@@ -1,13 +1,16 @@
 """任务中心服务层：互斥、CAS、租约恢复与保留条数。"""
+from contextlib import closing
 import os
 import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 from peach.migrations import upgrade
+from peach.jobs import process_matches
 from peach.repository import LedgerDatabase
 from peach.task_runs import (
     TaskRunConflict,
@@ -21,6 +24,37 @@ MIGRATIONS = Path(__file__).resolve().parents[1] / "migrations"
 
 
 class TaskRunStoreTests(unittest.TestCase):
+    def test_pruning_a_finished_run_preserves_download_state_and_clears_its_old_link(self):
+        run = self.store.start('download-postprocess', trigger='manual')
+        self.store.finish(run.id, 'succeeded')
+        with self.database.write_transaction(notify=False) as connection:
+            connection.execute("INSERT INTO download_task(provider,source_uri,target,state,updated_at,"
+                               "postprocess_state,postprocess_run_id,postprocess_detail) "
+                               "VALUES('115','sample','/Movies','ingested','now','complete',?,'整理完成')", (run.id,))
+        self.assertEqual(self.store.prune('download-postprocess', keep=0), 1)
+        with self.database.read_connection() as connection:
+            row = connection.execute('SELECT state,postprocess_state,postprocess_run_id,postprocess_detail '
+                                     'FROM download_task').fetchone()
+            self.assertEqual(tuple(row), ('ingested', 'complete', None, '整理完成'))
+
+    def test_process_identity_preserves_owners_when_creation_time_is_unknown(self):
+        started = stamp(datetime.now(timezone.utc))
+        with mock.patch('peach.jobs.process_creation_time', return_value=None):
+            self.assertTrue(process_matches(os.getpid(), started, alive=lambda _: True))
+            self.assertFalse(process_matches(os.getpid(), started, alive=lambda _: False))
+
+    def test_a_resumed_worker_with_current_heartbeat_is_not_reclaimed(self):
+        run = self.store.start('library-processing', trigger='manual')
+        earlier = datetime.now(timezone.utc) - timedelta(days=1)
+        created = datetime.now(timezone.utc).timestamp() - 30
+        with self.database.write_transaction(notify=False) as connection:
+            connection.execute('UPDATE task_run SET pid=?,started_at=? WHERE id=?',
+                               (os.getpid() + 1, stamp(earlier), run.id))
+        with mock.patch('peach.task_runs.process_alive', return_value=True), \
+                mock.patch('peach.jobs.process_creation_time', return_value=created):
+            self.assertEqual(self.store.recover_interrupted(), [])
+        self.assertEqual(self.store.get(run.id).status, 'running')
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -38,6 +72,31 @@ class TaskRunStoreTests(unittest.TestCase):
         self.assertEqual(run.progress_total, 10)
         self.assertEqual(run.pid, os.getpid())
         self.assertEqual(self.store.get(run.id).progress_label, "准备")
+
+    def test_active_families_match_live_ids_and_each_runs_live_descendants(self):
+        # 已结束的根 → 已结束的子 → 排队的孙；根下另一条在跑的子；独立的已失败与排队各一条。
+        ids = [self.store.start("demo", trigger="manual").id for _ in range(6)]
+        root, child, grandchild, runner, failed, alone = ids
+        layout = {root: (None, "succeeded"), child: (root, "succeeded"), grandchild: (child, "pending"),
+                  runner: (root, "running"), failed: (None, "failed"), alone: (None, "pending")}
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            for run_id, (parent, status) in layout.items():
+                finished = None if status in ("pending", "running") else "2026-01-01T00:00:00Z"
+                connection.execute("UPDATE task_run SET parent_run_id=?, status=?, finished_at=? WHERE id=?",
+                                   (parent, status, finished, run_id))
+
+        families = self.store.active_families()
+
+        self.assertEqual(set(families), self.store.live_ids())
+        self.assertEqual(families[root], [(grandchild, "pending"), (runner, "running")])
+        self.assertEqual(families[child], [(grandchild, "pending")])
+        self.assertEqual(families[alone], [(alone, "pending")])
+        self.assertNotIn(failed, families)
+        for run_id, family in families.items():
+            run = self.store.get(run_id)
+            expected = ([run_id] if run.active else []) + [
+                row.id for row in self.store.active_descendants(run_id)]
+            self.assertEqual([member for member, _status in family], sorted(expected))
 
     def test_missing_empty_or_corrupt_ledgers_have_no_available_task_center(self):
         self.assertTrue(self.store.available())
@@ -188,6 +247,18 @@ class TaskRunStoreTests(unittest.TestCase):
             self.assertEqual(self.store.recover_interrupted(), [])
         self.assertEqual(self.store.get(run.id).status, "running")
 
+    def test_recovery_does_not_treat_a_reused_pid_as_the_original_worker(self):
+        run = self.store.start("library-processing", trigger="manual")
+        old_start = stamp(datetime.now(timezone.utc) - timedelta(days=1))
+        with self.database.write_transaction(notify=False) as connection:
+            connection.execute("UPDATE task_run SET pid=?,started_at=?,heartbeat_at=? WHERE id=?",
+                               (os.getpid() + 1, old_start, old_start, run.id))
+        created_after_task = datetime.now(timezone.utc).timestamp()
+        with mock.patch("peach.task_runs.process_alive", return_value=True), \
+                mock.patch("peach.jobs.process_creation_time", return_value=created_after_task):
+            self.assertEqual(self.store.recover_interrupted(), [run.id])
+        self.assertEqual(self.store.get(run.id).status, "interrupted")
+
     def test_recovery_of_another_machine_waits_for_the_lease_to_expire(self):
         run = self.store.start("demo", trigger="manual")
         stale = stamp(datetime.now(timezone.utc) - timedelta(seconds=30))
@@ -209,6 +280,64 @@ class TaskRunStoreTests(unittest.TestCase):
         self.assertIn(live.id, remaining)
         self.assertEqual(len(remaining), 3)
         self.assertEqual(len(self.store.query(task_key="other")), 1)
+
+    def test_prune_preserves_followups_with_only_existing_task_references(self):
+        connect = self.database.connect
+        for foreign_keys in (0, 1):
+            with self.subTest(foreign_keys=foreign_keys):
+                def configured_connect(*args, _foreign_keys=foreign_keys, **kwargs):
+                    connection = connect(*args, **kwargs)
+                    connection.execute(f'PRAGMA foreign_keys={_foreign_keys}')
+                    return connection
+                with mock.patch.object(self.database, 'connect', configured_connect):
+                    key = f'parent-{foreign_keys}'
+                    active = self.store.start(key, trigger='manual')
+                    parent = self.store.start(key, trigger='manual')
+                    children = self.store.enqueue_followups(parent.id, [
+                        (f'{key}:running', f'child-{foreign_keys}', '正在处理'),
+                        (f'{key}:finished', 'child', '已经处理'),
+                        (f'{key}:pending', 'child', '等待处理'),
+                    ])['queued']
+                    self.store.claim_followup([f'child-{foreign_keys}'])
+                    self.store.finish(children[1], 'succeeded', summary={'changed':2})
+                    grandchild = self.store.enqueue_followups(children[0], [
+                        (f'{key}:grandchild', 'grandchild', '后续处理')])['queued'][0]
+                    self.store.finish(parent.id, 'succeeded')
+                    kept = self.store.start(key, trigger='manual')
+                    kept_child = self.store.enqueue_followups(kept.id, [
+                        (f'{key}:kept', 'child', '保留关联')])['queued'][0]
+                    self.store.finish(kept.id, 'succeeded')
+                    snapshots = {run_id:self.store.get(run_id) for run_id in
+                                 [active.id, kept.id, kept_child, grandchild, *children]}
+                    self.assertEqual(self.store.prune(key, keep=1), 1)
+                    self.assertIsNone(self.store.get(parent.id))
+                    for run_id, before in snapshots.items():
+                        expected = replace(before,
+                            parent_run_id=None if before.parent_run_id==parent.id else before.parent_run_id,
+                            root_run_id=None if before.root_run_id==parent.id else before.root_run_id)
+                        self.assertEqual(self.store.get(run_id), expected)
+                    with self.database.read_connection() as connection:
+                        self.assertEqual(connection.execute('PRAGMA foreign_key_check').fetchall(), [])
+                    self.assertEqual(self.store.prune(key, keep=1), 0)
+                    self.assertEqual(self.store.prune(key, keep=0), 1)
+                    self.assertEqual(self.store.get(active.id), snapshots[active.id])
+                    self.assertIsNone(self.store.get(kept_child).parent_run_id)
+                    self.assertIsNone(self.store.get(kept_child).root_run_id)
+
+    def test_task_reference_cleanup_rolls_back_with_a_batch_delete(self):
+        parents = [self.store.start(f'parent-{i}', trigger='manual') for i in range(2)]
+        for parent in parents:
+            self.store.enqueue_followups(parent.id, [(f'child:{parent.id}', 'child', '待处理')])
+            self.store.finish(parent.id, 'succeeded')
+        with self.database.write_transaction(notify=False) as connection:
+            before = connection.execute('SELECT * FROM task_run').fetchall()
+            connection.execute('SAVEPOINT cleanup')
+            connection.execute('DELETE FROM task_run WHERE id IN (?,?)', tuple(p.id for p in parents))
+            self.assertEqual(connection.execute('PRAGMA foreign_key_check').fetchall(), [])
+            self.assertEqual(connection.execute('SELECT count(*) FROM task_run').fetchone()[0], 2)
+            connection.execute('ROLLBACK TO cleanup')
+            connection.execute('RELEASE cleanup')
+            self.assertEqual(connection.execute('SELECT * FROM task_run').fetchall(), before)
 
     def test_query_filters_by_status_group_and_task(self):
         first = self.store.start("demo", trigger="manual")

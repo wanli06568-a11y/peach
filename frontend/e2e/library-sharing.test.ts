@@ -10,12 +10,16 @@ describe('馆藏与口味分享', () => {
   before(async () => { browser = await launch() });
   after(async () => { await browser?.close() });
   for (const viewport of VIEWPORTS) {
-    it(`${viewport.name}：离线圆点与文字均为错误色，浅色和暗色可辨识`, async () => {
+    it(`${viewport.name}：连接圆点和文字使用对应语义色，浅色和暗色可辨识`, async () => {
       const opened = await visit(browser, '/settings/library', viewport, async page => {
         await page.route('**/api/configuration', async route => {
           const response = await route.fetch();
           await route.fulfill({ json: { ...await response.json(), editable: false,
-            media_sources: [{ location: 'local', root: 'R:\\Media', path: 'R:\\Media', online: false }] } });
+            media_sources: [
+              { location: 'local', root: 'R:\\Media', path: 'R:\\Media', online: false },
+              { location: '115', root: 'B:\\', path: 'B:\\', online: true },
+              { location: 'pikpak', root: 'A:\\', path: 'A:\\' },
+            ] } });
         });
       });
       try {
@@ -26,20 +30,28 @@ describe('馆藏与口味分享', () => {
             document.documentElement.dataset.theme = value;
             document.documentElement.classList.toggle('dark', value === 'dark');
           }, theme);
-          const colors = await status.evaluate(element => {
+          for (const [state, textToken, dotToken] of [
+            ['offline', '--color-status-yellow-text', '--color-yellow-500'],
+            ['online', theme === 'dark' ? '--color-green-400' : '--color-green-700', '--color-green-500'],
+            ['unknown', '--color-text-secondary', '--color-text-tertiary'],
+          ]) {
+            const colors = await opened.page.locator(`[data-mount="${state}"]`).first().evaluate((element, tokens) => {
             const halo = element.firstElementChild!;
             const dot = halo.firstElementChild!;
             const probe = document.createElement('span');
-            probe.style.color = 'var(--color-text-error-primary)';
             element.append(probe);
-            const expected = getComputedStyle(probe).color;
+            probe.style.color = `var(${tokens[0]})`;
+            const expectedText = getComputedStyle(probe).color;
+            probe.style.color = `var(${tokens[1]})`;
+            const expectedDot = getComputedStyle(probe).color;
             probe.remove();
             return { text: getComputedStyle(element).color, dot: getComputedStyle(dot).backgroundColor,
-              halo: getComputedStyle(halo).backgroundColor, expected };
-          });
-          assert.equal(colors.dot, colors.expected, JSON.stringify(colors));
-          assert.equal(colors.text, colors.expected, JSON.stringify(colors));
-          assert.notEqual(colors.halo, 'rgba(0, 0, 0, 0)');
+              halo: getComputedStyle(halo).backgroundColor, expectedText, expectedDot };
+          }, [textToken, dotToken]);
+            assert.equal(colors.dot, colors.expectedDot, JSON.stringify(colors));
+            assert.equal(colors.text, colors.expectedText, JSON.stringify(colors));
+            assert.notEqual(colors.halo, 'rgba(0, 0, 0, 0)');
+          }
         }
         assert.deepEqual(opened.problems, []);
       } finally { await opened.close() }
@@ -73,12 +85,19 @@ describe('馆藏与口味分享', () => {
         assert.equal(await region.getByRole('switch').count(), 2, '两项上传开关同属一个分区');
         const initialToggle = region.getByRole('switch', { name: '上传馆藏与口味明细', exact: true });
         assert.equal(await initialToggle.count(), 1, '关闭状态也应显示上传开关');
+        const fields = region.getByText(state.fields[0], { exact: true });
+        assert.equal(await fields.isVisible(), false, '字段说明默认折叠');
+        const rules = region.getByText('馆藏统计字段与发送规则', { exact: true });
+        await rules.click();
+        assert.equal(await fields.isVisible(), true, '可以展开查看字段');
+        await rules.click();
+        await fields.waitFor({ state: 'hidden' });
         await region.getByRole('button', { name: '预览上传内容', exact: true }).click();
         const preview = region.getByLabel('馆藏与口味上传预览', { exact: true });
         await preview.waitFor();
         assert.equal(posts.length, 0);
-        assert.equal(await region.getByText(state.fields[0], { exact: true }).count(), 0);
-        assert.equal(await region.getByText(/当前预览包含.*不含账号、设备、文件路径和浏览器历史记录/).count(), 1);
+        assert.equal(await fields.isVisible(), false);
+        assert.equal(await region.getByText('随机标识用于实例去重。状态每日一次；关闭后仅补发一次关闭状态。', { exact: true }).isVisible(), true);
         assert.match(await preview.innerText(), /EXM-001/);
         assert.match(await preview.innerText(), /performer/);
         assert.equal(await region.locator('[data-code-block]').count(), 1);
@@ -102,7 +121,7 @@ describe('馆藏与口味分享', () => {
         assert.deepEqual(posts[0], { enabled: true, schema: 4, consent: true, preview_token: 'preview-token' });
         assert.equal(await preview.count(), 0, '同意后收起数据预览');
         assert.equal(await region.getByRole('checkbox').count(), 0, '同意后收起同意框');
-        assert.equal(await region.getByText(state.fields[0], { exact: true }).count(), 0, '同意后收起字段明细');
+        assert.equal(await fields.isVisible(), false, '同意后字段说明仍保持折叠');
         assert.equal(await toggle.isChecked(), true);
         await region.getByRole('button', { name: '预览上传内容', exact: true }).click();
         await preview.waitFor();

@@ -163,13 +163,14 @@ export const REVIEW_ROW = {
 };
 
 /** 人工复核页按一行造出来的队列打开：演示库里这一格未必正好有候选，而队列空了就没有卡。 */
-export async function openReview(browser: Browser): Promise<Visit> {
-  const opened = await visit(browser, '/review', DESKTOP);
+export async function openReview(browser: Browser, rows = [REVIEW_ROW], viewport = DESKTOP): Promise<Visit> {
+  const opened = await visit(browser, '/review', viewport);
   await opened.page.route('**/api/review', (route) => route.fulfill({
     status: 200,
     contentType: 'application/json',
     body: JSON.stringify({
-      sections: { metadata_fields: [REVIEW_ROW] }, counts: { metadata_fields: 1 }, genre_tags: [],
+      sections: { metadata_fields: rows }, counts: { metadata_fields: rows.length }, genre_tags: [],
+      queues: { later: { sections: {}, counts: {} }, ignored: { sections: {}, counts: {} } },
     }),
   }));
   await opened.page.reload({ waitUntil: 'load' });
@@ -374,11 +375,7 @@ export async function openCatalogBars(browser: Browser, viewport: Viewport = DES
   await opened.page.locator('[data-catalog-filter] [data-catalog-tag]').first().waitFor({ timeout: 15_000 });
   await opened.page.locator('[data-catalog-filter] [data-tier-studio]').first().waitFor({ timeout: 15_000 });
   await settle(opened.page);
-  // 关页时还在路上的那一趟桩请求不算失败。
-  return { ...opened, close: async () => {
-    await opened.page.unrouteAll({ behavior: 'ignoreErrors' });
-    await opened.close();
-  } };
+  return opened;
 }
 
 export interface CatalogFixture {
@@ -391,6 +388,7 @@ export interface CatalogFixture {
 export async function openCatalogFixture(
   browser: Browser,
   change: (payload: CatalogFixture, url: URL) => void,
+  { completeFirstPage = false }: { completeFirstPage?: boolean } = {},
 ): Promise<Visit> {
   const opened = await visit(browser, '/', DESKTOP);
   const baselines = new Map<string, CatalogFixture>();
@@ -406,7 +404,9 @@ export async function openCatalogFixture(
     const key = url.searchParams.get('orient') || '';
     let baseline = baselines.get(key);
     if (!baseline) {
-      const response = await route.fetch();
+      const fixtureUrl = new URL(url);
+      if (completeFirstPage && !fixtureUrl.searchParams.has('orient')) fixtureUrl.searchParams.set('limit', '60');
+      const response = await route.fetch({ url: fixtureUrl.href });
       baseline = await response.json() as CatalogFixture;
       baselines.set(key, baseline);
     }
@@ -576,7 +576,8 @@ export async function openPhotoWall(browser: Browser, viewport = DESKTOP): Promi
   }));
   await page.goto(new URL(`/performers/${encodeURIComponent(name)}?media=photos`, page.url()).href, { waitUntil: 'load' });
   await page.locator('[data-local-wall] [data-photo-cell] img').first().waitFor({ timeout: 15_000 });
-  await settle(page);
+  // 续页哨兵提前一屏开始取，这面短墙一出来就会去取那一页；它被上面压着，那枚键的忙态不算页面在等。
+  await settle(page, 'body', { except: '[data-entity-more]' });
   return opened;
 }
 

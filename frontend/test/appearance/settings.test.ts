@@ -27,12 +27,12 @@ describe('启动归一化', () => {
   it('认不出的一项退回出厂那一档，其余照留', () => {
     const { settings } = normalizeAppSettings({
       batchSize: 0, defaultSort: 'nope', hoverDelaySeconds: 61, seekSeconds: 2.5, searchHistoryLimit: 51, relatedLimit: -1,
-      theme: 'sepia', followInitialDays: 14, metadataRefreshDays: '7', accent: 'teal', homeLayout: 'big', ambientMode: 0,
+      feedLimit: 101, theme: 'sepia', followInitialDays: 14, metadataRefreshDays: '7', accent: 'teal', homeLayout: 'big', ambientMode: 0,
       theaterMode: 'yes', miniplayer: false, feedHideSoloCompilations: 'true',
     });
     expect(settings).toMatchObject({
       batchSize: 60, defaultSort: 'seed', hoverDelaySeconds: 5, seekSeconds: 10, searchHistoryLimit: 10, relatedLimit: 20,
-      theme: 'system', followInitialDays: 30, accent: 'teal', homeLayout: 'big', ambientMode: true,
+      feedLimit: 12, theme: 'system', followInitialDays: 30, accent: 'teal', homeLayout: 'big', ambientMode: true,
       theaterMode: false, miniplayer: false, feedHideSoloCompilations: false,
     });
   });
@@ -114,11 +114,37 @@ describe('数据库那一份落进本地缓存', () => {
     vi.unstubAllGlobals();
   });
 
+  it('名称偏好以数据库为准，仅在值改变时更新本地缓存和显示效果', () => {
+    const { store, changed, save } = stage({ performerNameLanguage: 'ja' });
+    applySyncedSettings({ performerNameLanguage: 'zh-CN' }, changed, store);
+    expect(store.value.performerNameLanguage).toBe('zh-CN');
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(changed.mock.calls).toEqual([['performerNameLanguage']]);
+    applySyncedSettings({ performerNameLanguage: 'zh-CN' }, changed, store);
+    applySyncedSettings({ performerNameLanguage: 'unsupported' }, changed, store);
+    expect(save).toHaveBeenCalledTimes(1);
+    expect(store.value.performerNameLanguage).toBe('zh-CN');
+  });
+
   it('侧栏顺序没变就不落盘', () => {
     const { store, save, changed } = stage();
     applySyncedSettings({ sidebarOrder: [...store.value.sidebarOrder] }, changed, store);
     applySyncedSettings({ sidebarOrder: [] }, changed, store);
     applySyncedSettings(null, changed, store);
     expect(save).not.toHaveBeenCalled();
+  });
+
+  it('新客户端与已有缓存都采用实例保存的导航和媒体库顺序', () => {
+    const fresh = stage();
+    const cached = stage({ navigationOrders: { tags: ['local', 'online'] }, libraryOrder: ['a', 'b'] });
+    const instance = { navigationOrders: { tags: ['online', 'local'] }, libraryOrder: ['b', 'a'] };
+    for (const client of [fresh, cached]) {
+      applySyncedSettings(instance, client.changed, client.store);
+      expect(client.store.value.navigationOrders.tags).toEqual(['online', 'local']);
+      expect(client.store.value.libraryOrder).toEqual(['b', 'a']);
+      applySyncedSettings({ navigationOrders: { tags: ['local', 'online'] }, libraryOrder: [] }, client.changed, client.store);
+      expect(client.store.value.navigationOrders.tags).toEqual(['local', 'online']);
+      expect(client.store.value.libraryOrder).toEqual([]);
+    }
   });
 });

@@ -15,7 +15,7 @@ import type { Want } from './wants';
 import { recordWantMagnets } from './wants';
 import { Disclosure } from '../settings/section';
 import { cachedResources, rememberResources, resourcesFresh } from './resource-cache';
-import { PROVIDER_ICONS } from '../components/source-label';
+import { providerIcon } from '../components/source-label';
 import { resourceNotice, resourceSize } from './resource-display';
 import './want-magnets.css';
 
@@ -33,16 +33,17 @@ export interface MagnetResult {
 }
 
 function ResourceFact({ icon: Icon, children, title }: { icon: ComponentType<{ className?: string; 'aria-hidden'?: boolean | 'true' | 'false' }>; children: ReactNode; title?: string }) {
-  return <span title={title} className="inline-flex items-center gap-1"><Icon aria-hidden className="size-3.5 shrink-0" />{children}</span>;
+  return <span title={title} className="inline-flex items-center gap-1"><Icon aria-hidden className="size-(--icon-inline) shrink-0" />{children}</span>;
 }
 
-export function WantMagnets({ want, readOnly, downloads, provider, toast, onSource, queryUrl }: {
+export function WantMagnets({ want, readOnly, downloads, provider, toast, onSource, queryUrl, eager = false }: {
   want: Pick<Want, 'id' | 'code' | 'title' | 'release_date'>; readOnly: boolean; downloads?: DownloadsSnapshot; provider: string; toast(message: string): void;
   onSource?(url: string): void;
   queryUrl?: string;
+  eager?: boolean;
 }) {
   const root = useRef<HTMLDivElement>(null);
-  const [visible, setVisible] = useState(typeof IntersectionObserver === 'undefined');
+  const [visible, setVisible] = useState(eager || typeof IntersectionObserver === 'undefined');
   const [submitted, setSubmitted] = useState<string[]>([]);
   const action = useAction();
   const client = useQueryClient();
@@ -115,7 +116,7 @@ export function WantMagnets({ want, readOnly, downloads, provider, toast, onSour
           if (!waiting) { refresh.current = true; void query.refetch() }
         }}>重新查询</Button>
       </div>
-      {waiting ? <LoadingDots label="正在查找资源链接…" /> : null}
+      {waiting ? <LoadingDots label="正在查找资源链接" /> : null}
       {failure ? <Note tone="error" title="资源链接未取得">{failure}</Note> : null}
       {query.data?.warnings?.map((warning) => <Note key={warning} tone="neutral">{resourceNotice(warning)}</Note>)}
       {query.data?.warnings?.length && query.data.source_url ? <ButtonLink variant="secondary" size="small" className="self-start"
@@ -137,21 +138,21 @@ export function WantMagnets({ want, readOnly, downloads, provider, toast, onSour
               </div>
               <div data-resource-facts="" className="flex flex-wrap gap-x-2 gap-y-1 text-caption-1-regular text-text-secondary">
                 <ResourceFact icon={RiLink}>{candidate.source}</ResourceFact>
-                <ResourceFact icon={RiHardDrive2Line} title={`来源大小：${candidate.size}`}>{resourceSize(candidate.size)}</ResourceFact>
+                <ResourceFact icon={RiHardDrive2Line} title={candidate.size ? `来源大小：${candidate.size}` : undefined}>{resourceSize(candidate.size)}</ResourceFact>
                 {candidate.files ? <ResourceFact icon={RiFileList2Line}>{candidate.files.replaceAll('個', '个')}</ResourceFact> : null}
                 <ResourceFact icon={RiCalendarLine} title={candidate.source === 'JavDB 评论' ? '评论日期' : '收录日期'}>{candidate.date ? candidate.date.slice(0, 10) : '日期未知'}</ResourceFact>
                 {candidate.attributes.filter(value => value !== '高清').map((value) => <ResourceFact key={value} icon={RiPriceTag3Line}>{value}</ResourceFact>)}
               </div>
             </div>
             <div data-resource-actions="" className="flex flex-wrap gap-2">
+              <ButtonLink data-button-link="" variant="secondary" size="small" trailingIcon={RiExternalLinkLine} href={candidate.source_url} target="_blank" rel="noopener noreferrer">链接来源</ButtonLink>
+              <Button variant="secondary" size="small" leadingIcon={RiFileCopyLine} {...busyProps(action.busy === `copy:${candidate.id}`)}
+                onClick={() => copy(candidate)}>复制链接</Button>
               {candidate.protocol === 'magnet' ?
-              <Button variant="primary" size="small" leadingIcon={configured ? PROVIDER_ICONS[configured.key] : RiCloudLine} title={configured ? `下载到 ${configured.label}` : undefined} disabled={readOnly || !downloads?.available || !configured || added}
+              <Button variant="primary" size="small" leadingIcon={configured ? providerIcon(configured.key) : RiCloudLine} title={configured ? `下载到 ${configured.label}` : undefined} disabled={readOnly || !downloads?.available || !configured || added}
                 {...busyProps(action.busy === candidate.id)} onClick={() => add(candidate)}>
                 {added ? '已添加' : '添加下载'}
               </Button> : null}
-              <Button variant={candidate.protocol === 'magnet' ? 'secondary' : 'primary'} size="small" leadingIcon={RiFileCopyLine} {...busyProps(action.busy === `copy:${candidate.id}`)}
-                onClick={() => copy(candidate)}>复制链接</Button>
-              <ButtonLink data-button-link="" variant="secondary" size="small" trailingIcon={RiExternalLinkLine} href={candidate.source_url} target="_blank" rel="noopener noreferrer">链接来源</ButtonLink>
             </div>
           </li>;
         });

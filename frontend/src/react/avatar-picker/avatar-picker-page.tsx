@@ -41,7 +41,7 @@ const SKELETON_TILES = 8;
 /** 格子的比例，与 `--aspect-avatar-choice` 同一个数。 */
 const TILE_ASPECT = 3 / 4;
 
-/** 框选那一步框的是哪张图：服务端那一格，或者本机选的文件（只在浏览器里预览）。 */
+/** 框选使用服务端转换后的候选；本机文件在确认时提交原始字节。 */
 interface Cropping { choice: AvatarChoice; file?: File }
 
 /** 进框选的四条路。都要先问服务端一次：图有多大、脸在哪。 */
@@ -99,14 +99,18 @@ function PickerBody({ kind, entityId, name, onPicked, close }: AvatarPickerProps
      一小块。整屏换掉而不是再叠一层弹层：这一步要的是尽可能大的底图，而弹层套弹层只会
      让底图更小。 */
   const [cropping, setCropping] = useState<Cropping | null>(null);
+  const [lostChoices, setLostChoices] = useState<Set<string>>(new Set());
+  const [imageAttempts, setImageAttempts] = useState<Record<string, number>>({});
   const key = avatarChoicesKey(kind, entityId);
   const picked = useRef(false);
 
   const listing = useQuery({
     queryKey: key,
     queryFn: ({ signal }) => fetchAvatarChoices(kind, entityId, signal),
-    // 上一次点开没取到就重来。取到过的那一份留着，反复开合不必每次再问一遍。
+    // 失败或索引过期时重新读取；有效候选在反复开合时复用。
     retryOnMount: true,
+    refetchOnMount: (query) => query.state.data?.index_stale ? 'always' : false,
+    refetchInterval: (query) => query.state.data?.index_refreshing && !query.state.error ? 1000 : false,
   });
   /* 换成功之后这一份候选里「在用」是哪一格已经过期，扔掉它，下次点开重新取。要等到弹层
      真的收起来再扔：这时候还有人在读这个键，当场清掉它会立刻再取一遍，白问一趟。 */
@@ -127,6 +131,7 @@ function PickerBody({ kind, entityId, name, onPicked, close }: AvatarPickerProps
      作品画面那一组不必问，列表里就带着尺寸和取景区。 */
   const opening = useMutation({
     mutationFn: (wanted: Opening) => openCrop(kind, entityId, wanted),
+    onMutate: () => { submit.reset() },
     onSuccess: setCropping,
   });
   const opens = (via: Opening['via']) => opening.isPending && opening.variables?.via === via;
@@ -177,15 +182,15 @@ function PickerBody({ kind, entityId, name, onPicked, close }: AvatarPickerProps
           {problem ? (
             <Note tone="error" action={listingFailed ? (
               <Button variant="secondary" size="small" {...busyProps(listing.isFetching)}
-                onClick={() => { if (!listing.isFetching) void listing.refetch() }}>重试</Button>
+                onClick={() => { if (!listing.isFetching) void listing.refetch() }}>立即重试</Button>
             ) : undefined}>{problem}</Note>
           ) : null}
         </div>
         <IconButton icon={RiCloseLine} size="small" aria-label="关闭" onClick={close} />
       </div>
       {cropping ? (
-        <CropStep kind={kind} entityId={entityId} choice={cropping.choice} file={cropping.file}
-          busy={submit.isPending} back={() => setCropping(null)} confirm={pickCrop} />
+        <CropStep kind={kind} entityId={entityId} choice={cropping.choice}
+          busy={submit.isPending} back={() => { submit.reset(); opening.reset(); setCropping(null) }} confirm={pickCrop} />
       ) : (
       <>
       {/* 候选网格是这一屏唯一会滚的层：头部和底下那排操作再长也不动。上下各留 16px：
@@ -210,19 +215,27 @@ function PickerBody({ kind, entityId, name, onPicked, close }: AvatarPickerProps
                 aria-selected={choice.current} title={choiceDetail(choice)} {...busyProps(busy)}
                 onClick={() => {
                   if (busy) return;
-                  if (choice.crop) setCropping({ choice });
+                  if (lostChoices.has(choice.ref)) {
+                    setLostChoices(previous => new Set([...previous].filter(ref => ref !== choice.ref)));
+                    setImageAttempts(previous => ({ ...previous, [choice.ref]: (previous[choice.ref] || 0) + 1 }));
+                    opening.reset();
+                    submit.reset();
+                    return;
+                  }
+                  if (choice.crop) { submit.reset(); opening.reset(); setCropping({ choice }) }
                   else opening.mutate({ via: 'choice', choice });
                 }}
                 className="relative flex cursor-pointer flex-col gap-1 overflow-hidden rounded-2lg border border-separator-border bg-background-secondary-default pb-1 text-center text-caption-1-regular text-text-secondary outline-none hover:border-border-button-hover hover:text-text-primary focus-visible:ring-2 focus-visible:ring-border-focus-ring aria-selected:border-border-focus-ring aria-selected:bg-background-tertiary-default aria-selected:text-text-primary aria-disabled:cursor-progress aria-disabled:opacity-60">
-                <ChoiceImage src={choiceImageUrl(kind, entityId, choice.ref, baseVersion(choice, choice.ref))}
-                  choice={choice} />
+                <ChoiceImage key={imageAttempts[choice.ref] || 0}
+                  src={choiceImageUrl(kind, entityId, choice.ref, baseVersion(choice, choice.ref))}
+                  choice={choice} onUnavailable={() => setLostChoices(previous => new Set(previous).add(choice.ref))} />
                 <span className="truncate px-1">{choice.label}</span>
                 {choice.current
                   ? <span className="absolute top-1 left-1"><Chip variant="caption" color="gray">在用</Chip></span>
                   : null}
                 {/* 合演封面上最大那张脸多半是领衔的另一位，格子不围着它取景，这里标出人数。 */}
-                {sharedCast(choice)
-                  ? <span className="absolute top-1 right-1"><Chip variant="caption" color="gray">{choice.cast.toLocaleString()} 人</Chip></span>
+                {sharedCast(choice) || choice.user_cropped
+                  ? <span className="absolute top-1 right-1"><Chip variant="caption" color="gray">{sharedCast(choice) ? `${choice.cast.toLocaleString()} 人` : '已裁剪'}</Chip></span>
                   : null}
               </button>
             ))}
@@ -249,14 +262,15 @@ function PickerBody({ kind, entityId, name, onPicked, close }: AvatarPickerProps
           <Button variant="secondary" onClick={() => file.current?.click()}
             {...busyProps(opens('file'))}>从本机选图片</Button>
           {/* 原生文件选择器长相不可控，按钮归 BoardUI，输入框只留着接文件。 */}
-          <input ref={file} type="file" accept="image/png,image/jpeg" tabIndex={-1} aria-hidden
+          <input ref={file} type="file" accept="image/jpeg,image/png,image/webp,image/avif,image/gif,image/bmp,image/tiff,image/x-icon,image/vnd.microsoft.icon,image/jp2,.jpg,.jpeg,.jpe,.jfif,.png,.webp,.avif,.gif,.bmp,.dib,.tif,.tiff,.ico,.jp2,.j2k,.jpf,.jpx" tabIndex={-1} aria-hidden
             className="hidden" onChange={pickFile} />
+          <span className="text-caption-1-regular text-text-secondary">支持常见图片格式，动图使用第一帧</span>
           {/* 地址一行至少 224px：窄屏下和「从本机选图片」挤不进一行就整行换下去，输入框不被压成一条缝。 */}
           <div className="flex min-w-0 flex-1 basis-56 items-center gap-2">
             <div className="min-w-0 flex-1">
               <Input type="url" aria-label="图片地址" placeholder="https://…" value={url} onChange={setUrl} />
             </div>
-            <Button disabled={!url.trim()} {...busyProps(opens('url'))}
+            <Button variant="secondary" disabled={!url.trim()} {...busyProps(opens('url'))}
               onClick={() => { if (!busy) opening.mutate({ via: 'url', url: url.trim() }) }}>用这个地址</Button>
           </div>
         </div>
@@ -272,7 +286,9 @@ function PickerBody({ kind, entityId, name, onPicked, close }: AvatarPickerProps
  *  要框的横图（作品画面、番号封面）不整张铺满居中：封面正中常常是书脊或背景，格子
  *  在后端给的取景区里取一块 3:4，看到的就是框选那一步默认框住的那张脸。竖的图库
  *  人像照旧 `object-cover`。 */
-function ChoiceImage({ src, choice }: { src: string; choice: AvatarChoice }) {
+function ChoiceImage({ src, choice, onUnavailable }: {
+  src: string; choice: AvatarChoice; onUnavailable(): void;
+}) {
   const image = useRef<HTMLImageElement>(null);
   const [revealed, setRevealed] = useState(false);
   const [lost, setLost] = useState(false);
@@ -286,10 +302,10 @@ function ChoiceImage({ src, choice }: { src: string; choice: AvatarChoice }) {
   return (
     <span data-choice-lost={lost || undefined}
       className="relative block w-full aspect-avatar-choice overflow-hidden">
-      {/* 取不到图时揭开骨架、撤掉图：骨架停在那儿读成还在等，留着图就是一枚破图标。
-          格子剩一块空底，名字和来源照旧在下面那行与 title 里。 */}
-      {lost ? null : <img ref={image} loading="lazy" alt="" src={src} data-revealed={shown}
-        onLoad={() => setRevealed(true)} onError={() => setLost(true)}
+      {/* 失败保留来源与重试入口，不把空白格当作可进入框选的图片。 */}
+      {lost ? <span className="absolute inset-0 flex items-center justify-center px-3">图片未取得，点击重试</span>
+        : <img ref={image} loading="lazy" alt="" src={src} data-revealed={shown}
+        onLoad={() => setRevealed(true)} onError={() => { setLost(true); onUnavailable() }}
         className={place
           ? 'reveal-content absolute max-w-none top-(--tile-top) left-(--tile-left) h-(--tile-height) w-(--tile-width)'
           : 'reveal-content absolute inset-0 size-full object-cover'}
@@ -303,26 +319,14 @@ function ChoiceImage({ src, choice }: { src: string; choice: AvatarChoice }) {
   );
 }
 
-/** 本机文件在浏览器里的预览地址。离开框选就收回，不留着占内存。 */
-function useFileUrl(file: File | undefined): string {
-  const [url, setUrl] = useState('');
-  useEffect(() => {
-    if (!file) return undefined;
-    const made = URL.createObjectURL(file);
-    setUrl(made);
-    return () => URL.revokeObjectURL(made);
-  }, [file]);
-  return url;
-}
-
 /** 框选那一步：一张底图、一个方框、一个圆预览。
  *
  *  比例锁死 1:1 且不给解锁：头像框是圆的，非方图装进去只会被再裁一次，而第二次
  *  裁在哪由 CSS 说了算，人在这里框的那一块就不作数了。
  *
  *  不是非框不可的图（人像那几路）多一个「整张使用」：有的图本来就是一张合用的大头照。 */
-function CropStep({ kind, entityId, choice, file, busy, back, confirm }: {
-  kind: string; entityId: number; choice: AvatarChoice; file?: File; busy: boolean;
+function CropStep({ kind, entityId, choice, busy, back, confirm }: {
+  kind: string; entityId: number; choice: AvatarChoice; busy: boolean;
   back(): void; confirm(picked: CropPick): void;
 }) {
   const bases = choice.bases.length ? choice.bases : [choice.ref];
@@ -330,8 +334,7 @@ function CropStep({ kind, entityId, choice, file, busy, back, confirm }: {
   const [size, setSize] = useState<CropSize | null>(null);
   const [box, setBox] = useState<CropBox | null>(null);
   const version = baseVersion(choice, base);
-  const fileUrl = useFileUrl(file);
-  const src = file ? fileUrl : choiceImageUrl(kind, entityId, base, version);
+  const src = choiceImageUrl(kind, entityId, base, version);
   const frame = useOverlayScrollbar<HTMLDivElement>();
   /* 换底图就是换一张图，上一张的框一个数都不留：同一组坐标落在另一张图上是一块
      错位的区域，而错位在屏幕上和「本来就框在这儿」看不出区别。 */

@@ -7,8 +7,9 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from peach import follow_providers
 from peach.follow import FollowSourceError
-from peach.follow_sources import FollowCandidate, SourceFetch
+from peach.follow_sources import FollowCandidate, IwaraConnector, SourceFetch
 from peach.follow_store import (
     FollowStore, ReleaseGroup, author_display_text, f95_author_handles,
     f95_author_name, normalized_author_name,
@@ -123,6 +124,27 @@ class RegistrationTests(_StoreCase):
 
 
 class RecordTests(_StoreCase):
+    def test_iwara_general_tags_enter_the_inventory_without_guessing_other_types(self):
+        from peach.web_follow import _item_tags, online_tag_inventory
+
+        candidate = IwaraConnector()._candidate({
+            "id": "Video123", "title": "Test animation", "tags": [
+                {"id": "dance", "type": "general"},
+                {"id": "blender", "type": "category"},
+                {"id": "series_title", "type": "source"},
+                {"id": "pose", "type": "unknown"},
+                {"id": "animation"}]}, {"name": "Test Creator"}, "creator")
+        source_id = self._source(provider="iwara", ref="creator")
+        self.store.record(source_id, _fetch([candidate], provider="iwara", ref="creator"),
+                          moment=MOMENT)
+        rows = online_tag_inventory(self.connection)
+        self.assertEqual([(row["k"], row["cat"]) for row in rows], [("dance", "general")])
+        item = self.store.items()[0]
+        self.assertEqual(_item_tags(item), ["dance"])
+        self.assertEqual(item.metadata["source_tag_types"], {
+            "dance": "general", "blender": "category", "series_title": "source", "pose": "unknown"})
+        self.assertEqual(item.metadata["tags"], ["dance", "blender", "series_title", "pose", "animation"])
+
     def test_booru_source_only_becomes_a_profile_when_the_handle_matches(self):
         source_id = self._source(
             provider="rule34xxx", ref="auxtasy", label="Auxtasy",
@@ -300,6 +322,57 @@ class RecordTests(_StoreCase):
         self.assertIsNotNone(outcome.evidence_path)
         self.assertIsNone(outcome.evidence_error)
 
+    def test_identical_evidence_is_reused_without_overwriting_files(self):
+        source_id = self._source()
+        fetch = _fetch([_candidate("1", "A")])
+        first = self.store.record(source_id, fetch, moment=MOMENT)
+        evidence = self.root / "sources" / Path(first.evidence_path)
+        sidecar = evidence.with_suffix(".json")
+        before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in (evidence, sidecar)]
+        again = self.store.record(source_id, fetch, moment=MOMENT)
+        self.assertEqual(again.evidence_path, first.evidence_path)
+        self.assertEqual(again.added, 0)
+        self.assertEqual([(path.read_bytes(), path.stat().st_mtime_ns)
+                          for path in (evidence, sidecar)], before)
+
+    def test_shared_response_body_keeps_distinct_snapshot_metadata(self):
+        for provider, spec in follow_providers.PROVIDERS.items():
+            if not spec.source_url:
+                continue
+            with self.subTest(provider=provider):
+                source_id = self._source(provider=provider, semantics=spec.semantics)
+                fetch = _fetch([_candidate("1", "A", provider=provider)],
+                               provider=provider, semantics=spec.semantics)
+                variants = (fetch, replace(fetch, request_url=fetch.request_url + "?firstId=1"),
+                            replace(fetch, candidates=()), replace(fetch, raw_body=b"different body"))
+                paths = []
+                for offset, variant in enumerate(variants):
+                    # 时刻各不相同：保留规则按时间留最近几份，同一时刻的先后没有定义。
+                    outcome = self.store.record(source_id, variant, moment=MOMENT + timedelta(seconds=offset))
+                    self.assertIsNone(outcome.evidence_error)
+                    paths.append(self.root / "sources" / Path(outcome.evidence_path))
+                self.assertEqual(len(set(paths)), 4)
+                for path, variant in zip(paths, variants):
+                    self.assertEqual(path.read_bytes(), variant.raw_body)
+                    sidecar = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
+                    self.assertEqual(sidecar["provider"], provider)
+                    self.assertEqual(sidecar["request_url"], variant.request_url)
+                    self.assertEqual(sidecar["candidates"], len(variant.candidates))
+
+    def test_conflicting_evidence_still_rejects_overwriting(self):
+        source_id = self._source()
+        fetch = _fetch([_candidate("1", "A")])
+        outcome = self.store.record(source_id, fetch, moment=MOMENT)
+        evidence = self.root / "sources" / Path(outcome.evidence_path)
+        sidecar = evidence.with_suffix(".json")
+        original = sidecar.read_bytes()
+        sidecar.write_bytes(b"conflicting evidence")
+        with self.assertRaisesRegex(FollowSourceError, "immutable follow snapshot collision"):
+            self.store.record(source_id, fetch, moment=MOMENT)
+        self.assertEqual(sidecar.read_bytes(), b"conflicting evidence")
+        self.assertEqual(evidence.read_bytes(), fetch.raw_body)
+        sidecar.write_bytes(original)
+
     def test_approximate_precision_is_carried_through_from_the_connector(self):
         source_id = self._source()
         self.store.record(source_id, _fetch([
@@ -340,6 +413,43 @@ class RecordTests(_StoreCase):
             self.store.set_status(self.store.items()[0].id, "saved")
         with self.assertRaises(FollowSourceError):
             self.store.set_status(self.store.items()[0].id, "nonsense")
+
+    def test_a_tag_the_site_later_marks_as_a_character_follows_on_older_items(self):
+        """站方事后把标签改成角色：新条目记上之后，同站旧条目里的同名标签跟着改。
+
+        跨作者也改；别的站不动；只往 character 改，新条目记成 general 不降级旧行。
+        """
+        def typed(external_id, kind, **kwargs):
+            return _candidate(external_id, external_id, extra={"tag_types": {
+                "d.mon (overwatch)": kind, "sex": "general"}}, **kwargs)
+
+        old = self._source(ref="vileclipse")
+        other_site = self._source(provider="rule34xxx", ref="vileclipse")
+        self.store.record(old, _fetch([typed("1", "general")], ref="vileclipse"),
+                          moment=MOMENT)
+        self.store.record(other_site, _fetch([typed("9", "general", provider="rule34xxx")],
+                                             provider="rule34xxx", ref="vileclipse"),
+                          moment=MOMENT)
+        newer = self._source(ref="someone-else")
+        # 探详情失败的候选是 partial，它带的类型不作数。
+        self.store.record(newer, _fetch([typed("2", "character", partial=True)],
+                                        ref="someone-else"), moment=MOMENT)
+
+        def kinds():
+            return {item.external_id: item.metadata["tag_types"]["d.mon (overwatch)"]
+                    for item in self.store.items()}
+
+        self.assertEqual(kinds()["1"], "general")
+        self.store.record(newer, _fetch([typed("3", "character")], ref="someone-else"),
+                          moment=MOMENT)
+        self.assertEqual(kinds(), {"1": "character", "2": "character", "3": "character",
+                                   "9": "general"})
+        old_item = next(item for item in self.store.items() if item.external_id == "1")
+        self.assertEqual(old_item.metadata["tag_types"]["sex"], "general")
+
+        self.store.record(old, _fetch([typed("4", "general")], ref="vileclipse"),
+                          moment=MOMENT)
+        self.assertEqual(kinds()["1"], "character")
 
 
 class GroupingTests(_StoreCase):
@@ -954,6 +1064,27 @@ class ReleaseGroupTests(unittest.TestCase):
 class AuthorIdentityTests(_StoreCase):
     """作者别名表的写入口径。这些 SQL 归存储层，不写在 Web 处理函数里。"""
 
+    def test_preferred_name_preserves_all_spellings_and_the_group(self):
+        current = "Suzutaru 3D (鈴太郎3D)"
+        self.store.upsert_author_alias(current, "suzutaro3d", source="manual")
+        self.store.upsert_author_alias(current, "鈴太郎3D", source="manual")
+        result = self.store.rename_author_group(normalized_author_name(current), "鈴太郎3D")
+        mapping, groups = self.store.author_aliases()
+        self.assertEqual(result, {"previous": current, "canonical": "鈴太郎3D"})
+        self.assertEqual(groups[0]["canonical_name"], "鈴太郎3D")
+        self.assertEqual({row["name"] for row in groups[0]["aliases"]}, {current, "suzutaro3d"})
+        self.assertEqual(set(mapping.values()), {normalized_author_name("鈴太郎3D")})
+
+    def test_preferred_name_rejects_other_groups_and_missing_groups(self):
+        self.store.upsert_author_alias("作者 A", "alias A", source="manual")
+        self.store.upsert_author_alias("作者 B", "alias B", source="manual")
+        before = self.store.author_aliases()
+        for key, name in ((normalized_author_name("作者 A"), "alias B"), ("missing", "名称"),
+                          (normalized_author_name("作者 A"), "")):
+            with self.subTest(key=key, name=name), self.assertRaises(ValueError):
+                self.store.rename_author_group(key, name)
+            self.assertEqual(self.store.author_aliases(), before)
+
     def test_the_container_suffix_is_not_part_of_the_author_name(self):
         """F95 的线程标题说的是一个容器，不是另一个作者。
 
@@ -1065,6 +1196,13 @@ class AuthorIdentityTests(_StoreCase):
         self.assertIsNone(self.store.learn_official_author_alias(
             "kemono", "fanbox/30917150",
             (_candidate("1", "a", provider="kemono", author="Initiala"),)))
+
+    def test_iwara_author_profile_provides_a_trusted_handle_alias(self):
+        learned = self.store.learn_official_author_alias(
+            "iwara", "user_creator",
+            (_candidate("1", "Work", provider="iwara", author="Test Creator"),))
+        self.assertEqual(learned["alias"], "user_creator")
+        self.assertEqual(learned["source"], "official:iwara")
 
 
 class SourceRemovalTests(_StoreCase):
@@ -1461,6 +1599,179 @@ class StoredCompilationTests(_StoreCase):
             "SELECT count(*) FROM follow_item").fetchone()[0], 0)
         self.assertEqual(self.connection.execute(
             "SELECT count(*) FROM follow_playback").fetchone()[0], 0)
+
+
+def _old_snapshot(directory: Path, index: int, size: int = 10) -> Path:
+    """升级前留下的一份快照：`.raw` 加同名 `.json`，名字按序号排出先后。"""
+    directory.mkdir(parents=True, exist_ok=True)
+    raw = directory / f"20260801T{index:06d}.000000Z-{index:064x}.raw"
+    raw.write_bytes(b"x" * size)
+    raw.with_suffix(".json").write_bytes(b"{}")
+    return raw
+
+
+class EvidenceRetentionTests(_StoreCase):
+    """原始快照：相同的不重写，每个来源只留最近 3 份和被条目引用的，存量等用户确认才删。"""
+
+    def _evidence(self):
+        return [row[0] for row in self.connection.execute("SELECT evidence_path FROM follow_item")]
+
+    def _raws(self, provider="rule34video"):
+        return sorted((self.root / "sources" / "follow" / provider).rglob("*.raw"))
+
+    def test_an_unchanged_page_reuses_the_latest_snapshot(self):
+        source_id = self._source()
+        fetch = _fetch([_candidate("1", "A")])
+        first = self.store.record(source_id, fetch, moment=MOMENT)
+        again = self.store.record(source_id, fetch, moment=MOMENT + timedelta(hours=1))
+        self.assertEqual(again.evidence_path, first.evidence_path)
+        self.assertEqual(len(self._raws()), 1)
+        changed = self.store.record(source_id, replace(fetch, raw_body=b"<html>new</html>"),
+                                    moment=MOMENT + timedelta(hours=2))
+        self.assertNotEqual(changed.evidence_path, first.evidence_path)
+        repeat = self.store.record(source_id, fetch, moment=MOMENT + timedelta(hours=3))
+        self.assertNotEqual(repeat.evidence_path, first.evidence_path,
+                            "只和最新一份比：页面改回旧样子也记一份新的")
+        self.assertEqual(len(self._raws()), 3)
+        self.assertEqual(self._evidence(), [first.evidence_path])
+
+    def test_each_source_keeps_three_recent_snapshots_and_the_referenced_ones(self):
+        other = self.root / "sources" / "follow" / "rule34video" / "another-source"
+        untouched = [_old_snapshot(other, index) for index in range(5)]
+        source_id = self._source()
+        paths = []
+        for index in range(5):
+            outcome = self.store.record(
+                source_id, _fetch([_candidate("1", "A")], raw=f"<html>{index}</html>".encode()),
+                moment=MOMENT + timedelta(hours=index))
+            paths.append(self.root / "sources" / Path(outcome.evidence_path))
+        self.assertEqual(self._evidence(), [str(paths[0].relative_to(self.root / "sources"))])
+        self.assertEqual([path.exists() for path in paths], [True, False, True, True, True])
+        self.assertFalse(paths[1].with_suffix(".json").exists())
+        self.assertTrue(all(path.exists() for path in untouched), "只清这次写入的那个来源目录")
+
+    def test_a_new_snapshot_only_offsets_its_own_growth_and_leaves_the_stock(self):
+        """升级后第一次检查不能把存量一口气删光：那在写事务里，也绕过了「修复与迁移」的确认。"""
+        source_id = self._source()
+        fetch = _fetch([_candidate("1", "A")])
+        directory = (self.root / "sources" / Path(self.store.record(source_id, fetch, moment=MOMENT)
+                                                  .evidence_path)).parent
+        stock = [_old_snapshot(directory, index) for index in range(20)]
+        self.store.record(source_id, replace(fetch, raw_body=b"<html>new</html>"),
+                          moment=MOMENT + timedelta(hours=1))
+        self.assertEqual(sum(not raw.exists() for raw in stock), 1)
+        self.assertEqual(len(list(directory.glob("*.raw"))), 22 - 1)
+        self.store.record(source_id, replace(fetch, raw_body=b"<html>new</html>"),
+                          moment=MOMENT + timedelta(hours=2))
+        self.assertEqual(sum(not raw.exists() for raw in stock), 1, "去重命中时没写新的，也不删")
+
+    def test_stock_snapshots_wait_for_the_user_and_keep_what_items_reference(self):
+        from peach import repair_center
+        from peach.follow_evidence import Reclaim
+        from peach.repository import LedgerDatabase
+        source_id = self._source()
+        directory = self.root / "sources" / "follow" / "rule34video" / "legacy"
+        raws = [_old_snapshot(directory, index, size=100) for index in range(6)]
+        # 迁移数据根前留下的绝对路径、反斜杠也认得出是同一个文件。
+        self.connection.execute(
+            "INSERT INTO follow_item(source_id,external_id,title,release_key,evidence_path,first_seen_at,"
+            "last_seen_at) VALUES(?,?,?,'old',?,?,?)", (source_id, "old", "Old", "D:\\peach-data\\sources\\follow\\rule34video"
+                                     f"\\legacy\\{raws[1].name}", "2026-08-01T00:00:00Z", "2026-08-01T00:00:00Z"))
+        self.connection.commit()
+        from peach.task_runs import TaskRunStore
+        database = LedgerDatabase(self.root / "ledger.db")
+        runs = TaskRunStore(database)
+        reclaim = Reclaim(self.root / "sources" / "follow", database, runs=runs)
+
+        def settle():
+            while reclaim.worker is not None and reclaim.worker.is_alive():
+                reclaim.worker.join(10)
+
+        def item():
+            with database.read_connection() as connection:
+                center = repair_center.snapshot(connection, {}, cloud_pending=0,
+                                                follow_evidence_status=reclaim.status())
+            return next((row for row in center["items"] if row["id"] == "follow-evidence"), None), center
+
+        self.assertTrue(item()[0]["estimating"])
+        settle()
+        waiting, _ = item()
+        # 留 3、4、5 三份最近的和被引用的 1，删 0、2 两份，每份 100 + 2 字节。
+        self.assertEqual((waiting["mode"], waiting["state"], waiting["files"], waiting["bytes"]),
+                         ("confirm", "waiting", 4, 204))
+        self.assertTrue(all(raw.exists() for raw in raws), "估算不删文件")
+        reclaim.start()
+        settle()
+        self.assertEqual([raw.exists() for raw in raws], [False, True, False, True, True, True])
+        done, center = item()
+        self.assertEqual((done["state"], done["changed"]), ("done", 4))
+        self.assertEqual([(row["title"], row["changed"]) for row in center["history"]],
+                         [("清理关注抓取的旧快照", 4)])
+        # 删除这一轮在活动页登记：计数、结算与摘要都在任务中心。
+        run = runs.query(task_key="follow-evidence-reclaim")[0]
+        self.assertEqual((run.status, run.progress_current, run.progress_total, run.result_summary),
+                         ("succeeded", 4, 4, {"files_removed": 4, "bytes_reclaimed": 204}))
+
+    def test_stock_cleanup_pauses_and_cancels_from_the_task_center(self):
+        """活动页的暂停停在两份快照之间，继续前不再删；取消结束这一轮，删了多少照实记，剩下的重新等确认。"""
+        import threading
+        import time
+        from unittest.mock import patch
+        from peach import follow_evidence, task_control
+        from peach.follow_evidence import Reclaim
+        from peach.repository import LedgerDatabase
+        from peach.task_runs import TaskRunStore
+        root = self.root / "sources" / "follow" / "rule34video"
+        first = [_old_snapshot(root / "a", index) for index in range(5)]
+        second = [_old_snapshot(root / "b", index) for index in range(5)]
+        database = LedgerDatabase(self.root / "ledger.db")
+        runs = TaskRunStore(database)
+        reclaim = Reclaim(self.root / "sources" / "follow", database, runs=runs)
+        reclaim.status()
+        reclaim.worker.join(10)
+        # 删完第一个目录后停在闸门前，等测试发出暂停再放行。
+        reached, release = threading.Event(), threading.Event()
+        listing = follow_evidence.directories
+
+        def gated(path):
+            for index, directory in enumerate(listing(path)):
+                if index == 1:
+                    reached.set()
+                    release.wait(10)
+                yield directory
+
+        def wait_for(predicate):
+            deadline = time.monotonic() + 10
+            while not predicate():
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.02)
+
+        with patch.object(follow_evidence, "directories", gated):
+            reclaim.start()
+            self.assertTrue(reached.wait(10))
+            run = runs.query(task_key="follow-evidence-reclaim")[0]
+            self.assertEqual(task_control.projection(runs, run)["actions"], ["pause", "cancel", "set_speed"])
+            task_control.request(runs, run.id, "pause")
+            release.set()
+            wait_for(lambda: task_control.projection(runs, runs.get(run.id))["state"] == "paused")
+            self.assertEqual([raw.exists() for raw in first], [False, False, True, True, True])
+            self.assertTrue(all(raw.exists() for raw in second), "暂停后不再删")
+            task_control.request(runs, run.id, "cancel")
+            reclaim.worker.join(10)
+        run = runs.get(run.id)
+        self.assertEqual((run.status, run.result_summary["files_removed"]), ("cancelled", 4))
+        self.assertTrue(all(raw.exists() for raw in second))
+        wait_for(lambda: reclaim.status()["phase"] == "ready")
+        self.assertEqual(reclaim.status()["files"], 4, "剩下的重新等确认")
+
+    def test_a_library_without_follow_snapshots_does_not_list_the_item(self):
+        from peach import repair_center
+        from peach.follow_evidence import Reclaim
+        reclaim = Reclaim(self.root / "sources" / "follow", None)
+        self.assertEqual(reclaim.status(), {"phase": "idle"})
+        center = repair_center.snapshot(self.connection, {}, cloud_pending=0,
+                                        follow_evidence_status=reclaim.status())
+        self.assertNotIn("follow-evidence", [row["id"] for row in center["items"]])
 
 
 if __name__ == "__main__":

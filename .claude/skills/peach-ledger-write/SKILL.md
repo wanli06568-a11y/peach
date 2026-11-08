@@ -1,12 +1,12 @@
 ---
 name: peach-ledger-write
-description: 在用户说迁移、migrate、--apply、合并实体、merge_entity、改真相字段、批量删除、清空回收站，或任何要写真实 ledger 的动作之前使用。
+description: 执行真实 ledger 迁移、真相字段写入、实体合并或不可逆删除前使用；临时测试库不属于真实写入。
 ---
 
 # 真实 ledger 写入流程
 
-最后复核：2026-10-17
-证据来源：[开发约定](../../../AGENTS.md)、ADR-0005、ADR-0015、ADR-0017、ADR-0052、ADR-0091、ADR-0106。
+最后复核：2026-11-07
+证据来源：[开发约定](../../../AGENTS.md)、ADR-0005、ADR-0015、ADR-0017、ADR-0052、ADR-0091、ADR-0106、用户 2026-11-07 尽量不复核的要求。
 
 真实库：当前写入者本机 `PEACH_DATA_ROOT/database/ledger.db`（WAL）。绝不能把共享传输副本或
 另一台机器的副本当当前真实库；测试只用临时 SQLite 与临时媒体。
@@ -18,9 +18,7 @@ description: 在用户说迁移、migrate、--apply、合并实体、merge_entit
 3. `PRAGMA integrity_check`。
 4. `peach migrate status` 核对版本。
 5. 应用后重复计数并做服务 smoke test，前后差异逐条解释。
-6. 复核通过后清退旧备份：`scripts/prune_ledger_backups.py --apply`（缺省只列计划）。规则在
-   `peach.ledger_backups`：最近 5 份、24 小时内、比 `ledger.db` 更新的都留，其余连同 `-wal`／`-shm`
-   删；账本 `integrity_check` 不是 ok 一份都不删。Windows 托盘每次启动按同一规则自动跑。
+6. 复核通过后清退旧备份：`scripts/prune_ledger_backups.py --apply`（缺省只列计划）。保留与清退条件以 `peach.ledger_backups` 为准；账本完整性检查不是 ok 时拒绝清退。Windows 托盘启动复用同一规则。
 
 Windows 写者的托盘在启动与「重启服务」时、子服务停着的间隙自动跑 `migrate upgrade`，
 备份、失败通知与 reader 不迁移见 ADR-0091。上面六步用于手工迁移与托盘之外的账本。
@@ -40,6 +38,8 @@ Windows 写者的托盘在启动与「重启服务」时、子服务停着的间
   覆盖人的判断、能按 `source`／`batch` 整批撤回（`scripts/revert_auto_landing.py`）的，由处理
   任务或后继直接写，每条记 `source`、判词与批次。LLM 输出、打分、`weak`、多候选与来源冲突
   只产候选，人复核后才 `approved`；撤不回的（合并、改规范名）判据再确定也要授权。
+- 能不复核就不复核：修复、升级补修与新判据先设计成自动落库加可撤回回执，复核只留给可信来源
+  真正冲突或判据本身不确定的情况。发现问题后只计数或只标「需复核」不算修复（#478 乱码人物）。
 - 运维脚本默认 dry-run：`scrape_codes.py` 默认只写复核 CSV，`clean_names.py` 默认只生成
   改名计划且 `--apply` 前备份 SQLite 并在数据库更新失败时回滚文件名。
 - 种子包按 ADR-0073、0075、[0106](../../../docs/adr/0106-seed-correction-history-and-explicit-withdrawals.md) 校验；只匹配已有实体，保留源置信度与非种子归属，冲突记 `seed-landing.csv`。
@@ -50,8 +50,7 @@ Windows 写者的托盘在启动与「重启服务」时、子服务停着的间
 
 - `entity(kind, normalized_name)` 唯一约束冲突通常不是 bug，而是同一人的新旧艺名信号。
 - 合并走 `peach.entities.merge_entity`：保留作品多的一侧，迁移关系、别名、外部引用、链接和
-  搜索词，旧称全部留作别名。`entity_external_ref` 每个 provider 只保留一条，同源第二条丢弃
-  并报告，不静默覆盖。
+  搜索词，旧称全部留作别名。`entity_external_ref` 保留同一 provider 的多个独立页面；仅实际约束冲突无法迁移的引用计入 `dropped_refs` 并报告，见 `tests/test_entity_merge.py`。
 - 合并不可逆：先取得用户授权并备份。唯一的自动路径是补别名后继（ADR-0064）：minnano-av 或
   av_neme 名字栏把两条女优实体列成同一个人时，后继自己备份到数据库目录再合；别的判据不得照搬。
 - 两条实现陷阱：sqlite 连接默认 `foreign_keys=OFF`，子表行必须在函数内显式 DELETE，否则留下
@@ -61,7 +60,7 @@ Windows 写者的托盘在启动与「重启服务」时、子服务停着的间
 
 ## 删除
 
-- 物理删除只有一条实现 `purge_assets()`，`/api/batch` 的 `delete` 与 `/api/trash/empty` 共用。
+- 物理删除只有一条实现：`stage_purge()` 在写事务外处理媒体，`commit_purge()` 在事务里复核后删行。
 - 顺序固定：先删媒体文件、再删账本行。删不掉的文件整条跳过并在 `blocked` 里回报，前端必须
   显示 `blocked`。反过来先删行会留下无人认领的媒体文件，那才是不可恢复的丢失。
 - `asset_search` 不列入 `ASSET_REFERENCE_TABLES`，FTS 行由 `0004` 的删除触发器负责。

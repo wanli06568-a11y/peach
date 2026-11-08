@@ -1,4 +1,5 @@
-"""A 盘官方移动：冲突、成员核验、确定性拒绝与状态未知、路径边界。"""
+"""已声明来源的官方移动：冲突、成员核验、确定性拒绝与状态未知、路径边界。"""
+import ssl
 import unittest
 from pathlib import PureWindowsPath
 from types import SimpleNamespace
@@ -11,6 +12,9 @@ import grpc
 from peach.organize_clouddrive import (ACCEPTED, DAV_ORIGIN, REJECTED, MoveNotExecuted, PikPakDav,
                                        UnconfirmedMove)
 from peach import organize_clouddrive
+from peach.task_retry import transient_delay
+
+MAPPING = organize_clouddrive.PikPakPaths('A:\\', '/Pikpak')
 
 
 class Status(grpc.RpcError):
@@ -21,6 +25,129 @@ class Status(grpc.RpcError):
         return self._code
 
 
+class ConfiguredPaths(unittest.TestCase):
+    def setUp(self):
+        self.mapping = organize_clouddrive.PikPakPaths('P:\\Library', '/My cloud/Movies', '/Movies')
+
+    def test_parent_creation_keeps_server_retry_after_but_stops_for_authentication(self):
+        for status, delay in ((429, 1200), (503, 1200), (401, None), (403, None)):
+            with self.subTest(status=status), httpx.Client(transport=httpx.MockTransport(
+                    lambda request, status=status: httpx.Response(status, headers={'Retry-After': '1200'}))) as http:
+                dav = PikPakDav(http, self.mapping, Mock(), listing=lambda path: [], rename=Mock(), move_remote=Mock())
+                with self.assertRaises(OSError) as failure:
+                    dav.ensure_parent('P:\\Library\\new\\film.mp4')
+                self.assertEqual(transient_delay(failure.exception), delay)
+
+    def test_certificate_failure_does_not_become_a_retryable_file_error(self):
+        error = httpx.ConnectError('证书校验失败')
+        error.__cause__ = ssl.SSLCertVerificationError('证书不可信')
+        with httpx.Client(transport=httpx.MockTransport(Mock(side_effect=error))) as http:
+            dav = PikPakDav(http, self.mapping, Mock(), listing=lambda path: [], rename=Mock(), move_remote=Mock())
+            with self.assertRaises(OSError) as failure:
+                dav.ensure_parent('P:\\Library\\new\\film.mp4')
+            self.assertIsNone(transient_delay(failure.exception))
+
+    def test_directory_network_failure_retries_but_permission_failure_stops(self):
+        for code, delay in ((grpc.StatusCode.UNAVAILABLE, 0), (grpc.StatusCode.DEADLINE_EXCEEDED, 0),
+                            (grpc.StatusCode.PERMISSION_DENIED, None)):
+            with self.subTest(code=code):
+                stream = Mock()
+                stream.__iter__ = Mock(side_effect=Status(code))
+                cloud = Mock(token='test-token')
+                cloud.channel.unary_stream.return_value.return_value = stream
+                with self.assertRaises(OSError) as failure:
+                    organize_clouddrive._cloud_listing(cloud, 'P:\\Library', self.mapping)
+                self.assertEqual(transient_delay(failure.exception), delay)
+                stream.cancel.assert_called_once()
+
+    def test_custom_drive_subdirectory_and_remote_name(self):
+        self.assertEqual(self.mapping.cloud_path('p:\\library\\人名\\a.mp4'), '/My cloud/Movies/人名/a.mp4')
+        self.assertEqual(self.mapping.dav_path('P:\\Library\\人名\\a.mp4'), '/Movies/人名/a.mp4')
+        dav = PikPakDav(Mock(), self.mapping, Mock(), listing=Mock(), rename=Mock(), move_remote=Mock())
+        self.assertEqual(unquote(dav.url('P:\\Library\\a b.mp4')), DAV_ORIGIN + '/Movies/a b.mp4')
+        dav.ensure_parent('P:\\Library\\a.mp4')
+        dav.listing.assert_not_called()
+
+    def test_paths_outside_the_declared_directory_are_rejected(self):
+        for path in ('A:\\a.mp4', 'P:\\LibraryOther\\a.mp4', 'P:\\Library\\..\\a.mp4',
+                     'P:Library\\a.mp4', 'P:\\Library\\a.mp4:secret'):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                self.mapping.cloud_path(path)
+
+    def test_mapping_comes_from_the_samples_declared_root(self):
+        roots = {'pikpak': ('P:\\Library', 'Q:\\Second')}
+        prefixes = (organize_clouddrive.CloudPrefix('/My cloud/Movies', 'P:\\Library'),
+                    organize_clouddrive.CloudPrefix('/Another account', 'Q:\\Second'))
+        selected = organize_clouddrive._configured_paths('Q:\\Second\\a.mp4', roots, prefixes)
+        self.assertEqual((selected.root, selected.remote), ('Q:\\Second', '/Another account'))
+        for mappings in ((), prefixes + (organize_clouddrive.CloudPrefix('/Duplicate', 'Q:\\Second'),)):
+            with self.subTest(mappings=mappings), self.assertRaises(ValueError):
+                organize_clouddrive._configured_paths('Q:\\Second\\a.mp4', roots, mappings)
+
+    def test_protocol_requests_use_the_configured_remote_directory(self):
+        cloud = Mock(token='test-token')
+        cloud.channel.unary_unary.return_value.return_value = SimpleNamespace(success=True)
+        organize_clouddrive._move_remote(cloud, 'P:\\Library\\old\\a.mp4',
+                                        'P:\\Library\\new\\a.mp4', self.mapping)
+        request = cloud.channel.unary_unary.return_value.call_args.args[0]
+        self.assertEqual(list(request.theFilePaths), ['/My cloud/Movies/old/a.mp4'])
+        self.assertEqual(request.destPath, '/My cloud/Movies/new')
+        organize_clouddrive._rename_remote(cloud, 'P:\\Library\\old\\a.mp4',
+                                          'P:\\Library\\old\\b.mp4', self.mapping)
+        request = cloud.channel.unary_unary.return_value.call_args.args[0]
+        self.assertEqual((request.path, request.newName), ('/My cloud/Movies/old/a.mp4', 'b.mp4'))
+
+    def test_custom_root_directory_listing_stays_within_mapping(self):
+        cloud = Mock(token='test-token')
+        stream = OfficialDirectoryEvidence.Stream([
+            SimpleNamespace(fullPathName='/My cloud/Movies/a.mp4', size=20, isDirectory=False)])
+        cloud.channel.unary_stream.return_value.return_value = stream
+        self.assertEqual(organize_clouddrive._cloud_listing(cloud, 'P:\\Library', self.mapping),
+                         [dict(path='P:\\Library\\a.mp4', size=20, directory=False)])
+        request = cloud.channel.unary_stream.return_value.call_args.args[0]
+        self.assertEqual(request.path, '/My cloud/Movies')
+        self.assertTrue(stream.cancelled)
+
+    def test_custom_root_authentication_checks_account_relative_path(self):
+        cloud = Mock(token='test-token')
+        cloud.channel.unary_unary.return_value.return_value = SimpleNamespace(
+            directUrl=DAV_ORIGIN + '/Movies/a.mp4', userAgent='',
+            additionalHeaders={'Authorization': 'test-credential'})
+        headers = organize_clouddrive._download_headers(cloud, 'P:\\Library\\a.mp4', self.mapping)
+        self.assertEqual(headers, {'Authorization': 'test-credential'})
+        request = cloud.channel.unary_unary.return_value.call_args.args[0]
+        self.assertEqual(request.path, '/My cloud/Movies/a.mp4')
+
+    def test_declared_root_cannot_be_a_move_target(self):
+        cloud = Mock(token='test-token')
+        with self.assertRaises(ValueError):
+            organize_clouddrive._move_remote(cloud, 'P:\\Library\\nested\\Library',
+                                            'P:\\Library', self.mapping)
+        cloud.channel.unary_unary.assert_not_called()
+
+    def test_channel_uses_the_configured_webdav_account_subdirectory(self):
+        from peach import downloads_clouddrive_pb2 as pb
+        roots = {'pikpak': ('P:\\Library',)}
+        prefix = organize_clouddrive.CloudPrefix('/Renamed account/Movies', 'P:\\Library')
+        with patch.object(organize_clouddrive, 'PushDiscoverySettings') as settings, \
+                patch.object(organize_clouddrive, 'CredentialStore') as credentials, \
+                patch.object(organize_clouddrive, 'DownloadSettings') as downloads, \
+                patch.object(organize_clouddrive, 'CloudDriveClient') as client, \
+                patch.object(organize_clouddrive, '_download_headers', return_value={}) as headers, \
+                patch.object(organize_clouddrive, 'http_client'), \
+                patch.object(organize_clouddrive.organize, 'verified_renames'):
+            settings.return_value.load.return_value = SimpleNamespace(prefixes=(prefix,))
+            credentials.return_value.load.return_value = SimpleNamespace(values={'token': 'test-token'})
+            downloads.return_value.load.return_value = SimpleNamespace(clouddrive_address='http://example.test')
+            cloud = client.return_value.__enter__.return_value
+            cloud.find.return_value = pb.CloudDriveFile(isDirectory=True,
+                CloudAPI=pb.CloudAPI(name='WebDAV', path='/Renamed account'))
+            with organize_clouddrive.pikpak_renames('P:\\Library\\a.mp4', roots) as dav:
+                self.assertEqual(dav.url('P:\\Library\\a.mp4'), DAV_ORIGIN + '/Movies/a.mp4')
+            cloud.find.assert_called_once_with('/Renamed account/Movies')
+            self.assertEqual(headers.call_args.args[2].dav_root, '/Movies')
+
+
 class OfficialMoves(unittest.TestCase):
     def setUp(self):
         self.entries = {'A:\\old': True, 'A:\\old\\film.mp4': 20, 'A:\\new': True}
@@ -28,7 +155,7 @@ class OfficialMoves(unittest.TestCase):
         self.refresh = Mock()
         self.http = httpx.Client(transport=httpx.MockTransport(self.handle), follow_redirects=False)
         self.addCleanup(self.http.close)
-        self.dav = PikPakDav(self.http, 'A:\\', self.refresh, listing=self.listing,
+        self.dav = PikPakDav(self.http, MAPPING, self.refresh, listing=self.listing,
                              rename=Mock(side_effect=self.relocate),
                              move_remote=Mock(side_effect=self.relocate))
 
@@ -189,7 +316,7 @@ class OfficialMoveProtocol(unittest.TestCase):
     def test_conflict_skip_and_false_optional_flags_are_encoded(self):
         cloud = Mock(token='test-token')
         cloud.channel.unary_unary.return_value.return_value = SimpleNamespace(success=True)
-        self.assertEqual(organize_clouddrive._move_remote(cloud, 'A:\\old\\film.mp4', 'A:\\new\\film.mp4'), ACCEPTED)
+        self.assertEqual(organize_clouddrive._move_remote(cloud, 'A:\\old\\film.mp4', 'A:\\new\\film.mp4', MAPPING), ACCEPTED)
         request = cloud.channel.unary_unary.return_value.call_args.args[0]
         self.assertEqual(list(request.theFilePaths), ['/Pikpak/old/film.mp4'])
         self.assertEqual(request.destPath, '/Pikpak/new')
@@ -202,10 +329,10 @@ class OfficialMoveProtocol(unittest.TestCase):
         cloud = Mock(token='test-token')
         for target in ('R:\\film.mp4', 'A:\\new\\other.mp4', 'A:\\old\\film.mp4', 'A:\\new\\..\\film.mp4'):
             with self.subTest(target=target), self.assertRaises(ValueError):
-                organize_clouddrive._move_remote(cloud, 'A:\\old\\film.mp4', target)
+                organize_clouddrive._move_remote(cloud, 'A:\\old\\film.mp4', target, MAPPING)
         for target in ('A:\\new\\title.mp4', 'R:\\old\\title.mp4'):
             with self.subTest(target=target), self.assertRaises(ValueError):
-                organize_clouddrive._rename_remote(cloud, 'A:\\old\\film.mp4', target)
+                organize_clouddrive._rename_remote(cloud, 'A:\\old\\film.mp4', target, MAPPING)
         cloud.channel.unary_unary.assert_not_called()
 
     def test_rpc_timeout_has_no_automatic_resubmission(self):
@@ -214,7 +341,7 @@ class OfficialMoveProtocol(unittest.TestCase):
                 cloud = Mock(token='test-token')
                 cloud.channel.unary_unary.return_value.side_effect = Status(grpc.StatusCode.DEADLINE_EXCEEDED)
                 target = 'A:\\new\\film.mp4' if submit is organize_clouddrive._move_remote else 'A:\\old\\title.mp4'
-                self.assertIsNone(submit(cloud, 'A:\\old\\film.mp4', target))
+                self.assertIsNone(submit(cloud, 'A:\\old\\film.mp4', target, MAPPING))
                 cloud.channel.unary_unary.return_value.assert_called_once()
 
     def test_request_rejections_are_deterministic(self):
@@ -224,21 +351,21 @@ class OfficialMoveProtocol(unittest.TestCase):
                 with self.subTest(code=code, submit=submit.__name__):
                     cloud = Mock(token='test-token')
                     cloud.channel.unary_unary.return_value.side_effect = Status(code)
-                    self.assertEqual(submit(cloud, 'A:\\old\\film.mp4', target), REJECTED)
+                    self.assertEqual(submit(cloud, 'A:\\old\\film.mp4', target, MAPPING), REJECTED)
 
     def test_rename_reply_maps_to_submission_status(self):
         for success, expected in ((True, ACCEPTED), (False, REJECTED)):
             with self.subTest(success=success):
                 cloud = Mock(token='test-token')
                 cloud.channel.unary_unary.return_value.return_value = SimpleNamespace(success=success)
-                self.assertEqual(organize_clouddrive._rename_remote(cloud, 'A:\\old\\film.mp4', 'A:\\old\\title.mp4'), expected)
+                self.assertEqual(organize_clouddrive._rename_remote(cloud, 'A:\\old\\film.mp4', 'A:\\old\\title.mp4', MAPPING), expected)
                 request = cloud.channel.unary_unary.return_value.call_args.args[0]
                 self.assertEqual((request.path, request.newName), ('/Pikpak/old/film.mp4', 'title.mp4'))
 
     def test_cache_scope_rejects_another_drive(self):
         cloud = Mock(token='test-token')
         with self.assertRaises(ValueError):
-            organize_clouddrive._refresh_listing(cloud, 'B:\\MVP')
+            organize_clouddrive._refresh_listing(cloud, 'B:\\MVP', MAPPING)
         cloud.channel.unary_unary.assert_not_called()
 
 
@@ -266,7 +393,7 @@ class OfficialDirectoryEvidence(unittest.TestCase):
         self.cloud.channel.unary_stream.return_value = read
 
     def test_ancestor_listings_confirm_the_complete_unicode_directory(self):
-        rows = organize_clouddrive._cloud_listing(self.cloud, 'A:\\old\\creator@handle')
+        rows = organize_clouddrive._cloud_listing(self.cloud, 'A:\\old\\creator@handle', MAPPING)
         self.assertEqual(rows, [dict(path='A:\\old\\creator@handle\\film.mp4', directory=False, size=20)])
         self.assertEqual(self.paths, [('/Pikpak', True), ('/Pikpak/old', True), ('/Pikpak/old/creator@handle', True)])
         self.assertTrue(all(stream.cancelled for stream in self.streams))
@@ -274,18 +401,18 @@ class OfficialDirectoryEvidence(unittest.TestCase):
     def test_missing_ancestor_does_not_read_an_unverified_child(self):
         self.entries['/Pikpak/old'] = []
         with self.assertRaises(FileNotFoundError):
-            organize_clouddrive._cloud_listing(self.cloud, 'A:\\old\\creator@handle')
+            organize_clouddrive._cloud_listing(self.cloud, 'A:\\old\\creator@handle', MAPPING)
         self.assertEqual(len(self.paths), 2)
 
     def test_foreign_drive_never_uses_the_existing_credential(self):
         with self.assertRaises(ValueError):
-            organize_clouddrive._cloud_listing(self.cloud, 'R:\\Media')
+            organize_clouddrive._cloud_listing(self.cloud, 'R:\\Media', MAPPING)
         self.assertFalse(self.paths)
 
     def test_duplicate_members_stop_and_cancel_the_stream(self):
         self.entries['/Pikpak/old/creator@handle'] *= 2
         with self.assertRaises(ValueError):
-            organize_clouddrive._cloud_listing(self.cloud, 'A:\\old\\creator@handle')
+            organize_clouddrive._cloud_listing(self.cloud, 'A:\\old\\creator@handle', MAPPING)
         self.assertTrue(all(stream.cancelled for stream in self.streams))
 
 
@@ -300,7 +427,7 @@ class AuthenticationSamples(unittest.TestCase):
         stub = cloud.channel.unary_unary.return_value
         stub.side_effect = [self.Missing(), reply]
         with patch.object(organize_clouddrive, '_fallback_samples', return_value=['A:\\available\\image.jpg']):
-            headers = organize_clouddrive._download_headers(cloud, 'A:\\moved\\image.jpg')
+            headers = organize_clouddrive._download_headers(cloud, 'A:\\moved\\image.jpg', MAPPING)
         self.assertEqual(headers, {'Authorization': 'test-credential'})
         self.assertEqual([c.args[0].path for c in stub.call_args_list], ['/Pikpak/moved/image.jpg', '/Pikpak/available/image.jpg'])
 
@@ -309,11 +436,11 @@ class AuthenticationSamples(unittest.TestCase):
         stub = cloud.channel.unary_unary.return_value
         stub.side_effect = self.Missing()
         with patch.object(organize_clouddrive, '_fallback_samples', return_value=['A:\\first.jpg', 'A:\\second.jpg']), self.assertRaises(ValueError):
-            organize_clouddrive._download_headers(cloud, 'A:\\moved.jpg')
+            organize_clouddrive._download_headers(cloud, 'A:\\moved.jpg', MAPPING)
         self.assertEqual(stub.call_count, 3)
 
     def test_foreign_download_source_is_rejected(self):
         cloud = Mock(token='test-token')
         cloud.channel.unary_unary.return_value.return_value = SimpleNamespace(directUrl='https://example.test/image.jpg', additionalHeaders={}, userAgent='')
         with self.assertRaises(ValueError):
-            organize_clouddrive._download_headers(cloud, 'A:\\image.jpg')
+            organize_clouddrive._download_headers(cloud, 'A:\\image.jpg', MAPPING)

@@ -14,9 +14,11 @@
  * 焦点先交给关闭钮，Tab 在面板里转圈，关掉后还给打开前那一枚。 */
 import {
   useLayoutEffect, useRef, useState, useSyncExternalStore,
-  type KeyboardEvent, type ReactNode,
+  type CSSProperties, type KeyboardEvent, type ReactNode,
 } from 'react';
 import { flushSync } from 'react-dom';
+import { useQuery } from '@tanstack/react-query';
+import { VisuallyHidden } from 'react-aria-components';
 import { ButtonLink } from '@/components/base/buttons/button';
 import {
   attachOverlayScrollbar, closeAnchoredMenu, iconSwapHtml, moveGlidePane, revealTexts,
@@ -30,15 +32,22 @@ import { Icon, RemixIcon } from './icon';
 import { IconSwitch, SelectField } from './legacy-controls';
 import { NumberSetting } from './number-setting';
 import type { Choice, PanelSettings, SettingsPanelApi, SettingsPanelHost } from './settings-panel-api';
-import { refreshPanelData, useSaveSettings } from './settings-data';
+import { fetchSettings, refreshPanelData, SETTINGS_KEY, useSaveSettings } from './settings-data';
+import { Note } from '../components/note';
+import { ShortcutSetting } from './shortcut-setting';
 import { SidebarOrder } from './sidebar-order';
+import { NavigationDropLine, NavigationOrderMenu, NavigationOrderPreferences, useNavigationOrder } from '../components/navigation-order';
+import { useSidebarReorder } from '../sidebar/use-sidebar-reorder';
 import { SettingsDialogClose } from '../components/settings-dialog-close';
 
 /* 左栏的分区，顺序即右边各组的顺序。字形按条目自己的名字取：整列取自 Remix，一家画的笔画
    才一样粗。 */
 const SECTIONS = [
-  ['外观与导航', 'ri-palette-line'], ['浏览与播放', 'ri-play-circle-line'],
-  ['JAV 与新作', 'jav'], ['搜索与推荐', 'ri-search-line'], ['内容显示', 'ri-shield-check-line'],
+  { id: 'appearance', title: '外观与导航', icon: 'ri-palette-line' },
+  { id: 'browsing', title: '浏览与播放', icon: 'ri-play-circle-line' },
+  { id: 'jav', title: 'JAV 与新作', icon: 'jav' },
+  { id: 'search', title: '搜索与推荐', icon: 'ri-search-line' },
+  { id: 'content', title: '内容显示', icon: 'ri-shield-check-line' },
 ] as const;
 
 const SORT_OPTIONS: readonly Choice[] = [
@@ -92,7 +101,7 @@ async function checkMachine(current: SettingsPanelHost): Promise<void> {
 function open(section = ''): void {
   const current = host;
   if (!current) return;
-  const requested = SECTIONS.findIndex(([title]) => title === section);
+  const requested = SECTIONS.findIndex(({ title }) => title === section);
   if (view.open && !view.closing) {
     if (requested >= 0 && requested !== view.tab) update({ tab: requested });
     return;
@@ -173,6 +182,18 @@ function SettingsNav({ tab, epoch, configurable, openConfiguration, onSelect }: 
   tab: number; epoch: number; configurable: boolean | null; openConfiguration(): void; onSelect(index: number): void;
 }) {
   const nav = useRef<HTMLDivElement | null>(null);
+  const order = useNavigationOrder('preferences');
+  const items = order.keys.map(key => {
+    const index = SECTIONS.findIndex(section => section.id === key);
+    return { ...SECTIONS[index]!, index };
+  });
+  const [narrow, setNarrow] = useState(() => matchMedia('(max-width:760px)').matches);
+  useLayoutEffect(() => {
+    const media = matchMedia('(max-width:760px)');
+    const changed = () => setNarrow(media.matches);
+    media.addEventListener('change', changed);
+    return () => media.removeEventListener('change', changed);
+  }, []);
   const glide = useRef<HTMLSpanElement | null>(null);
   const box = useRef<{ x: number; y: number; w: number; h: number } | null>(null);
   const shown = useRef(tab);
@@ -190,6 +211,8 @@ function SettingsNav({ tab, epoch, configurable, openConfiguration, onSelect }: 
   };
   const placeRef = useRef(place);
   placeRef.current = place;
+  const reorder = useSidebarReorder(nav, order.keys, order.commit,
+    () => requestAnimationFrame(() => placeRef.current(buttons.current[shown.current], false)), narrow ? 'x' : 'y', 'tab');
 
   useLayoutEffect(() => {
     const node = nav.current;
@@ -204,36 +227,50 @@ function SettingsNav({ tab, epoch, configurable, openConfiguration, onSelect }: 
     const moved = shown.current !== tab;
     shown.current = tab;
     placeRef.current(buttons.current[tab], moved);
-  }, [tab, epoch]);
+  }, [tab, epoch, order.keys.join(',')]);
 
   const keys = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
-    const count = SECTIONS.length;
-    let next = index;
-    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (index + 1) % count;
-    else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = (index + count - 1) % count;
+    if (event.altKey) return;
+    const count = items.length;
+    const position = items.findIndex(item => item.index === index);
+    let next = position;
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (position + 1) % count;
+    else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = (position + count - 1) % count;
     else if (event.key === 'Home') next = 0;
     else if (event.key === 'End') next = count - 1;
     else return;
     event.preventDefault();
-    onSelect(next);
-    buttons.current[next]?.focus();
+    onSelect(items[next].index);
+    buttons.current[items[next].index]?.focus();
   };
 
   /* 整块是一个 tablist：小标题写成 presentation，不占 tab 的位置，方向键从头走到尾。 */
   return (
     <div data-settings-nav="" data-glass-pane="" role="tablist" aria-label="设置分区" ref={nav}
+      data-navigation-order="preferences" data-navigation-axis={narrow ? 'x' : 'y'} data-reordering={reorder.picked ? '' : undefined}
+      onClickCapture={reorder.clickCapture}
       onPointerLeave={(event) => { if (event.pointerType !== 'touch') place(buttons.current[shown.current], true) }}>
       <span data-settings-glide="" aria-hidden="true" hidden ref={glide} />
       <p data-settings-nav-caption="" role="presentation">设置</p>
-      {SECTIONS.map(([title, icon], index) => (
+      {items.map(({ id, title, icon, index }) => (
         <button type="button" role="tab" key={title} id={tabId(index)} aria-controls={groupId(index)}
+          data-tab={id} data-dragging={reorder.picked?.key === id ? '' : undefined}
+          style={{ '--navigation-picked-left': `${reorder.picked?.bounds.left || 0}px`,
+            '--navigation-picked-top': `${reorder.picked?.bounds.top || 0}px`,
+            '--navigation-picked-width': `${reorder.picked?.bounds.width || 0}px`,
+            '--navigation-picked-offset': `${reorder.picked?.offset || 0}px`,
+            '--sidebar-nudge': `${reorder.nudge(id).distance}px`, '--sidebar-delay': `${reorder.nudge(id).delay}ms` } as CSSProperties}
+          {...reorder.bindings(id)} aria-keyshortcuts={narrow ? 'Alt+ArrowLeft Alt+ArrowRight' : 'Alt+ArrowUp Alt+ArrowDown'}
           aria-selected={index === tab} tabIndex={index === tab ? 0 : -1}
           ref={(node) => { buttons.current[index] = node }}
-          onClick={() => onSelect(index)} onKeyDown={(event) => keys(event, index)}
+          onClick={() => onSelect(index)} onKeyDown={(event) => { reorder.bindings(id).onKeyDown(event); keys(event, index) }}
           onPointerEnter={(event) => { if (event.pointerType !== 'touch') place(event.currentTarget, true) }}>
           {icon === 'jav' ? <Icon name={icon} /> : <RemixIcon name={icon} />}{title}
         </button>
       ))}
+      <NavigationDropLine reorder={reorder} />
+      <VisuallyHidden role="status" aria-live="polite">{reorder.announcement}</VisuallyHidden>
+      <NavigationOrderMenu order={order} />
       <div data-settings-service="" role="presentation">
         <button type="button" disabled={configurable !== true} onClick={openConfiguration}
           title={configurable === false ? '请在运行 Peach 的设备上打开 Peach 配置' : undefined}>
@@ -244,10 +281,11 @@ function SettingsNav({ tab, epoch, configurable, openConfiguration, onSelect }: 
   );
 }
 
-function Group({ index, tab, children }: { index: number; tab: number; children: ReactNode }) {
+function Group({ index, tab, children, cards = false }: { index: number; tab: number; children: ReactNode; cards?: boolean }) {
   return (
-    <section data-setting-group="" id={groupId(index)} role="tabpanel" aria-labelledby={tabId(index)} hidden={index !== tab}>
-      <h3>{SECTIONS[index][0]}</h3>
+    <section data-setting-group="" data-setting-layout={cards ? 'cards' : undefined}
+      id={groupId(index)} role="tabpanel" aria-labelledby={tabId(index)} hidden={index !== tab}>
+      <h3>{SECTIONS[index].title}</h3>
       {children}
     </section>
   );
@@ -322,7 +360,7 @@ function SettingsPanel({ host: current, view: shown }: { host: SettingsPanelHost
   useLayoutEffect(() => { resync.current?.() });
 
   const epoch = shown.epoch;
-  const select = (index: number) => { if (index !== view.tab) { update({ tab: index }); current.selectSection?.(SECTIONS[index][0]) } };
+  const select = (index: number) => { if (index !== view.tab) { update({ tab: index }); current.selectSection?.(SECTIONS[index].title) } };
   const save = () => current.store.save();
 
   return (
@@ -331,13 +369,14 @@ function SettingsPanel({ host: current, view: shown }: { host: SettingsPanelHost
       onClick={(event) => { if (event.target === event.currentTarget) close() }}>
       <div data-settings-card="" ref={card}>
         <div data-settings-head="" ref={head}>
-          <h2 id="settingsTitle">{SECTIONS[shown.tab][0]}</h2>
+          <h2 id="settingsTitle">{SECTIONS[shown.tab].title}</h2>
             <SettingsDialogClose id="settingsClose" label="关闭设置" onPress={() => close()} />
         </div>
         <SettingsNav tab={shown.tab} epoch={epoch} configurable={shown.configurable} onSelect={select}
           openConfiguration={() => { close(false); current.openConfiguration() }} />
         <div data-settings-scroll="" ref={scroll}>
-          <Group index={0} tab={shown.tab}>
+          <Group index={0} tab={shown.tab} cards>
+            <div data-setting-card="">
             <Row title="主题">
               <IconSwitch id="themeSetting" name="theme" legend="主题" options={current.themeOptions} value={settings.theme}
                 attr="data-theme-choice" variant="themeswitch" epoch={epoch}
@@ -352,10 +391,14 @@ function SettingsPanel({ host: current, view: shown }: { host: SettingsPanelHost
               onToggle={(on) => { settings.uiSounds = on; save(); current.changed('uiSounds') }} />
             <ToggleRow id="homeGlowSetting" title="侧栏光晕" checked={settings.homeGlow.on}
               onToggle={(on) => { settings.homeGlow.on = on; save(); current.changed('glow') }} />
+            </div>
             <GlowSettings host={current} />
-            <section data-sidebar-setting="" aria-labelledby="sidebarOrderTitle">
-              <span><b id="sidebarOrderTitle">导航入口与顺序</b></span>
-              <SidebarOrder host={current} />
+            <section data-setting-block="" aria-labelledby="sidebarOrderTitle">
+              <h4 data-settings-subheading="" id="sidebarOrderTitle">导航入口与顺序</h4>
+              <div data-setting-card="">
+                <section data-sidebar-setting=""><SidebarOrder host={current} /></section>
+              </div>
+              <div data-setting-card=""><NavigationOrderPreferences /></div>
             </section>
           </Group>
           <BrowseGroup host={current} tab={shown.tab} epoch={epoch} />
@@ -374,6 +417,7 @@ function SettingsPanel({ host: current, view: shown }: { host: SettingsPanelHost
             <ToggleRow id="censorSetting" title="SFW 模式" describedBy="sfwDescription" checked={current.censored()}
               description="隐藏敏感画面，停止悬停预览。"
               onToggle={(on) => current.setCensored(on)} />
+            <ShortcutSetting current={current.sfwShortcut()} onChange={current.setSfwShortcut} />
           </Group>
         </div>
       </div>
@@ -397,6 +441,8 @@ function decorateDirection(field: HTMLElement, ascending: boolean): void {
   if (label) label.textContent = ascending ? '升序' : '降序';
 }
 
+/* 「浏览与播放」分两段：作品列表（网格、排序、卡片与悬停）在前，播放在后。转码方式写的是运行 Peach
+   那台电脑的配置，在 Peach 配置「应用与维护 → 视频播放」，不在这里（ADR-0103）。 */
 function BrowseGroup({ host: current, tab, epoch }: GroupProps) {
   const settings = current.store.value;
   const save = () => current.store.save();
@@ -404,6 +450,7 @@ function BrowseGroup({ host: current, tab, epoch }: GroupProps) {
   const ascending = settings.defaultSortDirection === 'asc';
   return (
     <Group index={1} tab={tab}>
+      <h4 data-settings-subheading="">作品列表</h4>
       <Row title="每批加载作品">
         <div id="batchSizeSetting">
           <NumberSetting key={epoch} id="batchSizeSetting" label="每批作品" value={settings.batchSize}
@@ -425,6 +472,19 @@ function BrowseGroup({ host: current, tab, epoch }: GroupProps) {
           value={current.videoLayout()} attr="data-video-layout" variant="javimageswitch" text epoch={epoch}
           onChoose={(layout) => current.setVideoLayout(layout)} />
       </Row>
+      <label data-setting-row=""><span><b>合并分卷与版本</b></span>
+        <input type="checkbox" id="groupCollapseSetting" data-toggle="" role="switch" checked={settings.groupCollapse}
+          onChange={(event) => { settings.groupCollapse = event.target.checked; save(); current.changed('groupCollapse') }} />
+      </label>
+      <Row title="悬停预览延迟">
+        <div id="hoverDelaySetting">
+          <NumberSetting key={epoch} id="hoverDelaySetting" label="悬停预览延迟" value={settings.hoverDelaySeconds}
+            onApply={(value) => {
+              settings.hoverDelaySeconds = boundedPreference(value, 0, 60, 5); save(); current.changed('hoverDelay');
+            }} />
+        </div>
+      </Row>
+      <h4 data-settings-subheading="">播放</h4>
       <PlaybackRows host={current} epoch={epoch} />
     </Group>
   );
@@ -436,23 +496,50 @@ function JavGroup({ host: current, tab, epoch }: GroupProps) {
   return (
     <Group index={2} tab={tab}>
       <h4 data-settings-subheading="">作品显示</h4>
+      <NameLanguageSetting host={current} epoch={epoch} />
       <Row title="默认图片">
         <IconSwitch id="javImageSetting" name="jav-image" legend="默认图片" options={JAV_IMAGE_OPTIONS}
           value={settings.javImage} attr="data-jav-image-choice" variant="javimageswitch" text epoch={epoch}
           onChoose={(choice) => { settings.javImage = normalizeJavImage(choice); save(); current.changed('javImage') }} />
       </Row>
-      <label data-setting-row=""><span><b>合并分卷与版本</b></span>
-        <input type="checkbox" id="groupCollapseSetting" data-toggle="" role="switch" checked={settings.groupCollapse}
-          onChange={(event) => { settings.groupCollapse = event.target.checked; save(); current.changed('groupCollapse') }} />
-      </label>
       <h4 data-settings-subheading="">新作显示</h4>
-      <ToggleRow id="feedAutoScrollSetting" title="新作自动滚动" checked={settings.feedAutoScroll}
+      <Row title="显示数量">
+        <div id="feedLimitSetting">
+          <NumberSetting key={epoch} id="feedLimitSetting" label="新作显示数量" value={settings.feedLimit}
+            onApply={(value) => { settings.feedLimit = boundedPreference(value, 1, 100, 12); save(); current.changed('feedLimit') }} />
+        </div>
+      </Row>
+      <ToggleRow id="feedAutoScrollSetting" title="自动滚动" checked={settings.feedAutoScroll}
         onToggle={(on) => { settings.feedAutoScroll = on; save(); current.changed('feedAutoScroll') }} />
       {FEED_COMPILATIONS.map(([id, key, label, title]) => (
         <CompilationToggle key={id} host={current} id={id} settingKey={key} label={label} title={title} />
       ))}
     </Group>
   );
+}
+function NameLanguageSetting({ host: current, epoch }: { host: SettingsPanelHost; epoch: number }) {
+  const query = useQuery({ queryKey: SETTINGS_KEY, queryFn: ({ signal }) => fetchSettings(signal), staleTime: 0 });
+  const save = useSaveSettings();
+  const [pending, setPending] = useState<'zh-CN' | 'ja' | null>(null);
+  const language = query.data?.performerNameLanguage;
+  return <>
+    <Row title="女优名称" description={<small data-copy-key="performer-name-language-help">名称与别名只显示所选语言的写法；缺少对应时保留当前名称。偏好保存在数据库，其他设备读取同一份设置。</small>}>
+      <SelectField id="performerNameLanguageSetting" label="女优名称" epoch={epoch}
+        options={[["zh-CN", "中文"], ["ja", "日文原文"]]}
+        value={pending ?? language ?? current.store.value.performerNameLanguage}
+        disabled={query.isPending || query.isError || save.isPending || !language} busy={save.isPending}
+        onPick={(value) => {
+          if (save.isPending || (value !== 'zh-CN' && value !== 'ja') || value === language) return;
+          setPending(value);
+          save.mutate({ performerNameLanguage: value }, {
+            onSuccess: (saved) => { current.syncRemote(saved); current.receipt('已保存名称显示偏好') },
+            onError: (error) => current.failure('保存名称显示偏好', error),
+            onSettled: () => setPending(null),
+          });
+        }} />
+    </Row>
+    {query.isError ? <Note tone="error">未取得数据库中的名称偏好，请重新打开设置。</Note> : null}
+  </>;
 }
 /* 合集开关由服务端判，列表、未读数和补封面排队都跟着它，所以先存到服务端再重画；往返期间开关
    停在新位置、挂忙态，失败退回原位。 */
@@ -491,14 +578,6 @@ function PlaybackRows({ host: current, epoch }: Omit<GroupProps, 'tab'>) {
   const save = () => current.store.save();
   return (
     <>
-      <Row title="悬停预览延迟">
-        <div id="hoverDelaySetting">
-          <NumberSetting key={epoch} id="hoverDelaySetting" label="悬停预览延迟" value={settings.hoverDelaySeconds}
-            onApply={(value) => {
-              settings.hoverDelaySeconds = boundedPreference(value, 0, 60, 5); save(); current.changed('hoverDelay');
-            }} />
-        </div>
-      </Row>
       <ToggleRow id="detailAutoplaySetting" title="打开详情自动播放" checked={settings.detailAutoplay}
         onToggle={(on) => { settings.detailAutoplay = on; save() }} />
       <ToggleRow id="miniplayerSetting" title="离开详情后小窗播放" checked={settings.miniplayer}

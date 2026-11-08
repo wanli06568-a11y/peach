@@ -18,6 +18,7 @@ import type { SidebarApi, SidebarHost } from './sidebar/sidebar-api';
 import type { ManageHeaderApi, ManageHeaderHost } from './manage-header/manage-header-api';
 import type { BatchDockApi, BatchDockHost } from './batch-dock/batch-dock-api';
 import type { GlowPickerHost } from './glow-picker/glow-picker-api';
+import type { CoverItem, FaceRef } from '@peach/card-art';
 
 export type { IndexProps };
 export type { CatalogGridProps };
@@ -49,6 +50,10 @@ export interface TunnelState {
 export interface AccessSettingsProps {
   initial: AccessState;
   receipt(message: string): void;
+  /** 需要登录时紧跟在密码分区下面的设备列表；改密码后拿到新 `revision` 重新画。 */
+  devices?(state: AccessState): import('react').ReactNode;
+  /** 不论访问方式都跟在后面的分区（访问口令）；确认文案随当前访问方式变。 */
+  after?(state: AccessState): import('react').ReactNode;
 }
 
 export interface StartupState {
@@ -57,6 +62,41 @@ export interface StartupState {
 
 export interface UninstallState {
   available: boolean; full_available: boolean; message: string; data_root: string; directories: string[];
+}
+
+/** 数据目录里的一类数据。`reclaimable` 是清理这一类能腾出的字节。 */
+export interface StorageCategory {
+  key: string; label: string; description: string; note: string; cleanable: boolean;
+  bytes: number; files: number; reclaimable: number;
+}
+
+export interface StorageRelocation { state: 'done' | 'error'; message: string; notes?: string[]; finished_at: number }
+
+export interface StorageState {
+  data_root: string;
+  free_bytes: number | null;
+  total_bytes: number | null;
+  system_drive: boolean;
+  budget?: { policy: StoragePolicy | null; error: string; recommendation_state?: string; last_check: {
+    checked_at: number; paused: boolean; reasons: string[]; freed_bytes: number;
+    cache_bytes: number | null; data_bytes: number | null; external_cache_bytes: number | null;
+  } | null };
+  usage: { measured_at: number; total_bytes: number; total_files: number; categories: StorageCategory[];
+    allocated_bytes?: number | null; managed_cache_bytes?: number | null; external_cache_bytes?: number | null;
+    capacity_error?: string } | null;
+  job: { state: 'idle' | 'measuring' | 'cleaning'; category?: string; categories?: string[]; message: string; error?: boolean;
+    files?: number; bytes?: number; expected_files?: number | null };
+  relocation: { available: boolean; message: string; steps?: { text: string; command: string }[]; last: StorageRelocation | null };
+}
+
+export interface StoragePolicy {
+  enabled: boolean;
+  minimum_free_gib: number;
+  data_max_gib: number;
+  cache_max_gib: number;
+  auto_clean: boolean;
+  external_cache_path: string;
+  external_cache_max_gib: number;
 }
 
 export interface PeachProxyState { mode: string; proxy_saved: boolean; needs_selection: boolean }
@@ -106,12 +146,12 @@ export interface AutomaticUpdateState {
   mode: string; interval_hours: number; available: boolean; download_available: boolean; error?: string;
 }
 
-/** 云下载的两条渠道：115 经 CloudDrive2，PikPak 直连。 */
-export type DownloadProviderKey = '115' | 'pikpak';
+/** 媒体库中可用的直连渠道与 CloudDrive2 路径渠道。 */
+export type DownloadProviderKey = '115' | 'pikpak' | `clouddrive:${string}:${string}`;
 
 export interface DownloadConfig {
   clouddrive_address: string;
-  targets: Partial<Record<DownloadProviderKey, string>>;
+  targets: Record<string, string>;
   /** PikPak 根目录对应的数据库路径前缀，空串表示还没选。 */
   pikpak_root: string;
   wait_hours: number;
@@ -121,6 +161,8 @@ export type PikPakBrowserState = 'idle' | 'waiting' | 'done' | 'cancelled' | 'ti
 
 /** 设置页的云下载块。凭据只报存没存过，不回值。 */
 export interface DownloadSettingsState {
+  problems?: string[];
+  media_sources: string[];
   available: boolean;
   config: DownloadConfig;
   token_set: boolean;
@@ -174,6 +216,9 @@ export interface DownloadTask {
   code: string | null;
   title: string | null;
   origin: string | null;
+  display_code?: string | null;
+  display_title?: string | null;
+  artwork?: (CoverItem & { performer_entities?: (FaceRef & { name: string })[]; performer_total?: number }) | null;
   state: string;
   state_label: string;
   failure: string | null;
@@ -199,14 +244,18 @@ export interface DownloadTask {
 }
 
 export interface DownloadsSnapshot {
+  total?: number;
+  page?: number;
   available: boolean;
   providers: { key: DownloadProviderKey; label: string; configured: boolean; target: string }[];
   tasks: DownloadTask[];
+  has_more?: boolean;
+  next_before_id?: number | null;
 }
 
 export interface DownloadSubmitResult {
   ok: boolean;
-  outcome: 'submitted' | 'adopted' | 'adopted_remote' | 'refused' | 'failed';
+  outcome: 'submitted' | 'adopted' | 'adopted_remote' | 'deferred' | 'refused' | 'failed';
   task: DownloadTask;
 }
 
@@ -219,8 +268,16 @@ export interface ReleaseState {
   message: string;
   release_url: string;
   checked_at?: number;
-  package_kind?: 'update' | 'full';
+  /** `installer` 是 macOS 的 DMG：没有应用内安装，下载后手动替换。 */
+  package_kind?: 'update' | 'full' | 'installer';
+  asset_url?: string;
   asset_size?: number;
+  /** 能在页面里下载并重启安装；只有 Windows 独立包是 true。 */
+  in_app_update?: boolean;
+  /** 容器换新版要在宿主机上做的几步；其他安装方式是空表。 */
+  steps?: { text: string; command: string }[];
+  /** Docker 镜像检查到新镜像时才有：能否经 Watchtower 一键更新（ADR-0140），不能时 `reason` 说明为什么。 */
+  one_click?: { available: boolean; reason: string };
 }
 
 export interface UpdateJob {
@@ -228,7 +285,11 @@ export interface UpdateJob {
 }
 
 export interface MediaSource {
+  transport?: 'filesystem' | 'smb'; smb_username?: string; smb_password_saved?: boolean; smb_encrypt?: boolean;
+  root_id?: string; library_id?: string;
   location: string; root: string; path: string; online?: boolean; library?: string; library_icon?: string; cost?: 'free' | 'metered';
+  /** 媒体库来源色（强调色键名，空串不上色）与处理方式；`library_stages` 是自定义时所选步骤，逗号分隔。 */
+  library_color?: string; library_policy?: 'auto' | 'local' | 'custom'; library_stages?: string;
 }
 
 export interface ConfigurationFact {
@@ -236,14 +297,18 @@ export interface ConfigurationFact {
   value: string;
   download_url?: string;
   download_label?: string;
+  /** 能由 Peach 装进数据目录的缺失工具（`ffmpeg`、`untrunc`），有它就不给下载外链。 */
+  install_tool?: string;
 }
 
 export interface ConfigurationData {
+  section_errors?: Record<string, { title: string; message: string; error_id: string }>;
   remote_reporting?: import('./settings/remote-reporting-settings').RemoteReportingState;
   library_sharing?: import('./settings/library-sharing-settings').LibrarySharingState;
   ledger_read_only?: boolean;
   startup?: StartupState;
   uninstall?: UninstallState;
+  storage?: StorageState;
   peach_proxy?: PeachProxyState;
   entry_links?: EntryLinksState;
   push_discovery?: PushDiscoveryState;
@@ -252,6 +317,9 @@ export interface ConfigurationData {
   update_job?: UpdateJob;
   automatic_updates?: AutomaticUpdateState;
   access?: AccessState;
+  api_token?: import('./settings/api-token-settings').ApiTokenState;
+  /** 没有 HTTPS 服务或没有本机 CA 时为 null，那一块整个不渲染。 */
+  certificate?: import('./settings/certificate-trust').CertificateState | null;
   tunnel?: TunnelState;
   editable: boolean;
   /** 不能编辑时给用户看的原因，可编辑时为空。 */
@@ -265,6 +333,10 @@ export interface ConfigurationData {
   windows?: boolean;
   port: number;
   port_editable?: boolean;
+  network?: {
+    editable: boolean; host: string; mdns_name: string; scope: 'local' | 'lan';
+    local_url: string; lan_url: string; ip_url: string;
+  };
   mount_dependencies?: { name: string; available: boolean; download_url: string }[];
   facts: ConfigurationFact[];
 }
@@ -292,6 +364,7 @@ export interface ConfigurationPanel {
 export interface ConfigurationGroupProps extends Pick<ConfigurationProps, 'receipt'> {
   data: ConfigurationData;
   panel?: ConfigurationPanel;
+  issues?: import('react').ReactNode;
 }
 
 /** 高清版目标页仍由遗留层提供的能力。全是纯函数或导航，页面不持有它们的状态。 */
@@ -314,10 +387,6 @@ export interface StatsProps {
   tagLabel(key: string): string;
   /** 点一个内容标签：回目录并按它筛选。整页换成目录由遗留壳做。 */
   onTag(key: string): void;
-  /** 打开配置页的「媒体」页签。没有视频或没有存储来源时空态里的那个去处。 */
-  openMediaSettings(): void;
-  /** 这台机器能不能改配置。不能改时空态不给「添加媒体目录」。 */
-  configurable: boolean;
 }
 
 /** 口味页仍由遗留层提供的能力。都是导航、查表或回执，页面不持有它们的状态。 */
@@ -360,7 +429,6 @@ export interface FollowManageProps {
   toast(message: string): void;
   /** 去「看更新」那一页（`/follow`）。整页换成哪一屏仍归遗留壳。 */
   openFollow(): void;
-  openServiceConfiguration(): void;
   /** 数据库只读：这台机器只能浏览，写操作全部不给点。 */
   readOnly: boolean;
   readOnlyMessage: string;
@@ -376,8 +444,9 @@ export interface FollowManageProps {
 export interface ReviewProps {
   /** 地址栏此刻带着的分类。不认识的值退回默认那一档。 */
   category: string;
+  queue?: string;
   /** 把分类写回地址栏。空串表示这一项此刻就是默认值，壳不写进去。 */
-  route(params: { category: string }): void;
+  route(params: { category: string; queue?: string }): void;
   /** 打开作品详情（遗留层的整页视图，含播放器与队列）。 */
   openItem(id: number): void;
   /** 打开实体资料页。`kind` 是 `creator`／`performer`。 */
@@ -436,6 +505,7 @@ export type DataCleanupSection = 'review' | 'quality' | 'duplicates' | 'ads' | '
 
 /** 数据管理页仍由遗留层提供的能力：回执和换页。 */
 export interface DataCleanupProps {
+  navigate(path: string): void;
   /** 操作回执（遗留层 `actionReceipt`）。`warning` 是做完了但有一部分要留意，走警告音效。 */
   toast(message: string, options?: { warning?: boolean }): void;
   /** 失败回执（遗留层 `actionFailure`）：`action` 是没做成的那件事。 */

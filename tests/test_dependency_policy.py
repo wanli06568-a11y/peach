@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import contextlib
+import io
 import json
 from pathlib import Path
 import re
@@ -17,9 +19,101 @@ from tests.support.gitrepo import seed_repository
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class NativeTransportSecurityTests(unittest.TestCase):
+    def test_bundled_brotli_has_the_security_fix(self):
+        from curl_cffi import Curl
+        curl = Curl()
+        try:
+            native = curl.version().decode("ascii")
+        finally:
+            curl.close()
+        version = re.search(r"\bbrotli/(\d+)\.(\d+)\.(\d+)", native)
+        self.assertIsNotNone(version, native)
+        self.assertGreaterEqual(tuple(map(int, version.groups())), (1, 2, 1), native)
+
+
+class NpmInstallTests(unittest.TestCase):
+    def test_transport_errors_retry_the_same_locked_install(self):
+        from scripts import npm_ci
+        for style in ("error", "ERR!"):
+            for code in ("ECONNRESET", "ETIMEDOUT", "EAI_AGAIN"):
+                with self.subTest(style=style, code=code):
+                    interrupted = subprocess.CompletedProcess([], 152, "", f"npm {style} code {code}\n")
+                    clean = subprocess.CompletedProcess([], 0, "installed\n", "")
+                    run, sleep = mock.Mock(side_effect=[interrupted, clean]), mock.Mock()
+                    self.assertEqual(npm_ci.install(ROOT, ignore_scripts=True, runner=run, sleep=sleep), 0)
+                    self.assertEqual(run.call_count, 2)
+                    self.assertEqual(run.call_args_list[0], run.call_args_list[1])
+                    self.assertIn("--ignore-scripts", run.call_args.args[0])
+                    self.assertEqual(run.call_args.kwargs["cwd"], ROOT)
+                    sleep.assert_called_once_with(5)
+
+    def test_transport_exhaustion_keeps_the_failure(self):
+        from scripts import npm_ci
+        run = mock.Mock(return_value=subprocess.CompletedProcess([], 152, "", "npm error code ECONNRESET\n"))
+        sleep = mock.Mock()
+        self.assertEqual(npm_ci.install(ROOT, runner=run, sleep=sleep), 152)
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [mock.call(5), mock.call(10)])
+
+    def test_lock_and_lifecycle_failures_are_not_retried(self):
+        from scripts import npm_ci
+        for code in ("EUSAGE", "ELIFECYCLE", "EINTEGRITY"):
+            with self.subTest(code=code):
+                run = mock.Mock(return_value=subprocess.CompletedProcess(
+                    [], 1, "a lifecycle mentioned ECONNRESET", f"npm error code {code}\n"))
+                sleep = mock.Mock()
+                self.assertEqual(npm_ci.install(ROOT, runner=run, sleep=sleep), 1)
+                run.assert_called_once()
+                sleep.assert_not_called()
+
+
+def _docker_context_includes(rules, relative):
+    """按 .dockerignore 末条命中者为准判定路径是否进入构建上下文，父目录命中也算。"""
+    parts = relative.split('/')
+    included = True
+    for negated, pattern in rules:
+        if any(pattern.fullmatch('/'.join(parts[:depth])) for depth in range(1, len(parts) + 1)):
+            included = negated
+    return included
+
+
+class DockerBuildContextTests(unittest.TestCase):
+    def test_build_stage_receives_every_bundled_runtime_resource(self):
+        from peach.bundle_resources import data_files
+        rules = []
+        for line in (ROOT / '.dockerignore').read_text(encoding='utf-8').splitlines():
+            if line.strip() and not line.startswith('#'):
+                negated, pattern = line.startswith('!'), line.lstrip('!').rstrip('/')
+                regex = re.escape(pattern).replace(r'\*\*', '.*').replace(r'\*', '[^/]*')
+                rules.append((negated, re.compile(regex)))
+        stage = (ROOT / 'Dockerfile').read_text(encoding='utf-8').split(' AS build\n', 1)[1].split('\nFROM ', 1)[0]
+        with tempfile.TemporaryDirectory() as folder:
+            app = Path(folder)
+            for line in stage.splitlines():
+                words = line.split()
+                if not words or words[0] != 'COPY' or words[1].startswith('--'):
+                    continue
+                *sources, destination = words[1:]
+                for source in sources:
+                    origin = ROOT / source
+                    files = [origin] if origin.is_file() else [p for p in origin.rglob('*') if p.is_file()]
+                    for path in files:
+                        if not _docker_context_includes(rules, path.relative_to(ROOT).as_posix()):
+                            continue
+                        target = app / destination / (path.name if origin.is_file() else path.relative_to(origin))
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(b'')
+            data_files(app)
+
+
 class NpmAuditTests(unittest.TestCase):
+    def setUp(self):
+        self.output = io.StringIO()
+        self.enterContext(contextlib.redirect_stdout(self.output))
+
     def test_docker_dependency_updates_have_a_takeover_recipe(self):
-        for manifest in ('Dockerfile', '.github/actions/actionlint/Dockerfile'):
+        for manifest in ('Dockerfile', '.github/actions/actionlint/Dockerfile', 'compose.yaml'):
             self.assertEqual(adopt.recipe_for([manifest])[0], 'docker')
 
     def test_high_and_critical_vulnerabilities_fail_without_network_retries(self):
@@ -31,6 +125,7 @@ class NpmAuditTests(unittest.TestCase):
                     {'metadata': {'vulnerabilities': counts}}), '')
                 run, sleep = mock.Mock(return_value=response), mock.Mock()
                 self.assertEqual(npm_audit.audit(ROOT, runner=run, sleep=sleep), 1)
+                self.assertEqual(json.loads(self.output.getvalue().splitlines()[-1])['decision'], 'vulnerable')
                 self.assertEqual(run.call_count, 1)
                 sleep.assert_not_called()
 
@@ -94,6 +189,7 @@ class DependencyPolicyTests(unittest.TestCase):
         owners = {
             "tldextract": "tldextract",
             "AppKit": "pyobjc-framework-Cocoa",
+            "Foundation": "pyobjc-framework-Cocoa",
             "PIL": "pillow",
             "PyObjCTools": "pyobjc-framework-Cocoa",
             "apscheduler": "APScheduler",
@@ -101,6 +197,7 @@ class DependencyPolicyTests(unittest.TestCase):
             "browserexport": "browserexport",
             "ahocorasick": "pyahocorasick",
             "bs4": "beautifulsoup4",
+            "cryptography": "cryptography",
             "curl_cffi": "curl_cffi",
             "cv2": "opencv-python-headless",
             "dmgbuild": "dmgbuild",
@@ -118,10 +215,14 @@ class DependencyPolicyTests(unittest.TestCase):
             "psutil": "psutil",
             "pydantic": "pydantic",
             "pystray": "pystray",
+            "qrcode": "qrcode",
             "resvg_py": "resvg-py",
             "sentry_sdk": "sentry-sdk",
+            "smbclient": "smbprotocol",
+            "smbprotocol": "smbprotocol",
             "starlette": "starlette",
             "torznab": "torznab",
+            "tzlocal": "tzlocal",
             "uvicorn": "uvicorn",
             "watchdog": "watchdog",
             "wordninja_enhanced": "wordninja-enhanced",
@@ -308,6 +409,13 @@ class DependencyPolicyTests(unittest.TestCase):
                 adopt.bring_over("dep", ("package.json",), root=repo)
             self.assertEqual(caught.exception.files, ["package.json"])
 
+    def test_bridge_dependencies_are_isolated_from_application_dependencies(self):
+        key, recipe = adopt.recipe_for(["tools/amane-bridge/uv.lock"])
+        self.assertEqual(key, "amane")
+        self.assertEqual(recipe["checks"], (("uv", "lock", "--project", "tools/amane-bridge", "--check"),))
+        with self.assertRaises(RuntimeError):
+            adopt.recipe_for(["uv.lock", "tools/amane-bridge/uv.lock"])
+
     def test_adopting_every_open_pr_stops_at_a_conflict_and_resumes_after_it(self):
         """`--all-open` 一个 PR 一个提交；改到相邻行的那个停下报文件，解完再跑只剩收尾。
 
@@ -334,7 +442,7 @@ class DependencyPolicyTests(unittest.TestCase):
             log = git(repo, "log", "--format=%B", "-2")
             for number in (1, 2):
                 self.assertIn(f"Dependabot PR #{number} 没有派生产物", log)
-            self.assertIn("README-Impact: none; ", log)
+            self.assertIn(f"Co-Authored-By: {signature}", log)
             self.assertIn("git commit -F build/adopt-pr-3.txt", stopped["next"])
 
             (repo / ".github/workflows/test.yml").write_bytes(workflow(2, 2))
@@ -350,21 +458,33 @@ class DependencyPolicyTests(unittest.TestCase):
             closing = [step for step in resumed["next"] if step.startswith("gh pr close")]
             self.assertEqual([step.split()[3] for step in closing], ["1", "2", "3"])
 
-    def test_the_takeover_commit_message_passes_the_readme_impact_gate(self):
-        """`README-Impact` 与 `Co-Authored-By` 必须同一个 trailer 块、中间不空行。
+    def test_a_reference_to_a_pr_keeps_its_dependency_update_pending(self):
+        with tempfile.TemporaryDirectory() as holder:
+            repo = seed_repository(Path(holder).resolve() / "repo",
+                                   {".github/workflows/test.yml": b"a: 1\n"}, "base")
+            takeover_repository(repo)
+            branch = "dependabot/example"
+            dependabot_branch(repo, branch, {".github/workflows/test.yml": b"a: 2\n"})
+            adopt.fetch(branch, root=repo)
+            git(repo, "commit", "--allow-empty", "-qm", "fix(deps): 核对独立依赖清单",
+                "-m", "来源为 Dependabot PR #133 的实际文件范围")
+            self.assertFalse(adopt.adopted(133, branch, root=repo))
+            result = adopt.adopt({"number": 133, "headRefName": branch}, apply=True,
+                                 signature="Codex (GPT-6) <noreply@openai.com>", root=repo)
+            self.assertTrue(result["applied"])
+            self.assertTrue(adopt.adopted(133, branch, root=repo))
+            self.assertEqual((repo / ".github/workflows/test.yml").read_bytes(), b"a: 2\n")
 
-        隔一个空行 `git interpret-trailers` 就只认后一个，`ready` 会报「交付提交须有唯一
-        README-Impact」——这条我在 0.29.0 那次亲手踩过。
-        """
+    def test_takeover_message_includes_source_rebuild_steps_and_the_supplied_author(self):
         signature = "Claude Code (Opus 5) <noreply@anthropic.com>"
         message = adopt.commit_message("web", ["lucide-static 1.38.0 → 1.40.0"],
                                        "4", signature)
-        self.assertIn("\nREADME-Impact: none; ", message)
-        self.assertRegex(message, r"README-Impact: none; [^\n]+\nCo-Authored-By: ")
+        self.assertIn("\nRefs #4\n", message)
         self.assertIn("PR #4", message)
         self.assertIn("npm run vendor:web", message)
         self.assertIn("lucide-static 1.38.0 → 1.40.0", message)
         self.assertIn(f"Co-Authored-By: {signature}", message)
+        self.assertNotIn("README-Impact:", message)
         # 署名由调用方给：跑接管的可能是任一个智能体，写死一个工具名就是记错人。
         with self.assertRaisesRegex(ValueError, "--co-author"):
             adopt.commit_message("web", [], "4", "Claude Code")

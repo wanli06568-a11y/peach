@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import html
+import hashlib
 import json
 import re
 import time
@@ -401,15 +402,9 @@ _PAHEAL_LIST_RE = re.compile(r"^/post/list/([^/]+)/\d+$")
 
 
 def canonical_source_ref(provider: str, ref: str) -> str:
-    """Return the provider's stable source identity.
-
-    Most provider ids are case-sensitive opaque values.  rule34.xxx tags are not:
-    the API returns the same feed for ``LazyProcrastinator`` and
-    ``lazyprocrastinator``.  Keeping the pasted spelling in the unique key therefore
-    creates duplicate subscriptions when the same author is added in two batches.
-    """
+    """来源的稳定身份；booru 标签与 Iwara 用户名忽略大小写。"""
     value = str(ref or "").strip()
-    return value.casefold() if provider in {"rule34xxx", "rule34paheal"} else value
+    return value.casefold() if provider in {"rule34xxx", "rule34paheal", "iwara"} else value
 
 
 #: 线程 slug 里从这个 token 起就不是作品名了：f95 的惯例是
@@ -773,6 +768,197 @@ class _BaseConnector:
             self.transport, credential=self.gofile_credential,
             timeout=self.timeout, max_bytes=self.max_bytes, max_items=self.max_items,
         ).expand(links, labels=labels)
+
+
+class IwaraConnector(_BaseConnector):
+    """Iwara 作者视频列表及播放格式；协议依据见 docs/REUSE.md。"""
+
+    provider = "iwara"
+    API_ROOT = "https://apiq.iwara.tv"
+    PAGE_SIZE = 32
+    _HANDLE_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+    _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9]{1,80}$")
+
+    def __init__(self, **kwargs):
+        if kwargs.get("transport") is None:
+            kwargs["transport"] = CurlCffiTransport(impersonate="chrome")
+        super().__init__(**kwargs)
+
+    @classmethod
+    def parse_url(cls, provider, parsed, host):
+        matched = re.fullmatch(r"/profile/([A-Za-z0-9_-]{1,80})(?:/videos)?/?",
+                               parsed.path)
+        if host not in {"iwara.tv", "ecchi.iwara.tv"} or not matched:
+            raise FollowSourceError("Iwara 请粘贴作者主页，例如 https://www.iwara.tv/profile/username")
+        ref = matched.group(1).casefold()
+        return ParsedSource(provider, ref, f"https://www.iwara.tv/profile/{ref}", ref)
+
+    @classmethod
+    def profile_handle(cls, ref):
+        value = str(ref or "").strip()
+        return value if cls._HANDLE_RE.fullmatch(value) else ""
+
+    def _headers(self):
+        headers = {**super()._headers(), "Accept": "application/json",
+                   "Origin": "https://www.iwara.tv", "Referer": "https://www.iwara.tv/",
+                   "X-Site": "www.iwara.tv"}
+        if self.credential and self.credential.values.get("access_token"):
+            headers["Authorization"] = "Bearer " + self.credential.values["access_token"]
+        return headers
+
+    def _check_status(self, response):
+        if response.status in (401, 403):
+            raise FollowSourceError(
+                f"Iwara 拒绝访问（HTTP {response.status}）：登录凭据可能已过期，"
+                "或站点要求浏览器验证，请核对来源与订阅设置")
+        if response.status == 404:
+            raise FollowSourceError("Iwara 作者或视频未取得：可能已删除或需要有访问权的账号")
+        super()._check_status(response)
+
+    def _object(self, response):
+        payload = self.parse_json(response)
+        if not isinstance(payload, dict):
+            raise FollowSourceError("Iwara 接口响应格式不符")
+        if payload.get("message"):
+            code = str(payload["message"])
+            if code in {"errors.privateVideo", "errors.notFound", "errors.unauthorized"}:
+                raise FollowSourceError("Iwara 内容未取得：请确认账号有访问权并更新登录凭据")
+            raise FollowSourceError("Iwara 接口拒绝请求，请在来源页面核对内容状态")
+        return payload
+
+    def fetch(self, ref, *, etag=None, last_modified=None, page=0):
+        handle = self.profile_handle(ref).casefold()
+        if not handle:
+            raise FollowSourceError("Iwara 的 ref 必须是作者用户名")
+        if int(page) < 0:
+            raise FollowSourceError("Iwara 页码不能小于 0")
+        profile = self.fetch_json(f"{self.API_ROOT}/profile/{handle}")
+        if not isinstance(profile, dict) or not isinstance(profile.get("user"), dict):
+            raise FollowSourceError("Iwara 作者资料格式不符")
+        user = profile["user"]
+        user_id = str(user.get("id") or "")
+        if not re.fullmatch(r"[A-Za-z0-9-]{1,80}", user_id):
+            raise FollowSourceError("Iwara 作者 ID 未取得")
+        url = self.API_ROOT + "/videos?" + urllib.parse.urlencode({
+            "user": user_id, "page": int(page), "limit": self.PAGE_SIZE,
+            "sort": "date", "rating": "all"})
+        common, response = self._request(url, ref=handle, page=page,
+                                         etag=etag, last_modified=last_modified)
+        if response is None:
+            return SourceFetch(not_modified=True, **common)
+        payload = self._object(response)
+        rows = payload.get("results")
+        if not isinstance(rows, list):
+            raise FollowSourceError("Iwara 视频列表格式不符")
+        if page and not rows:
+            raise FollowHistoryEnd("没有更多历史内容")
+        candidates = []
+        seen = set()
+        for row in rows[:self.max_items]:
+            candidate = self._candidate(row, user, handle)
+            if candidate.external_id in seen:
+                continue
+            seen.add(candidate.external_id)
+            candidates.append(candidate)
+        return SourceFetch(candidates=tuple(candidates), raw_body=response.body, **common)
+
+    def _candidate(self, row, user, handle):
+        """把列表字段映射为稳定 DTO，不保存短效文件地址。"""
+        if not isinstance(row, dict) or not self._VIDEO_ID_RE.fullmatch(str(row.get("id") or "")):
+            raise FollowSourceError("Iwara 视频条目缺少有效 ID")
+        video_id = row["id"]
+        file = row.get("file") if isinstance(row.get("file"), dict) else {}
+        file_id = str(file.get("id") or "")
+        thumbnail = None
+        if re.fullmatch(r"[A-Za-z0-9-]{1,80}", file_id):
+            thumbnail = f"https://files.iwara.tv/image/thumbnail/{file_id}/thumbnail-00.jpg"
+        url = f"https://www.iwara.tv/video/{video_id}"
+        extra = {"media_kind": "video", **self._tag_metadata(row.get("tags"))}
+        if row.get("embedUrl"):
+            extra["media_error"] = "Iwara 此条目使用外部播放器，请打开来源页面观看"
+        return FollowCandidate(
+            provider=self.provider, external_id=video_id,
+            title=plain_text(str(row.get("title") or "")) or video_id,
+            url=url, media_url=None if row.get("embedUrl") else url,
+            thumb_url=thumbnail, published_at=_iso_from_text(row.get("createdAt")),
+            duration=self._duration(file.get("duration")),
+            author=plain_text(str(user.get("name") or handle)),
+            summary=plain_text(str(row.get("body") or "")) or None, extra=extra)
+
+    @staticmethod
+    def _tag_metadata(value):
+        """仅接纳上游明确的 general 类型，其他类型保留原值。"""
+        rows = value if isinstance(value, list) else []
+        tags = [tag for tag in rows if isinstance(tag, dict)
+                and isinstance(tag.get("id"), str)]
+        source_types = {tag["id"]: tag["type"] for tag in tags
+                        if isinstance(tag.get("type"), str) and tag["type"]}
+        return {"tags": [tag["id"] for tag in tags], "source_tag_types": source_types,
+                "tag_types": {name: "general" for name, kind in source_types.items()
+                              if kind == "general"}}
+
+    @staticmethod
+    def _duration(value):
+        try:
+            seconds = float(value)
+            return seconds if 0 < seconds < 10 ** 7 else None
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def media_url_allowed(url):
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            return (parsed.scheme == "https" and parsed.port in {None, 443}
+                    and not parsed.username and not parsed.password
+                    and (parsed.hostname == "iwara.tv"
+                         or str(parsed.hostname or "").endswith(".iwara.tv")))
+        except ValueError:
+            return False
+
+    def playback_formats(self, video_id):
+        """播放时取得短效格式清单；凭据只发送到固定 API。"""
+        if not self._VIDEO_ID_RE.fullmatch(str(video_id or "")):
+            raise FollowSourceError("Iwara 视频 ID 无效")
+        response = self._get(f"{self.API_ROOT}/video/{video_id}")
+        self._check_status(response)
+        detail = self._object(response)
+        file_url = str(detail.get("fileUrl") or "")
+        if not file_url:
+            raise FollowSourceError("Iwara 正片地址未取得，请打开来源页面核对访问权")
+        if not self.media_url_allowed(file_url):
+            raise FollowSourceError("Iwara 返回了不受信任的文件接口地址")
+        parsed = urllib.parse.urlsplit(file_url)
+        expires = urllib.parse.parse_qs(parsed.query).get("expires", [""])[0]
+        if not expires.isdecimal():
+            raise FollowSourceError("Iwara 文件接口缺少有效期限")
+        # yt-dlp IwaraIE 的公开文件接口签名，固定 revision 见 docs/REUSE.md。
+        key = "_".join((parsed.path.rstrip("/").rsplit("/", 1)[-1], expires,
+                        "mSvL05GfEmeEmsEYfGCnVpEjYgTJraJN"))
+        response = self._get(file_url, connector_headers=False,
+                             headers={"X-Version": hashlib.sha1(key.encode()).hexdigest()})
+        self._check_status(response)
+        rows = self.parse_json(response)
+        if not isinstance(rows, list):
+            raise FollowSourceError("Iwara 播放格式清单不符")
+        formats = []
+        file = detail.get("file") if isinstance(detail.get("file"), dict) else {}
+        source_height = file.get("height")
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get("src"), dict):
+                continue
+            value = str(row["src"].get("view") or row["src"].get("download") or "")
+            value = "https:" + value if value.startswith("//") else value
+            if not self.media_url_allowed(value):
+                continue
+            name = str(row.get("name") or "")
+            level = int(name) if name.isdecimal() else (
+                int(source_height) if name == "Source" and str(source_height).isdecimal() else 0)
+            formats.append((level, value, name == "Source"))
+        if not formats:
+            raise FollowSourceError("Iwara 正片格式未取得")
+        return tuple((level, value) for level, value, _ in sorted(
+            formats, key=lambda entry: (entry[2], entry[0]), reverse=True))
 
 
 class KemonoConnector(_BaseConnector):
@@ -1335,6 +1521,13 @@ class Rule34VideoConnector(_BaseConnector):
         if not video and not tags and not categories and not models:
             return {}
         tag_types = {tag: "general" for tag in tags}
+        # 角色和普通标签是同一种 `a.tag_item`，只有外层分组不同：站方把角色单列在
+        # 标题为 Characters 的 `.vp-group--characters` 里。2026-11-03 实测 4708183、
+        # 4708408 有这一组；4707928 没有，`d.mon (overwatch)` 列在 Tags 组，照记 general。
+        for node in soup.select('.vp-group--characters a.tag_item[href*="/tags/"]'):
+            character = plain_text(node.get_text(" "))
+            if character in tag_types:
+                tag_types[character] = "character"
         for category in categories:
             tag_types[category] = (
                 "metadata" if category.casefold() in {"2d", "3d"} else "copyright")
@@ -1365,11 +1558,12 @@ class Rule34VideoConnector(_BaseConnector):
 class Rule34XxxConnector(_BaseConnector):
     """rule34.xxx 的官方 dapi。
 
-    网页版已挂 Cloudflare Turnstile，Peach 不绕验证码，因此这里只走官方 API，
-    并且必须带账号自己的 `user_id` + `api_key`（在
-    `https://rule34.xxx/index.php?page=account&s=options` 生成）。凭据只进查询参数
-    以外的位置不可行——dapi 只接受查询参数——所以请求 URL 不进日志也不进 ledger，
-    只有 `request_url` 的脱敏形式会被记录。
+    网页版挂了 Cloudflare 验证：2026-11-03 实测帖子页回 HTTP 403、`cf-mitigated:
+    challenge`、正文是「Rule34.xxx CAPTCHA」页，10-20 起读 `#tag-sidebar` 的路径整批
+    落空。Peach 不绕验证码，因此这里只走官方 API，并且必须带账号自己的 `user_id` +
+    `api_key`（在 `https://rule34.xxx/index.php?page=account&s=options` 生成）。凭据
+    只进查询参数以外的位置不可行——dapi 只接受查询参数——所以请求 URL 不进日志也不进
+    ledger，只有 `request_url` 的脱敏形式会被记录。
 
     `ref` 是标签，例如 `lazyprocrastinator`。
     """
@@ -1377,8 +1571,9 @@ class Rule34XxxConnector(_BaseConnector):
     provider = "rule34xxx"
     #: 一页 24 条时整页都能补上；额度存在是为了页面变长时请求数不跟着长。
     DEFAULT_ENRICH_BUDGET = 24
-    #: 第二阶段补两样：帖子页的标签分类（metadata 的 `tag_types`）和原文件头的时长。
-    #: mp4 缺时长的行下次检查还会进第二阶段，判据在 `follow_store._ENRICHED_PREDICATES`。
+    #: 标签分类（metadata 的 `tag_types`）随列表请求的 `fields=tag_info` 一起到；第二
+    #: 阶段补上传时间和原文件头的时长。mp4 缺时长的行下次检查还会进第二阶段，判据在
+    #: `follow_store._ENRICHED_PREDICATES`。
     ENRICHED_MARK = "tag_types_duration"
     _TAG_RE = re.compile(r"^[^\s&?#]{1,100}$")
     #: 历史行存的是 250px 的 preview。官方 dapi 的 `sample_url` 与它用同一
@@ -1426,29 +1621,37 @@ class Rule34XxxConnector(_BaseConnector):
             return str(item.media_url or item.thumb_url or "") or None
         return str(item.thumb_url or "") or None
 
-    def _dapi(self, tags: str, *, limit: int, page: int = 0,
-              etag: str | None = None, last_modified: str | None = None,
-              ) -> tuple[dict[str, object], HttpResponse | None]:
-        """问一次 dapi。凭据、地址形状和脱敏都只有这一处。
-
-        `tags` 原样交给站点：dapi 的标签之间用空格分隔，`sort:score` 这类元标签也
-        走同一个参数，所以这里不解析它，只负责把它编码进查询串。
-        """
+    def _dapi_url(self, **parameters: str) -> str:
+        """带凭据的 dapi 地址。查询串里有 api_key，只能拿去发请求，不能落进日志或证据。"""
         if self.credential is None:
             raise CredentialError(
                 "rule34xxx 需要 user_id 与 api_key；请把它们写进 "
                 "peach-data/secrets/follow/rule34xxx.json")
         user_id, api_key = self.credential.require("user_id", "api_key")
+        query = urllib.parse.urlencode({"page": "dapi", **parameters,
+                                        "user_id": user_id, "api_key": api_key})
+        return f"https://api.rule34.xxx/index.php?{query}"
+
+    def _dapi(self, tags: str, *, limit: int, page: int = 0,
+              etag: str | None = None, last_modified: str | None = None,
+              tag_info: bool = False,
+              ) -> tuple[dict[str, object], HttpResponse | None]:
+        """问一次 dapi 帖子列表。地址形状和脱敏都只有这一处。
+
+        `tags` 原样交给站点：dapi 的标签之间用空格分隔，`sort:score` 这类元标签也
+        走同一个参数，所以这里不解析它，只负责把它编码进查询串。
+
+        `tag_info` 让每条帖子随带 `tag_info`：每个标签的分类和帖子数，一页一次请求
+        就拿全，不必逐条去问帖子页或 tag 接口。2026-11-03 实测 24 条约 99 KB。
+        """
         # `pid` 是 0 起的页号，页大小就是 `limit`。
-        parameters = {
-            "page": "dapi", "s": "post", "q": "index", "json": "1",
-            "limit": str(min(limit, 1000)), "tags": tags,
-            "user_id": user_id, "api_key": api_key,
-        }
+        parameters = {"s": "post", "q": "index", "json": "1",
+                      "limit": str(min(limit, 1000)), "tags": tags}
         if page:
             parameters["pid"] = str(page)
-        query = urllib.parse.urlencode(parameters)
-        url = f"https://api.rule34.xxx/index.php?{query}"
+        if tag_info:
+            parameters["fields"] = "tag_info"
+        url = self._dapi_url(**parameters)
         safe_url = (f"https://api.rule34.xxx/index.php?page=dapi&s=post&q=index"
                     f"&tags={tags}" + (f"&pid={page}" if page else ""))
         # request_url 传脱敏版：真实 url 的查询串里带 api_key，绝不能落进证据。
@@ -1456,6 +1659,108 @@ class Rule34XxxConnector(_BaseConnector):
                              last_modified=last_modified, page=page,
                              headers={"Accept": "application/json"},
                              request_url=safe_url)
+
+    #: dapi 被限流时的退避节奏，与外网退避规则同一套。站方口径是每 60 秒 60 次。
+    _RATE_LIMIT_RETRY_DELAYS = (1.5, 4.0, 9.0)
+
+    def _dapi_patiently(self, url: str, accept: str) -> HttpResponse | None:
+        """补细节用的 dapi 请求：被限流就退避重试，仍取不到返回 None。
+
+        列表那次请求已经成功，这里取的是锦上添花的细节，所以失败不抛：一抛整次检查
+        就丢了已经到手的列表。但也不能把被挡回来读成「没有」——返回 None 让调用方
+        保持 partial，下一轮再问。限流有两种长相：HTTP 429，或者 HTTP 200 加一句
+        `You currently have a limit of 60 requests every 60 second(s)`。
+        """
+        for delay in (0.0, *self._RATE_LIMIT_RETRY_DELAYS):
+            if delay:
+                self.sleeper(delay)
+            try:
+                response = self._get(url, headers={"Accept": accept})
+            except FollowSourceError:
+                return None
+            if response.status == 429 or (response.status == 200
+                                          and self._upstream_reason(response)):
+                continue
+            return response if response.status == 200 else None
+        return None
+
+    #: XML 帖子的 `created_at`：`Fri May 01 18:32:21 +0200 2026`。
+    _CREATED_AT_RE = re.compile(
+        r"^\w{3} (\w{3}) (\d{1,2}) (\d{2}):(\d{2}):(\d{2}) ([+-])(\d{2})(\d{2}) (\d{4})$")
+    _MONTHS = {name: number for number, name in enumerate(
+        ("jan", "feb", "mar", "apr", "may", "jun",
+         "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
+    _XML_POST_RE = re.compile(r"<post\b[^>]*>", re.IGNORECASE)
+    _XML_ATTR_RE = re.compile(r'\b(id|created_at)="([^"]*)"')
+
+    @classmethod
+    def _created_at(cls, text: str) -> str | None:
+        """XML 的上传时间转成 UTC。不靠 `%a %b`：那两个格式符跟着系统区域设置走。"""
+        matched = cls._CREATED_AT_RE.match(html.unescape(str(text or "")).strip())
+        month = cls._MONTHS.get(matched.group(1).casefold()) if matched else None
+        if not matched or not month:
+            return None
+        day, hour, minute, second = (int(matched.group(index)) for index in (2, 3, 4, 5))
+        offset = timedelta(hours=int(matched.group(7)), minutes=int(matched.group(8)))
+        try:
+            local = datetime(int(matched.group(9)), month, day, hour, minute, second,
+                             tzinfo=timezone(-offset if matched.group(6) == "-" else offset))
+        except ValueError:
+            return None
+        return _iso_utc(local)
+
+    @classmethod
+    def _upload_times_from_xml(cls, body: bytes) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for tag in cls._XML_POST_RE.findall(body.decode("utf-8", errors="replace")):
+            attributes = dict(cls._XML_ATTR_RE.findall(tag))
+            uploaded = cls._created_at(attributes.get("created_at", ""))
+            if attributes.get("id") and uploaded:
+                result[attributes["id"]] = uploaded
+        return result
+
+    def _upload_times(self, *, page: int = 0, tags: str = "",
+                      post_id: str = "") -> dict[str, str]:
+        """帖子号到上传时间。只有 XML 形态给 `created_at`。
+
+        JSON 形态没有这一栏，`fields=created_at` 实测也不加；反过来 XML 不认
+        `fields=tag_info`。所以分类和上传时间各要一次请求：列表一次 JSON、一次 XML，
+        按帖子号对回去。两次之间有新帖插进来时页会错开一格，对不上的那条不写上传时间，
+        候选保持 partial。
+
+        `created_at` 与帖子页 `#stats` 的 Posted 是同一个时刻：17361475 的 XML 是
+        `Fri May 01 18:32:21 +0200 2026`，账本里帖子页取到的是 `2026-05-01T16:32:21Z`。
+        """
+        parameters = {"s": "post", "q": "index"}
+        if post_id:
+            parameters["id"] = post_id
+        else:
+            parameters.update(limit=str(min(self.max_items, 1000)), tags=tags)
+            if page:
+                parameters["pid"] = str(page)
+        response = self._dapi_patiently(self._dapi_url(**parameters), "application/xml")
+        return self._upload_times_from_xml(response.body) if response is not None else {}
+
+    #: `tag_info` 里普通标签叫 `tag`；tag 接口与帖子页 `#tag-sidebar` 叫 general。
+    #: 记成后者，读取层与前端 `r34-*` 色板都按这套词认分类。
+    _TAG_INFO_TYPES = {"tag": "general", "general": "general", "artist": "artist",
+                       "copyright": "copyright", "character": "character",
+                       "metadata": "metadata"}
+
+    @classmethod
+    def _tag_info_types(cls, info) -> dict[str, str]:
+        """`fields=tag_info` 给的分类。名字与 `tags` 一样是 HTML 转义形态，要反转义。"""
+        if not isinstance(info, list):
+            return {}
+        result: dict[str, str] = {}
+        for row in info:
+            if not isinstance(row, dict):
+                continue
+            name = html.unescape(str(row.get("tag") or "")).strip()
+            kind = cls._TAG_INFO_TYPES.get(str(row.get("type") or "").strip().casefold(), "")
+            if name and kind:
+                result[name] = kind
+        return result
 
     def _dapi_posts(self, response: HttpResponse) -> list[dict]:
         """一次 dapi 响应里的帖子。"""
@@ -1494,32 +1799,34 @@ class Rule34XxxConnector(_BaseConnector):
         if not self._TAG_RE.match(tag):
             raise FollowSourceError(f"rule34xxx 的 ref 必须是单个标签，收到：{ref!r}")
         common, response = self._dapi(tag, limit=self.max_items, page=page,
-                                      etag=etag, last_modified=last_modified)
+                                      etag=etag, last_modified=last_modified,
+                                      tag_info=True)
         if response is None:
             return SourceFetch(not_modified=True, **common)
         listed = [self._candidate(post, tag)
                   for post in self._dapi_posts(response)[: self.max_items]]
-        # 第二阶段：标签分类只有帖子详情页给，列表的 dapi 只给一串扁平标签。
+        # 第二阶段要的上传时间整页一次问齐；整页都补过就一次也不问。
+        wanted = self.enrich_budget and any(
+            str(candidate.external_id) not in self.enrich_skip for candidate in listed)
+        self._uploaded = self._upload_times(tags=tag, page=page) if wanted else {}
         candidates, probed = self.enrich(listed)
         if page and not candidates:
             raise FollowHistoryEnd("没有更多历史内容")
         return SourceFetch(candidates=candidates, probed=probed,
                            raw_body=response.body, **common)
 
+    #: 这一页的帖子号到上传时间，`fetch` 每次重新填；类上的空表只是还没抓过时的默认。
+    _uploaded: Mapping[str, str] = {}
+
     def _enrich_one(self, candidate: FollowCandidate) -> FollowCandidate:
-        detail = self._detail(str(candidate.external_id))
-        # 文件头在另一个主机上，帖子页被限流挡回来不影响它，所以不论分类取没取到都问。
+        uploaded = self._uploaded.get(str(candidate.external_id))
+        # 文件头在另一个主机上，dapi 被限流不牵连它，所以不论上传时间取没取到都问。
         duration = self._video_seconds(candidate.media_url)
-        tag_types = detail.get("tag_types")
-        if not tag_types:
-            # 详情页这次没给出分类。保持 partial：上一轮取到的分类还在库里，
-            # 覆盖成空会让「这条没有分类」和「这次没问到」在数据里长得一样。
-            # partial 行落库时时长只补空，所以读到的时长照样带上。
+        if not uploaded or not candidate.extra.get("tag_types"):
+            # 这次缺了一样就保持 partial：落库时不动 `published_at`，上一轮取到的上传
+            # 时间不会被 `change` 冲掉；分类经 `json_patch` 照样并进去，时长只补空。
             return replace(candidate, duration=duration) if duration else candidate
-        return replace(candidate, partial=False,
-                       published_at=detail.get("published_at") or candidate.published_at,
-                       duration=duration,
-                       extra={**candidate.extra, "tag_types": tag_types})
+        return replace(candidate, partial=False, published_at=uploaded, duration=duration)
 
     #: 读时长只取文件开头这么多字节。站方转码出的 mp4 都是 faststart，`mvhd` 在开头
     #: 几百字节里；实测随机 12 条全部读出，64 KiB 留足 `ftyp` 之后夹杂别的盒的余量。
@@ -1580,8 +1887,8 @@ class Rule34XxxConnector(_BaseConnector):
             rows.append((tag, int(matched.group(1).replace(",", "")) if matched else 0))
         return tuple(rows)
 
-    #: dapi 的 tag 接口用数字表示分类。名字取站方自己在详情页 `#tag-sidebar` 上用的
-    #: 那套（`_detail` 读的就是它），两条路认出来的类型才是同一个词。
+    #: dapi 的 tag 接口用数字表示分类。名字取站方帖子页 `#tag-sidebar` 上用的那套，
+    #: 与 `_TAG_INFO_TYPES` 归一后的词相同，几条路认出来的类型才是同一个词。
     _TAG_TYPE_NAMES = {0: "general", 1: "artist", 3: "copyright",
                        4: "character", 5: "metadata"}
     #: dapi 的 tag 接口只回 XML，`json=1` 实测被忽略。
@@ -1602,13 +1909,8 @@ class Rule34XxxConnector(_BaseConnector):
         tag = (name or "").strip()
         if not tag or self.credential is None:
             return ""
-        user_id, api_key = self.credential.require("user_id", "api_key")
-        query = urllib.parse.urlencode({
-            "page": "dapi", "s": "tag", "q": "index", "name": tag,
-            "user_id": user_id, "api_key": api_key,
-        })
         # 查询串里带 api_key，和 `fetch` 一样绝不落进日志或证据。
-        response = self._get(f"https://api.rule34.xxx/index.php?{query}",
+        response = self._get(self._dapi_url(s="tag", q="index", name=tag),
                              headers={"Accept": "application/xml"})
         self._check_status(response)
         body = response.body.decode("utf-8", errors="replace")
@@ -1624,60 +1926,32 @@ class Rule34XxxConnector(_BaseConnector):
         "video", "sound", "animated", "mp4", "webm", "3d", "hd", "60fps",
         "tagme", "highres", "absurdres",
     })
-    #: 详情页取不到时的退避节奏，与外网退避规则同一套。
-    _DETAIL_RETRY_DELAYS = (1.5, 4.0, 9.0)
-    #: 详情页 `#stats` 里的上传时间：`Posted: 2026-09-11 00:48:20 by mhzw666`。
-    _POSTED_RE = re.compile(r"Posted:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
-
     def _detail(self, post_id: str) -> dict[str, object]:
-        """帖子详情页上才有的两样：标签分类和上传时间。取不到就是空字典。
+        """单条帖子的标签分类和上传时间，供存量行补齐。取不到的那一样不出现在结果里。
 
-        dapi 只给一串扁平标签，分类要读详情页 `#tag-sidebar`，取不到就不给，不按词形
-        猜。dapi 也不给上传时间：它的 `change` 是最后一次修改，实测 17361475 在
-        2026-05-01 上传、09-14 被改过标签，`change` 就是 09-14。详情页 `#stats` 的
-        Posted 才是上传时间；没被改过的帖子两者逐秒相同，所以它和 `change` 一样是 UTC。
+        列表请求一页问齐这两样（`fetch`），这里按帖子号各问一次：JSON 带
+        `fields=tag_info` 给分类，XML 给 `created_at`。dapi 列表的 `change` 是最后一次
+        修改：实测 17361475 在 2026-05-01 上传、09-14 被改过标签，`change` 就是 09-14。
+        被限流挡回来时退避重试，仍取不到就缺那一样，不按词形猜，也不写空冒充已补。
         """
-        url = ("https://rule34.xxx/index.php?page=post&s=view&id="
-               f"{urllib.parse.quote(post_id)}")
-        # 站方公布的口径是每 60 秒 60 次，而列表页一页 24 条、每条都要单独打一次
-        # 详情页，被挡回来是常态。一次挡回来就返回 {}，得到的是「这条没有类型」——
-        # 和「这条确实没有类型」在日志里长得一模一样。实测：回填首轮 400 条里
-        # 372 条判成「没有类型」，事后逐条直取，全部 200 且 `#tag-sidebar` 正常。
-        response = None
-        for delay in (0.0, *self._DETAIL_RETRY_DELAYS):
-            if delay:
-                self.sleeper(delay)
-            try:
-                response = self._get(url, headers={"Accept": "text/html"})
-            except FollowSourceError:
-                response = None
-                break
-            if response.status not in {425, 429}:
-                break
-        if response is None or response.status != 200:
+        if not str(post_id).isdigit():
             return {}
-        soup = BeautifulSoup(response.body, "html.parser")
-        allowed = {"general", "artist", "copyright", "character", "metadata"}
-        result: dict[str, str] = {}
-        for row in soup.select("#tag-sidebar li[class*='tag-type-']"):
-            tag_type = next((
-                value.removeprefix("tag-type-") for value in row.get("class", [])
-                if value.startswith("tag-type-")
-            ), "")
-            if tag_type not in allowed:
-                continue
-            link = row.select_one("a[href*='page=post'][href*='tags=']")
-            if link is None:
-                continue
-            query = urllib.parse.parse_qs(
-                urllib.parse.urlsplit(str(link.get("href") or "")).query)
-            name = html.unescape(str((query.get("tags") or [""])[0])).strip()
-            if name:
-                result[name] = tag_type
-        stats = soup.select_one("#stats")
-        posted = self._POSTED_RE.search(stats.get_text(" ") if stats is not None else "")
-        return {"tag_types": result,
-                "published_at": _iso_from_text(posted.group(1)) if posted else None}
+        result: dict[str, object] = {}
+        response = self._dapi_patiently(
+            self._dapi_url(s="post", q="index", json="1", id=str(post_id),
+                           fields="tag_info"), "application/json")
+        if response is not None:
+            try:
+                posts = self._dapi_posts(response)
+            except FollowSourceError:
+                posts = []
+            tag_types = self._tag_info_types(posts[0].get("tag_info")) if posts else {}
+            if tag_types:
+                result["tag_types"] = tag_types
+        uploaded = self._upload_times(post_id=str(post_id)).get(str(post_id))
+        if uploaded:
+            result["published_at"] = uploaded
+        return result
 
     def _candidate(self, post: dict, tag: str) -> FollowCandidate:
         post_id = str(post.get("id") or "")
@@ -1685,6 +1959,7 @@ class Rule34XxxConnector(_BaseConnector):
         # 就进 metadata，读取层再转一次就成了双重转义，用户看到的就是 `&#039;`
         # 字面量，同一个标签还会和反转义后的写法分裂成两个身份。
         tags = html.unescape(str(post.get("tags") or ""))
+        tag_types = self._tag_info_types(post.get("tag_info"))
         image = str(post.get("image") or "")
         stem = re.sub(r"\.[a-z0-9]{2,5}$", "", image, flags=re.IGNORECASE)
         # booru 帖子没有标题。实测 rule34.xxx 的 `image` 全是 32 位十六进制哈希，
@@ -1719,18 +1994,20 @@ class Rule34XxxConnector(_BaseConnector):
             # 对图片则是站点选定的样图。gallery-dl 的 booru 抽取器也把这三层
             # 作为可配置回退链，不能把最小 preview 固定成 Peach 封面。
             thumb_url=str(post.get("sample_url") or post.get("preview_url") or "") or None,
-            # `change` 是最后修改时间，只在详情页取不到时占位；上传时间由 `_detail` 给。
+            # `change` 是最后修改时间，只在 XML 的 `created_at` 取不到时占位。
             published_at=_iso_from_epoch(post.get("change")),
             group_hint=hint,
             title_is_name=title_is_name,
-            # 列表视图：标签分类要等第二阶段的详情页。
+            # 列表视图：上传时间要等第二阶段。分类已经随 `tag_info` 到了，partial 行
+            # 落库时 metadata 走 `json_patch`，分类照样写进去。
             partial=True,
             extra={"tag": tag, "tags": tags, "score": post.get("score"),
                    "source": source, "title_from": title_from,
                    "preview_url": post.get("preview_url"),
                    # dapi 随帖给出原文件的宽高；图片墙靠它在图落地前占好比例。
                    # sample 与 preview 都是等比缩放，比例与原文件一致。
-                   **_dims_extra(post.get("width"), post.get("height"))},
+                   **_dims_extra(post.get("width"), post.get("height")),
+                   **({"tag_types": tag_types} if tag_types else {})},
         )
 
     @classmethod
@@ -2046,8 +2323,15 @@ _PROFILE_PATH_STOPWORDS = frozenset({
 _PROFILE_HANDLE_RE = re.compile(r"^[A-Za-z0-9._-]{2,64}$")
 _PIXIV_USER_RE = re.compile(r"(?:^|/)users/(\d{1,20})(?:$|/)")
 _XENFORO_MEMBER_RE = re.compile(r"^members/([^/.]+)\.(\d{1,20})/?$")
-_BSKY_PROFILE_RE = re.compile(r"^profile/([^/]+)$")
+_BSKY_PROFILE_RE = re.compile(r"^profile/([A-Za-z0-9._-]{2,64})$")
 _FANTIA_FANCLUB_RE = re.compile(r"^fanclubs/(\d{1,20})(?:$|/)")
+_PROFILE_PATH_IDENTITIES = {
+    "pixiv.net": ("pixiv", _PIXIV_USER_RE),
+    "bsky.app": ("bsky", _BSKY_PROFILE_RE),
+    "fantia.jp": ("fantia", _FANTIA_FANCLUB_RE),
+    "iwara.tv": ("iwara", re.compile(r"^profile/([A-Za-z0-9_-]{1,80})(?:/videos)?$")),
+    "ecchi.iwara.tv": ("iwara", re.compile(r"^profile/([A-Za-z0-9_-]{1,80})(?:/videos)?$")),
+}
 
 
 def profile_link_identity(url: str, *, forum_host: str = "") -> tuple[str, str] | None:
@@ -2073,19 +2357,14 @@ def profile_link_identity(url: str, *, forum_host: str = "") -> tuple[str, str] 
     if host == "fanbox.cc" and first.startswith("@"):
         handle = first[1:]
         return ("fanbox", handle) if _PROFILE_HANDLE_RE.match(handle) else None
-    if host == "pixiv.net":
-        matched = _PIXIV_USER_RE.search(path)
-        return ("pixiv", matched.group(1)) if matched else None
+    identity = _PROFILE_PATH_IDENTITIES.get(host)
+    if identity:
+        service, pattern = identity
+        matched = pattern.search(path)
+        return (service, canonical_source_ref(service, matched.group(1))) if matched else None
     if host.endswith(".itch.io"):
         handle = host.removesuffix(".itch.io")
         return ("itchio", handle) if _PROFILE_HANDLE_RE.match(handle) else None
-    if host == "bsky.app":
-        matched = _BSKY_PROFILE_RE.match(path)
-        handle = matched.group(1) if matched else ""
-        return ("bsky", handle) if _PROFILE_HANDLE_RE.match(handle) else None
-    if host == "fantia.jp":
-        matched = _FANTIA_FANCLUB_RE.match(path)
-        return ("fantia", matched.group(1)) if matched else None
     if forum_host and host == forum_host.lower().removeprefix("www."):
         matched = _XENFORO_MEMBER_RE.match(path)
         return (forum_host.split(".")[0], matched.group(1)) if matched else None
@@ -3057,7 +3336,7 @@ def parse_source_url(raw_url: str) -> ParsedSource:
 _CONNECTOR_CLASSES: tuple[type, ...] = (
     FanboxConnector, PatreonConnector, SubscribeStarConnector, KemonoConnector,
     Rule34VideoConnector, Rule34XxxConnector, Rule34PahealConnector,
-    F95ZoneConnector, SimpCityConnector,
+    F95ZoneConnector, SimpCityConnector, IwaraConnector,
 )
 
 CONNECTORS: dict[str, type] = {

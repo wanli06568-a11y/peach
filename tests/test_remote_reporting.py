@@ -5,6 +5,7 @@ import runpy
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +18,17 @@ DSN = "https://public@o123.ingest.us.sentry.io/456"
 
 
 class RemoteReportingTests(unittest.TestCase):
+    def test_last_sent_date_survives_queued_and_failed_delivery(self):
+        from peach import reporting_delivery
+        reporting.save({'usage': True, 'errors': True}, self.config)
+        permit = reporting._permit('usage', self.config, reporting.consent(self.config))
+        reporting_delivery.record(permit, 'first', {'status': 'queued'})
+        reporting_delivery.record(permit, 'first', {'status': 'accepted'})
+        sent = reporting_delivery.snapshot(self.config)['usage']['last_sent_at']
+        reporting_delivery.record(permit, 'next', {'status': 'queued'})
+        reporting_delivery.record(permit, 'next', {'status': 'failed', 'reason': 'queue_full'})
+        self.assertEqual(reporting_delivery.snapshot(self.config)['usage']['last_sent_at'], sent)
+
     def setUp(self):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
@@ -53,13 +65,15 @@ class RemoteReportingTests(unittest.TestCase):
             self.assertTrue(reporting.snapshot()["errors"])
             reporting.usage()
             reporting.capture("unhandled-main", ValueError("private"))
-            self.assertEqual(client.capture_event.call_count, 2)
+            self.assertEqual(client.capture_event.call_count, 1)
+            self.assertEqual(client.transport.capture_envelope.call_count, 1)
             reporting.save({"usage": False, "errors": False})
             self.assertFalse(reporting.snapshot()["usage"])
             self.assertFalse(reporting.snapshot()["errors"])
             reporting.usage()
             reporting.capture("unhandled-main", ValueError("private"))
-            self.assertEqual(client.capture_event.call_count, 2)
+            self.assertEqual(client.capture_event.call_count, 1)
+            self.assertEqual(client.transport.capture_envelope.call_count, 1)
 
     def test_consent_requires_joint_choice_and_missing_endpoint_is_visible(self):
         for invalid in ({"usage": "false", "errors": False}, {"usage": True}, [],
@@ -102,6 +116,25 @@ class RemoteReportingTests(unittest.TestCase):
             with self.subTest(value=value), mock.patch.dict(os.environ, {"PEACH_SENTRY_DSN": value}):
                 self.assertEqual(reporting.dsn(), "")
 
+    @staticmethod
+    def _telemetry(client):
+        """内存客户端收到的日志与会话条目，按信封顺序展开。"""
+        items = []
+        for call in client.transport.capture_envelope.call_args_list:
+            for item in call.args[0].items:
+                payload = item.payload.json
+                if item.type == 'log':
+                    items.extend(('log', log) for log in payload['items'])
+                else:
+                    items.append((item.type, payload))
+        return items
+
+    @staticmethod
+    def _counts(client):
+        return [{key: value['value'] for key, value in log['attributes'].items()}
+                for kind, log in RemoteReportingTests._telemetry(client)
+                if kind == 'log' and log['body'] == 'Peach diagnostic count']
+
     def test_daily_budget_is_shared_deduplicated_and_bounded(self):
         reporting.save({"usage": True, "errors": True})
         client = mock.Mock()
@@ -112,12 +145,57 @@ class RemoteReportingTests(unittest.TestCase):
                 event = {"message": str(index)}
                 reporting.send("errors", event)
                 reporting.send("errors", event)
-        self.assertEqual(client.capture_event.call_count, 21)
+        self.assertEqual(client.capture_event.call_count, 5)
+        self.assertEqual(client.transport.capture_envelope.call_count, 1)
         payload = json.loads((self.config.directory("state") / "remote-reporting-frequency.json").read_text())
         self.assertEqual(len(payload["records"]), 20)
         self.assertTrue(all(row['total'] == 2 for row in payload['records'].values()))
 
-    def test_frequency_batches_send_disjoint_counts_and_keep_group_identity(self):
+    def test_usage_is_one_log_and_session_without_error_events(self):
+        from peach import reporting_identity as identity
+        reporting.save({"usage": True, "errors": True})
+        client = mock.Mock()
+        with mock.patch.object(reporting, "_new_client", return_value=client), \
+                mock.patch.object(identity, "_memory_bytes", return_value=15.8 * 2 ** 30):
+            reporting.usage()
+        client.capture_event.assert_not_called()
+        (kind, log), (session_kind, session) = self._telemetry(client)
+        self.assertEqual((kind, session_kind, log['body']), ('log', 'sessions', 'Peach daily activity'))
+        attributes = {key: value['value'] for key, value in log['attributes'].items()}
+        self.assertEqual(attributes["purpose"], "version-statistics")
+        self.assertEqual(attributes["distribution"], "source")
+        self.assertEqual(attributes["memory_gb"], "16")
+        self.assertEqual(attributes["cpu_cores"], str(os.cpu_count()))
+        self.assertEqual(attributes["sentry.release"], session['attrs']['release'])
+        for key in ("os", "os_version", "architecture", "python", "sentry.environment"):
+            self.assertTrue(attributes[key], key)
+        self.assertEqual(session['aggregates'][0]['exited'], 1)
+        self.assertEqual(set(session['attrs']), {'release', 'environment'})
+
+    def test_distribution_tells_desktop_apps_docker_wheel_and_source_apart(self):
+        from peach import reporting_identity as identity
+        cases = (
+            ("windows-app", {"frozen": True, "system": "Windows"}),
+            ("macos-app", {"frozen": True, "system": "Darwin"}),
+            ("docker", {"environ": {"PEACH_DISTRIBUTION": "docker"}}),
+            ("wheel", {"root": Path("site-packages/peach/_resources")}),
+            ("source", {"root": Path("peach-app")}),
+        )
+        for expected, case in cases:
+            with self.subTest(expected), \
+                    mock.patch.object(identity.sys, "frozen", case.get("frozen", False), create=True), \
+                    mock.patch.object(identity.platform, "system", return_value=case.get("system", "Linux")), \
+                    mock.patch.dict(os.environ, case.get("environ", {"PEACH_DISTRIBUTION": ""})), \
+                    mock.patch("peach.settings_file.PROJECT_ROOT", case.get("root", Path("peach-app"))):
+                self.assertEqual(identity.distribution(), expected)
+
+    def test_memory_is_reported_as_the_nearest_common_capacity(self):
+        from peach.reporting_identity import memory_bucket
+        for gigabytes, bucket in ((7.6, "8"), (15.8, "16"), (23.4, "24"), (31.9, "32"), (0.9, "2"), (1024, "256+")):
+            with self.subTest(gigabytes=gigabytes):
+                self.assertEqual(memory_bucket(gigabytes * 2 ** 30), bucket)
+
+    def test_frequency_sends_one_event_then_count_logs_with_the_same_key(self):
         from peach import diagnostic_frequency as frequency
         reporting.save({"usage": True, "errors": True})
         client = mock.Mock()
@@ -131,12 +209,17 @@ class RemoteReportingTests(unittest.TestCase):
             self.assertEqual(first['tags']['occurrence_count'], '1')
             clock.return_value = now + timedelta(hours=1)
             reporting.flush_counts()
-            second = client.capture_event.call_args.args[0]
-            self.assertEqual(second['tags']['occurrence_count'], '4')
-            self.assertEqual(second['tags']['diagnostic_key'], first['tags']['diagnostic_key'])
-            self.assertEqual(second['tags']['occurrence_day'], '2026-10-18')
+            self.assertEqual(self._counts(client), [])
+            clock.return_value = now + timedelta(hours=6)
+            reporting.flush_counts()
             reporting.flush_counts(force=True)
-            self.assertEqual(client.capture_event.call_count, 2)
+            [count] = self._counts(client)
+            self.assertEqual(count['occurrence_count'], 4)
+            self.assertEqual(count['diagnostic_key'], first['tags']['diagnostic_key'])
+            self.assertEqual(count['occurrence_day'], '2026-10-18')
+            self.assertEqual(count['exception_type'], 'ValueError')
+            self.assertEqual(count['purpose'], 'technical-diagnostics')
+            self.assertEqual(client.capture_event.call_count, 1)
         payload = (self.config.directory('state') / 'remote-reporting-frequency.json').read_text()
         self.assertNotIn('private title', payload)
         self.assertNotIn('installation', payload)
@@ -151,11 +234,10 @@ class RemoteReportingTests(unittest.TestCase):
             self.assertEqual(first['event_id'], 'a' * 32)
             reporting.close()
             reporting.flush_counts(force=True)
-            second = client.capture_event.call_args.args[0]
-            self.assertNotIn('event_id', second)
-            self.assertEqual(second['tags']['occurrence_count'], '2')
-            self.assertEqual(first['tags']['diagnostic_key'], second['tags']['diagnostic_key'])
-            self.assertEqual(client.capture_event.call_count, 2)
+            [count] = self._counts(client)
+            self.assertEqual(count['occurrence_count'], 2)
+            self.assertEqual(count['diagnostic_key'], first['tags']['diagnostic_key'])
+            self.assertEqual(client.capture_event.call_count, 1)
 
     def test_frequency_pending_counts_expire_with_consent_and_expected_states_are_excluded(self):
         import asyncio
@@ -171,28 +253,62 @@ class RemoteReportingTests(unittest.TestCase):
             reporting.save({"usage": True, "errors": True})
             reporting.flush_counts(force=True)
             self.assertEqual(client.capture_event.call_count, 1)
+            self.assertEqual(self._counts(client), [])
             reporting.capture('unhandled-main', ValueError('private'))
+            self.assertEqual(client.capture_event.call_count, 2)
             self.assertEqual(client.capture_event.call_args.args[0]['tags']['occurrence_count'], '1')
 
-    def test_frequency_daily_limit_defers_counts_and_preserves_occurrence_day(self):
+    def test_frequency_daily_event_limit_defers_first_events_and_keeps_their_day(self):
         from peach import diagnostic_frequency as frequency
         reporting.save({"usage": True, "errors": True})
         client = mock.Mock()
         now = datetime(2026, 10, 18, 12, tzinfo=timezone.utc)
         with mock.patch.object(reporting, '_new_client', return_value=client), \
                 mock.patch.object(frequency, '_now', return_value=now) as clock:
-            for index in range(20):
+            for index in range(7):
                 reporting.send('errors', {'message': str(index)})
             reporting.send('errors', {'message': '0'})
             reporting.flush_counts(force=True)
-            self.assertEqual(client.capture_event.call_count, 20)
+            self.assertEqual(client.capture_event.call_count, frequency.EVENT_LIMIT)
+            self.assertEqual([count['occurrence_count'] for count in self._counts(client)], [1])
             clock.return_value = now + timedelta(days=1)
             reporting.flush_counts(force=True)
-            self.assertEqual(client.capture_event.call_count, 21)
+            self.assertEqual(client.capture_event.call_count, 7)
             self.assertEqual(client.capture_event.call_args.args[0]['tags']['occurrence_count'], '1')
             self.assertEqual(client.capture_event.call_args.args[0]['tags']['occurrence_day'], '2026-10-18')
 
-    def test_frequency_sdk_rejection_keeps_pending_counts_for_later_batch(self):
+    def test_frequency_counts_roll_over_by_occurrence_day(self):
+        from peach import diagnostic_frequency as frequency
+        reporting.save({"usage": True, "errors": True})
+        client = mock.Mock()
+        now = datetime(2026, 10, 18, 23, tzinfo=timezone.utc)
+        with mock.patch.object(reporting, '_new_client', return_value=client), \
+                mock.patch.object(frequency, '_now', return_value=now) as clock:
+            for _ in range(3):
+                reporting.capture('unhandled-main', ValueError('private'))
+            clock.return_value = now + timedelta(hours=2)
+            reporting.capture('unhandled-main', ValueError('private'))
+            reporting.flush_counts(force=True)
+        self.assertEqual(client.capture_event.call_count, 1)
+        self.assertEqual([(count['occurrence_day'], count['occurrence_count']) for count in self._counts(client)],
+                         [('2026-10-18', 2), ('2026-10-19', 1)])
+
+    def test_frequency_resends_one_event_after_the_key_goes_quiet(self):
+        from peach import diagnostic_frequency as frequency
+        reporting.save({"usage": True, "errors": True})
+        client = mock.Mock()
+        now = datetime(2026, 10, 18, 12, tzinfo=timezone.utc)
+        with mock.patch.object(reporting, '_new_client', return_value=client), \
+                mock.patch.object(frequency, '_now', return_value=now) as clock:
+            reporting.capture('unhandled-main', ValueError('private'))
+            clock.return_value = now + timedelta(days=frequency.RETENTION_DAYS - 1)
+            reporting.capture('unhandled-main', ValueError('private'))
+            self.assertEqual(client.capture_event.call_count, 1)
+            clock.return_value = now + timedelta(days=2 * frequency.RETENTION_DAYS)
+            reporting.capture('unhandled-main', ValueError('private'))
+            self.assertEqual(client.capture_event.call_count, 2)
+
+    def test_frequency_sdk_rejection_keeps_the_first_event_for_later(self):
         reporting.save({"usage": True, "errors": True})
         client = mock.Mock()
         client.capture_event.return_value = None
@@ -203,30 +319,47 @@ class RemoteReportingTests(unittest.TestCase):
             self.assertEqual(client.capture_event.call_args.args[0]['tags']['occurrence_count'], '1')
             reporting.flush_counts(force=True)
             self.assertEqual(client.capture_event.call_count, 2)
+            self.assertEqual(self._counts(client), [])
 
     def test_frequency_shared_file_serializes_independent_processes(self):
         from peach import diagnostic_frequency as frequency
+        from filelock import FileLock
         root = Path(__file__).resolve().parents[1]
         reporting.save({"usage": True, "errors": True})
-        program = ('from peach import diagnostic_frequency as f; '
+        program = ('import sys; from peach import diagnostic_frequency as f; '
                    'from peach.settings_file import active; '
                    'from peach.remote_reporting import consent; '
-                   'f.record(active(), consent()["revision"], {"release":"test", "tags":{"stage":"cli"}}, lambda e: True)')
+                   'config=active(); revision=consent()["revision"]; '
+                   'print("ready", flush=True); sys.stdin.readline(); '
+                   'f.record(config, revision, {"release":"test", "tags":{"stage":"cli"}}, '
+                   'lambda e: True, lambda c: True)')
         env = {**os.environ, 'PYTHONPATH': str(root / 'src'), 'PEACH_SENTRY_DSN': ''}
         processes = [subprocess.Popen([sys.executable, '-X', 'utf8', '-c', program], env=env,
-                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE) for _ in range(2)]
-        for process in processes:
-            try:
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE) for _ in range(2)]
+        try:
+            for process in processes:
+                self.assertEqual(process.stdout.readline().strip(), b'ready')
+            with FileLock(str(frequency._path(self.config)) + '.lock'):
+                for process in processes:
+                    process.stdin.write(b'go\n')
+                    process.stdin.flush()
+                time.sleep(.25)
+                for process in processes:
+                    self.assertIsNone(process.poll(), '锁被短暂占用时诊断记录进程不能退出')
+            for process in processes:
                 stdout, stderr = process.communicate(timeout=30)
                 self.assertEqual(process.returncode, 0, (stdout, stderr))
-            finally:
+        finally:
+            for process in processes:
                 if process.poll() is None:
                     process.kill()
                     process.communicate()
-        sent = []
-        frequency.flush(self.config, reporting.consent()['revision'], lambda e: sent.append(e) or True, force=True)
-        self.assertEqual(len(sent), 1)
-        self.assertEqual(sent[0]['tags']['occurrence_count'], '1')
+        events, counts = [], []
+        frequency.flush(self.config, reporting.consent()['revision'], lambda e: events.append(e) or True,
+                        lambda batch: counts.extend(batch) or True, force=True)
+        self.assertEqual(events, [])
+        self.assertEqual([count['tags']['occurrence_count'] for count in counts], ['1'])
 
     def test_frequency_shutdown_submits_pending_counts_and_stops_timer(self):
         reporting.save({"usage": True, "errors": True})
@@ -235,8 +368,8 @@ class RemoteReportingTests(unittest.TestCase):
             for _ in range(3):
                 reporting.capture('unhandled-main', ValueError('private'))
             reporting._shutdown()
-        self.assertEqual(client.capture_event.call_count, 2)
-        self.assertEqual(client.capture_event.call_args.args[0]['tags']['occurrence_count'], '2')
+        self.assertEqual(client.capture_event.call_count, 1)
+        self.assertEqual([count['occurrence_count'] for count in self._counts(client)], [2])
         self.assertIsNone(reporting._frequency_timer)
         self.assertFalse(reporting._frequency_configs)
 
@@ -248,19 +381,54 @@ class RemoteReportingTests(unittest.TestCase):
 
     def test_frequency_timer_flushes_without_another_occurrence(self):
         from peach import diagnostic_frequency as frequency
-        reporting.save({"usage": True, "errors": True})
         now = datetime(2026, 10, 18, 12, tzinfo=timezone.utc)
         client = mock.Mock()
         with mock.patch.object(reporting, '_new_client', return_value=client), \
                 mock.patch.object(reporting.threading, 'Timer') as timer, \
                 mock.patch.object(frequency, '_now', return_value=now) as clock:
+            reporting.save({"usage": True, "errors": True})
             for _ in range(4):
                 reporting.capture('unhandled-main', ValueError('private'))
             callback = timer.call_args.args[1]
-            clock.return_value = now + timedelta(hours=1)
+            clock.return_value = now + timedelta(seconds=frequency.INTERVAL)
             callback()
-            self.assertEqual(client.capture_event.call_count, 2)
-            self.assertEqual(client.capture_event.call_args.args[0]['tags']['occurrence_count'], '3')
+            self.assertEqual(client.capture_event.call_count, 1)
+            self.assertEqual([count['occurrence_count'] for count in self._counts(client)], [3])
+
+    def test_daily_activity_is_reported_after_midnight_without_restarting(self):
+        client = mock.Mock()
+        start = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
+        with mock.patch.object(reporting, '_new_client', return_value=client), \
+                mock.patch.object(reporting.threading, 'Timer'), \
+                mock.patch.object(reporting, 'datetime', wraps=datetime) as clock:
+            clock.now.return_value = start
+            reporting.save({'usage': True, 'errors': True})
+            reporting.usage(self.config)
+            reporting._frequency_tick()
+            self.assertEqual(client.transport.capture_envelope.call_count, 1)
+            clock.now.return_value = start + timedelta(days=1)
+            reporting._frequency_tick()
+            self.assertEqual(client.transport.capture_envelope.call_count, 2)
+            reporting.save({'usage': False, 'errors': False})
+            clock.now.return_value = start + timedelta(days=2)
+            reporting._frequency_tick()
+            self.assertEqual(client.transport.capture_envelope.call_count, 2)
+
+    def test_missing_transport_records_failure_instead_of_leaving_queued(self):
+        reporting.save({'usage': True, 'errors': True})
+        client = mock.Mock(transport=None)
+        with mock.patch.object(reporting, '_new_client', return_value=client):
+            reporting.usage(self.config)
+        self.assertEqual(reporting.snapshot(self.config)['delivery']['usage']['status'], 'failed')
+
+    def test_enabling_starts_background_reporting_without_restart_and_disable_cancels_it(self):
+        with mock.patch.object(reporting.threading, 'Timer') as timer:
+            reporting.save({'usage': True, 'errors': True})
+            timer.return_value.start.assert_called_once()
+            self.assertIn(str(self.config.directory('state')), reporting._frequency_configs)
+            reporting.save({'usage': False, 'errors': False})
+            timer.return_value.cancel.assert_called_once()
+            self.assertIsNone(reporting._frequency_timer)
 
     def test_actionable_faults_keep_codes_and_omit_private_text(self):
         with mock.patch.object(reporting, "send") as send:
@@ -286,7 +454,28 @@ class RemoteReportingTests(unittest.TestCase):
             send.assert_not_called()
             reporting.capture('browser', message='private title', stack='at https://private/dist/peach-app.js:12:34')
             self.assertEqual(send.call_args.args[1]['exception']['values'][0]['stacktrace']['frames'],
-                             [{'filename': 'peach-app.js', 'lineno': 12, 'colno': 34}])
+                             [{'filename': 'peach-app.js', 'abs_path': 'app:///peach-app.js', 'lineno': 12, 'colno': 34}])
+
+    def test_unsupported_folder_picker_is_local_and_dialog_failures_are_reported(self):
+        from peach.folder_picker import command, PickerUnavailable
+        from fastapi import HTTPException
+        try:
+            command(None, platform='linux')
+        except PickerUnavailable as cause:
+            unsupported = HTTPException(501, 'private')
+            unsupported.__cause__ = cause
+        with mock.patch.object(reporting, 'send') as send:
+            reporting.capture('http-request', unsupported, status_code=501, route='api/pick-folder')
+            send.assert_not_called()
+            failed = HTTPException(501, 'private')
+            failed.__cause__ = PickerUnavailable('private')
+            reporting.capture('http-request', failed, status_code=501, route='api/pick-folder')
+            send.assert_called_once()
+            send.reset_mock()
+            unexpected = HTTPException(500, 'private')
+            unexpected.__cause__ = unsupported.__cause__
+            reporting.capture('http-request', unexpected, status_code=500, route='api/pick-folder')
+            send.assert_called_once()
 
     def test_control_and_source_states_keep_local_records_without_remote_events(self):
         import asyncio
@@ -366,8 +555,36 @@ class RemoteReportingTests(unittest.TestCase):
                 reporting.capture('logging', error, level='ERROR', logger='peach.fixture')
                 send.assert_called_once()
 
+    def test_lock_contention_disk_and_upstream_conditions_stay_local(self):
+        import errno
+        import sqlite3
+        import httpx
+        from fastapi import HTTPException
+        from filelock import Timeout
+        timeout = httpx.ConnectTimeout('private', request=httpx.Request('GET', 'https://example.test/'))
+        local = [('background-job', Timeout('private.lock'), {}), ('background-job', timeout, {}),
+                 ('media-probe', TimeoutError(errno.ETIMEDOUT, 'private'), {'tool': 'ffprobe'}),
+                 ('library-preview', OSError(errno.EIO, 'private'), {}),
+                 ('http-request', HTTPException(502, 'private'), {'status_code': 502})]
+        for name in ('SQLITE_IOERR_SHMSIZE', 'SQLITE_FULL', 'SQLITE_BUSY', 'SQLITE_LOCKED'):
+            error = sqlite3.OperationalError('private')
+            error.sqlite_errorname = name
+            local.append(('background-job', error, {}))
+        for stage, error, fields in local:
+            with self.subTest(error=type(error).__name__, stage=stage), mock.patch.object(reporting, 'send') as send:
+                reporting.capture(stage, error, level='ERROR', **fields)
+                send.assert_not_called()
+        reported = sqlite3.OperationalError('private')
+        reported.sqlite_errorname = 'SQLITE_ERROR'
+        for stage, error, fields in (('background-job', reported, {}),
+                                     ('http-request', RuntimeError('private'), {'status_code': 500})):
+            with self.subTest(error=type(error).__name__), mock.patch.object(reporting, 'send') as send:
+                reporting.capture(stage, error, level='ERROR', **fields)
+                send.assert_called_once()
+
     def test_expected_media_input_conditions_are_local_and_decoder_faults_are_reported(self):
-        for marker in ('Invalid data found', 'Permission denied', 'No space left', 'No such file or directory'):
+        for marker in ('Invalid data found', 'Permission denied', 'No space left', 'No such file or directory',
+                       'Invalid argument', 'Input/output error'):
             with self.subTest(marker=marker), mock.patch.object(reporting, 'send') as send:
                 reporting.capture('frame-capture', returncode=1, stderr=marker)
                 send.assert_not_called()
@@ -399,7 +616,7 @@ class RemoteReportingTests(unittest.TestCase):
             reporting.capture('browser', stack='at https://example.test/dist/peach-app.js?v=build:12:34')
             send.assert_called_once()
             frames = send.call_args.args[1]['exception']['values'][0]['stacktrace']['frames']
-            self.assertEqual(frames, [{'filename': 'peach-app.js', 'lineno': 12, 'colno': 34}])
+            self.assertEqual(frames, [{'filename': 'peach-app.js', 'abs_path': 'app:///peach-app.js', 'lineno': 12, 'colno': 34}])
 
     def test_preview_environment_conditions_preserve_guidance_and_local_issue(self):
         from peach import library_processing
@@ -455,6 +672,50 @@ class RemoteReportingTests(unittest.TestCase):
                 path.write_text(json.dumps({"usage": usage, "errors": errors, "revision": previous['revision']}))
                 client.transport._send_envelope(envelope)
             network.assert_not_called()
+
+    def test_telemetry_envelopes_need_a_current_permit_and_events_cannot_carry_them(self):
+        from sentry_sdk.transport import HttpTransport
+        from sentry_sdk.envelope import Envelope, Item, PayloadRef
+        reporting.save({"usage": True, "errors": True})
+        current = reporting.consent()
+        client = reporting._new_client(DSN)
+        self.addCleanup(lambda: client.close(timeout=0))
+        permit = {"consent": str(self.config.directory('state') / 'remote-reporting.json'),
+                  "kind": "usage", "revision": current['revision'], "receipt": 'r' * 32}
+
+        def envelope(headers, *items):
+            built = Envelope(headers=headers)
+            for kind in items:
+                if kind == 'event':
+                    built.add_event({"message": "fixture", "extra": dict(permit)})
+                else:
+                    built.add_item(Item(type=kind, payload=PayloadRef(json={"items": []})))
+            return built
+
+        sent = []
+        with mock.patch.object(HttpTransport, "_send_envelope", side_effect=sent.append):
+            client.transport._send_envelope(envelope({"peach_permit": dict(permit)}, 'log', 'sessions'))
+            self.assertEqual(len(sent), 1)
+            self.assertNotIn('peach_permit', sent[0].headers)
+            for blocked in (envelope({}, 'log'), envelope({"peach_permit": dict(permit)}, 'log', 'event'),
+                            envelope({}, 'event', 'sessions'),
+                            envelope({"peach_permit": {**permit, "revision": "old"}}, 'log')):
+                client.transport._send_envelope(blocked)
+            self.assertEqual(len(sent), 1)
+
+    def test_usage_wire_payload_has_no_host_sdk_or_consent_path(self):
+        from sentry_sdk.transport import HttpTransport
+        sent = []
+        reporting.save({"usage": True, "errors": True})
+        with mock.patch.object(HttpTransport, "_send_envelope", side_effect=lambda envelope: sent.append(envelope.serialize())):
+            reporting.usage()
+            reporting._client.flush(timeout=2)
+        self.assertEqual(len(sent), 1)
+        wire = sent[0].decode()
+        for value in (str(self.root), 'server.address', 'sentry.sdk', 'consent', 'peach_permit', 'receipt'):
+            self.assertNotIn(value, wire)
+        self.assertIn('"type":"log"', wire.replace(' ', ''))
+        self.assertIn('"aggregates"', wire)
 
     def test_sdk_failure_does_not_break_local_error_recording(self):
         from peach import error_reporting
@@ -535,6 +796,53 @@ class RemoteReportingTests(unittest.TestCase):
                     entry["main"](["Peach.exe", mode])
             tray.assert_not_called()
             client.assert_not_called()
+
+
+class PackagedReportingConfigTests(unittest.TestCase):
+    """两端打包共用的 `sentry.json` 写入；发行构建缺 DSN 必须失败，而不是产出静默的安装包。"""
+
+    LIBRARY_DSN = "https://public@o123.ingest.us.sentry.io/789"
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name).resolve()
+        self.output = self.root / "bundle" / "sentry.json"
+
+    def write(self, *flags, **targets):
+        env = {key: value for key, value in os.environ.items()
+               if key not in {"PEACH_SENTRY_DSN", "PEACH_LIBRARY_SENTRY_DSN"}}
+        env.update(targets, PYTHONIOENCODING="utf-8")
+        script = Path(__file__).resolve().parents[1] / "scripts/write_reporting_config.py"
+        return subprocess.run([sys.executable, "-X", "utf8", str(script), "--output", str(self.output), *flags],
+                              capture_output=True, text=True, encoding="utf-8", env=env, timeout=60)
+
+    def test_release_config_is_read_back_by_the_packaged_runtime(self):
+        result = self.write("--require", PEACH_SENTRY_DSN=DSN, PEACH_LIBRARY_SENTRY_DSN=self.LIBRARY_DSN)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        from peach import library_sharing
+        with mock.patch.dict(os.environ, {"PEACH_SENTRY_DSN": "", "PEACH_LIBRARY_SENTRY_DSN": ""}), \
+                mock.patch("peach.settings_file.PROJECT_ROOT", self.output.parent):
+            self.assertEqual(reporting.dsn(), DSN)
+            self.assertEqual(library_sharing.target(), self.LIBRARY_DSN)
+
+    def test_local_build_without_targets_ships_an_unconfigured_bundle(self):
+        result = self.write()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.output.read_text(encoding="utf-8")), {"dsn": "", "library_dsn": ""})
+
+    def test_release_build_rejects_missing_invalid_or_shared_targets(self):
+        cases = {
+            "缺共享馆藏": {"PEACH_SENTRY_DSN": DSN},
+            "非 Sentry 托管": {"PEACH_SENTRY_DSN": "https://public@sentry.example.com/456",
+                              "PEACH_LIBRARY_SENTRY_DSN": self.LIBRARY_DSN},
+            "同一项目": {"PEACH_SENTRY_DSN": DSN, "PEACH_LIBRARY_SENTRY_DSN": DSN},
+        }
+        for name, targets in cases.items():
+            with self.subTest(name):
+                result = self.write("--require", **targets)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.output.exists())
 
 
 class RemoteReportingApiTests(unittest.TestCase):

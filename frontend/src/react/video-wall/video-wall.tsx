@@ -1,17 +1,15 @@
 import { memo, useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
-import { Radio } from 'react-aria-components';
 import { useQuery } from '@tanstack/react-query';
 import { motion, useReducedMotion } from 'motion/react';
 import { cardArtwork, coverAnchor } from '@peach/card-art';
 import { fmtDur, requestErrorMessage } from '@peach/legacy/core';
-import { spinnerHtml } from '@peach/legacy/ui';
+import { setActionBusy, spinnerHtml } from '@peach/legacy/ui';
 import { isOverlayPath, peachHistory } from '@peach/history';
 import { Button } from '@/components/base/buttons/button';
 import type { MediaCardActions, MediaCardHelpers, MediaItem } from '../catalog-grid/types';
 import { Note } from '../components/note';
 import { ArtSlot } from '../components/art-slot';
-import { SEGMENT, SEGMENTED_TRACK, SegmentedRadioGroup } from '../components/segmented';
 import { busyProps } from '../settings/busy-props';
 import { useWallCamera } from './use-wall-camera';
 import { expandedWallTiles, finiteWallTile, visibleWallTiles, wallTileAt, WallExploration, type WallCamera, type WallTile } from './wall-layout';
@@ -21,6 +19,7 @@ import { WallControls } from './wall-controls';
 import { WallQueue } from './wall-queue';
 import { Shuffle } from '../entity-filter/entity-filter-page';
 import { exitWall, unfilteredWallAddress } from './wall-route';
+import { removeWallBootSkeleton } from './wall-boot';
 import './video-wall.css';
 
 interface VideoWallProps {
@@ -49,12 +48,13 @@ const WallArtwork = memo(function WallArtwork({ item, image, big = false, ratio 
   const pic = useRef<HTMLSpanElement>(null);
   useLayoutEffect(() => {
     pic.current?.querySelectorAll<HTMLImageElement>('img.cover').forEach(img => {
-      if (img.complete && img.naturalWidth) coverAnchor(img);
+      if (img.complete && img.naturalWidth) coverAnchor(img, ratio);
     });
   }, [ratio, artwork.html]);
+  // 比例就是下面写进 `--card-ratio` 的那个数，直接交给取景，免得每格提交后各读一次计算样式。
   return <span ref={pic} data-media-pic="" style={{ '--card-ratio':String(ratio) } as CSSProperties}>
     <ArtSlot artwork={artwork} relayout={node => node.querySelectorAll<HTMLImageElement>('img.cover').forEach(img => {
-      if (img.complete && img.naturalWidth) coverAnchor(img);
+      if (img.complete && img.naturalWidth) coverAnchor(img, ratio);
     })} />
   </span>;
 });
@@ -103,12 +103,14 @@ export function VideoWall({ items, finite, hasMore, busy, loading = false, error
   const [moreError, setMoreError] = useState('');
   const [laterBusy, setLaterBusy] = useState(false);
   const [later, setLater] = useState<{ id: number; on: boolean } | null>(null);
-  const [toolsOpen, setToolsOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const searchButton = useRef<HTMLButtonElement>(null);
   const [portal] = useState(() => {
     const node = document.createElement('div'); node.className = 'peach-react'; return node;
   });
   useLayoutEffect(() => {
     document.body.append(portal);
+    removeWallBootSkeleton();
     camera.viewport.current?.focus({ preventScroll: true });
   }, [portal]);
   useEffect(() => () => portal.remove(), [portal]);
@@ -129,7 +131,10 @@ export function VideoWall({ items, finite, hasMore, busy, loading = false, error
   useLayoutEffect(saveView);
   const visible = visibleWallTiles(loading ? 12 : finite ? items.length : items.length || hasMore ? 12 : 0,
     finite && !loading, camera.view.camera, camera.view.size);
-  const tiles = loading ? visible.map(tile => ({ ...tile, index:-1 })) : finite ? visible : exploration.assign(visible, items.length, hasMore);
+  /* 重进墙面时作品列表会按首页重读、比已分配的位置短：没有作品的位置先画骨架，续页补齐后再显示，
+     不能拿空位去渲染磁贴（窄屏一屏格子多，这样整面墙直接卸掉成黑屏）。 */
+  const tiles = loading ? visible.map(tile => ({ ...tile, index:-1 })) : finite ? visible
+    : exploration.assign(visible, items.length, hasMore).map(tile => tile.index < items.length || (!!selected && tile.key === selectedKey) ? tile : { ...tile, index:-1 });
   const activeTile = selected && (finite ? wallTileAt(items.length, true, selectedKey) : exploration.tile(selectedKey, items.length));
   const expanded = activeTile ? expandedWallTiles(items.length, finite, activeTile) : new Map();
   if (activeTile && !tiles.some(tile => tile.key === activeTile.key)) tiles.push(activeTile);
@@ -176,6 +181,10 @@ export function VideoWall({ items, finite, hasMore, busy, loading = false, error
     document.body.style.overflow = 'hidden';
     return () => { document.body.style.overflow = previous };
   }, [covered]);
+  const closeSearch = () => {
+    setSearchOpen(false);
+    requestAnimationFrame(() => searchButton.current?.focus({ preventScroll: true }));
+  };
   const close = (continuePlaying = true) => {
     stopPlayer(continuePlaying); setPendingPlayback(null); setSelected(null); setSelectedKey(''); setSourceId(null); setQueueOpen(false); setError('');
     const focus = tileFocus.current;
@@ -187,7 +196,7 @@ export function VideoWall({ items, finite, hasMore, busy, loading = false, error
   const choose = (item: MediaItem, tile: WallTile, animate = true) => {
     if (selected?.id !== item.id) stopPlayer(false);
     tileFocus.current = { key: tile.key, id: item.id };
-    setError(''); setPendingPlayback(null); setSelected(item); setSelectedKey(tile.key); setSourceId(null); setQueueOpen(false); setToolsOpen(false);
+    setError(''); setPendingPlayback(null); setSelected(item); setSelectedKey(tile.key); setSourceId(null); setQueueOpen(false); setSearchOpen(false);
     camera.reveal(expandedWallTiles(items.length, finite, tile).get(tile.key) || tile, animate, true);
     if (!animate) requestAnimationFrame(() => root.current?.querySelector<HTMLButtonElement>('[data-wall-play]')?.focus({ preventScroll: true }));
   };
@@ -309,7 +318,7 @@ export function VideoWall({ items, finite, hasMore, busy, loading = false, error
     </div>
     <button type="button" data-wall-focus-close="" aria-label="收起作品" title="收起" onClick={() => close()}><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-x" /></svg></button>
     {error || (groupRef && groupQuery.error && !group) ? <div data-wall-play-error=""><Note tone="error">{error || requestErrorMessage(groupQuery.error)}</Note>
-      {groupQuery.error && !group ? <Button size="small" variant="ghost" onClick={() => void groupQuery.refetch()}>重试</Button> : null}</div> : null}
+      {groupQuery.error && !group ? <Button size="small" variant="ghost" onClick={() => void groupQuery.refetch()}>立即重试</Button> : null}</div> : null}
     <WallControls item={current} playing={playing} frame={playerFrame} starting={starting} pendingGroup={!!groupRef && groupQuery.isPending}
       grouped={!!groupRef} queueOpen={queueOpen} queueReady={!!tracks.length && (!groupRef || !!group)}
       hasPrevious={trackIndex > 0} hasNext={trackIndex >= 0 && trackIndex < tracks.length - 1}
@@ -323,36 +332,40 @@ export function VideoWall({ items, finite, hasMore, busy, loading = false, error
     hidden={covered} onKeyDown={event => {
       if (event.key !== 'Escape' || event.defaultPrevented) return;
       event.preventDefault(); event.stopPropagation();
-      if (queueOpen) setQueueOpen(false); else if (selected) close(); else if (toolsOpen) setToolsOpen(false); else exitWall();
+      if (queueOpen) setQueueOpen(false); else if (selected) close(); else if (searchOpen) closeSearch(); else exitWall();
     }}>
-    <button type="button" data-wall-back="" aria-label="退出播放墙" title="返回" onClick={exitWall}>
-      <svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-chevron-left" /></svg>
-    </button>
-    {finite ? <aside data-wall-filter-notice="" className="ui-project-banner" role="status">
-      <div><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-info" /></svg><p>当前仅显示筛选结果</p></div>
-      <Button size="small" variant="ghost" onClick={() => peachHistory.push(unfilteredWallAddress())}>清除筛选</Button>
-    </aside> : null}
-    {toolsOpen ? <div data-wall-toolbar="" aria-label="播放墙工具">
-      <form onSubmit={event => {
+    <div data-wall-bar="">
+      <button type="button" data-wall-back="" aria-label="退出播放墙" title="返回" onClick={exitWall}>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-chevron-left" /></svg>
+      </button>
+      {!finite && (hasMore || items.length > 0) ? <div data-wall-refresh=""><Shuffle busy={busy} onPress={() => void fresh()} /></div> : null}
+      <button type="button" data-wall-round="" data-wall-image="" aria-label="显示视频缩略图" title={image === 'thumbnail' ? '改回封面' : '显示视频缩略图'}
+        aria-pressed={image === 'thumbnail'} onClick={() => setImage(image === 'thumbnail' ? 'cover' : 'thumbnail')}>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-gallery-thumbnails" /></svg>
+      </button>
+      <form data-wall-search="" data-open={searchOpen || undefined} role="search" onSubmit={event => {
         event.preventDefault();
         const params = new URLSearchParams(location.search);
         const text = String(new FormData(event.currentTarget).get('q') || '').trim();
+        // 关键词没变（包括空着再点一次放大镜）只收起，不重进墙面。
+        if (text === (params.get('q') || '')) { closeSearch(); return }
         if (text) params.set('q', text); else params.delete('q');
-        saveView(); peachHistory.push(`/wall?${params}`); setToolsOpen(false);
+        saveView(); peachHistory.push(`/wall?${params}`); setSearchOpen(false);
       }}>
-        <svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-search" /></svg>
-        <input type="search" name="q" aria-label="搜索播放墙" placeholder="搜索作品" defaultValue={new URLSearchParams(location.search).get('q') || ''} />
+        <button ref={searchButton} type={searchOpen ? 'submit' : 'button'} data-wall-round=""
+          aria-label={searchOpen ? '搜索' : '打开搜索'} title="搜索" aria-expanded={searchOpen}
+          onClick={event => { if (!searchOpen) { event.preventDefault(); setSearchOpen(true) } }}>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-search" /></svg>
+        </button>
+        {searchOpen ? <input type="search" name="q" aria-label="搜索播放墙" placeholder="搜索作品" autoFocus
+          defaultValue={new URLSearchParams(location.search).get('q') || ''}
+          onBlur={event => { if (!event.currentTarget.value.trim() && !event.currentTarget.form?.contains(event.relatedTarget as Node | null)) setSearchOpen(false) }} /> : null}
       </form>
-      <SegmentedRadioGroup aria-label="播放墙图片" value={image} onChange={setImage} className={SEGMENTED_TRACK}>
-        <Radio value="cover" className={SEGMENT}>封面</Radio><Radio value="thumbnail" className={SEGMENT}>缩略图</Radio>
-      </SegmentedRadioGroup>
-      <div data-wall-tools="">
-        <Button size="small" variant="ghost" aria-label="缩小播放墙" onClick={() => camera.zoom(1 / 1.2)}>缩小</Button>
-        <Button size="small" variant="ghost" aria-label="放大播放墙" onClick={() => camera.zoom(1.2)}>放大</Button>
-        <Button size="small" variant="ghost" onClick={camera.reset}>回到起点</Button>
-      </div>
-      <span data-wall-hint="">拖动浏览 · Shift + 滚轮横移</span>
-    </div> : null}
+      {finite ? <aside data-wall-filter-notice="" className="ui-project-banner" role="status">
+        <div><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-info" /></svg><p>当前仅显示筛选结果</p></div>
+        <Button size="small" variant="ghost" onClick={() => peachHistory.push(unfilteredWallAddress())}>清除筛选</Button>
+      </aside> : null}
+    </div>
     <div ref={camera.viewport} data-wall-viewport="" tabIndex={0} role="region" aria-label="播放墙，拖动或方向键浏览"
       aria-busy={loading || freshFrom !== null || (busy && pendingTiles) || undefined} data-skeleton={loading ? 'wall' : undefined}
       {...(loading || freshFrom !== null ? {} : camera.handlers)} onClick={event => {
@@ -362,22 +375,29 @@ export function VideoWall({ items, finite, hasMore, busy, loading = false, error
       }} onKeyDown={event => {
         if (freshFrom !== null) return;
         if (event.target instanceof Element && event.target.closest('button,input,[role="slider"],[data-wall-player],[data-wall-queue]')) return;
+        if (event.ctrlKey || event.metaKey || event.altKey) return;
+        const zooms: Record<string, number> = { '+': 1.2, '=': 1.2, '-': 1 / 1.2 };
+        if (zooms[event.key]) { event.preventDefault(); camera.zoom(zooms[event.key]!); return }
+        if (event.key === '0') { event.preventDefault(); camera.reset(); return }
         const directions: Record<string, [number, number]> = { ArrowLeft: [200,0], ArrowRight: [-200,0], ArrowUp: [0,200], ArrowDown: [0,-200] };
         const delta = directions[event.key];
-        if (!delta || event.ctrlKey || event.metaKey || event.altKey) return;
+        if (!delta) return;
         event.preventDefault(); camera.pan(...delta);
       }}>
       <div ref={camera.world} data-wall-world="">
         {tiles.map(tile => {
           if (tile.index < 0) return <span key={tile.key} data-wall-skeleton="" aria-hidden="true"
             style={{ '--wall-left':`${tile.x}px`, '--wall-top':`${tile.y}px`, '--wall-width':`${tile.width}px`, '--wall-height':`${tile.height}px` } as CSSProperties} />;
-          const item = items[tile.index]!;
           const focused = !!selected && tile.key === selectedKey;
+          const item = focused ? selected! : items[tile.index]!;
           const rect = expanded.get(tile.key) || tile;
           const landing = !entranceDone && !focused;
           const delay = landing ? Math.min(.34, (Math.max(0, tile.x + camera.view.camera.x / camera.view.camera.scale)
             + Math.max(0, tile.y + camera.view.camera.y / camera.view.camera.scale)) / 103.36 * .03) : 0;
-          return <motion.article key={tile.key} layout data-wall-tile={tile.key} data-wall-id={item.id}
+          /* 投影只在这一格自己的几何变了的那次提交里量：拖动、平移时整面墙每次重渲染都量一遍
+             全部磁贴和页面滚动位置，量的那一下正赶上刚写完的样式，逐次整树重算。 */
+          return <motion.article key={tile.key} layout layoutDependency={`${rect.x}:${rect.y}:${rect.width}:${rect.height}`}
+            data-wall-tile={tile.key} data-wall-id={item.id}
             data-wall-focus={focused ? '' : undefined} data-playing={focused && (playing || starting) ? '' : undefined}
             role={focused ? 'group' : 'button'} tabIndex={focused ? -1 : 0}
             aria-label={focused ? label(item) : `展开 ${label(item)}`} aria-expanded={focused ? undefined : false}
@@ -413,15 +433,16 @@ export function VideoWall({ items, finite, hasMore, busy, loading = false, error
         })}
       </div>
     </div>
-    {!loading && queryError ? <div data-wall-error=""><Note tone="error">{queryError}</Note><Button size="small" variant="ghost" onClick={retry}>重试</Button></div> : null}
-    {!loading && !queryError && !items.length ? <div data-wall-empty="" dangerouslySetInnerHTML={{ __html:emptyHtml }} /> : null}
-    {!finite && (hasMore || items.length > 0) ? <div data-wall-refresh=""><Shuffle busy={busy} onPress={() => void fresh()} /></div> : null}
-    {hasMore && finite ? <div data-wall-footer=""><Button size="small" variant="secondary" {...busyProps(busy)} onClick={() => void more()}>
+    {!loading && queryError ? <div data-wall-error=""><Note tone="error">{queryError}</Note><Button size="small" variant="ghost" onClick={retry}>立即重试</Button></div> : null}
+    {!loading && !queryError && !items.length ? <div data-wall-empty="" onClick={async event => {
+      const control = (event.target as Element).closest('[data-wall-load-more]');
+      if (!control || busy || moreFlight.current) return;
+      setActionBusy(control);
+      try { await more() } finally { setActionBusy(control, false) }
+    }} dangerouslySetInnerHTML={{ __html:emptyHtml }} /> : null}
+    {hasMore && finite && items.length > 0 ? <div data-wall-footer=""><Button size="small" variant="secondary" {...busyProps(busy)} onClick={() => void more()}>
       {busy ? <span dangerouslySetInnerHTML={{ __html:spinnerHtml() }} /> : null}载入更多</Button></div> : null}
-    {moreError ? <div data-wall-error=""><Note tone="error">{moreError}</Note><Button size="small" variant="ghost" {...busyProps(busy)} onClick={() => void more()}>重试</Button></div> : null}
-    <button type="button" data-wall-tools-button="" aria-label="播放墙工具" title="播放墙工具" aria-expanded={toolsOpen} onClick={() => setToolsOpen(!toolsOpen)}>
-      <svg viewBox="0 0 24 24" aria-hidden="true"><use href="#i-settings" /></svg>
-    </button>
+    {moreError ? <div data-wall-error=""><Note tone="error">{moreError}</Note><Button size="small" variant="ghost" {...busyProps(busy)} onClick={() => void more()}>立即重试</Button></div> : null}
   </div>;
   return createPortal(wall, portal);
 }

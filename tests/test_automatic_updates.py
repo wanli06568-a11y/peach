@@ -16,14 +16,14 @@ class AutomaticUpdateTests(unittest.TestCase):
         self.updates = AutomaticUpdates(self.root, available=True)
 
     def test_settings_roundtrip_disable_and_validate_installation(self):
-        self.assertEqual(self.updates.snapshot()["mode"], "off")
+        self.assertEqual(self.updates.snapshot()["mode"], "check")
         self.updates.save({"mode": "check", "interval_hours": 6})
         self.assertEqual(AutomaticUpdates(self.root, available=True).read()["mode"], "check")
         for body in ({"mode": [], "interval_hours": 24}, {"mode": "check", "interval_hours": True},
                      {"mode": "check", "interval_hours": 1}):
             with self.assertRaises(ValueError):
                 self.updates.save(body)
-        with patch("peach.distribution.standalone", return_value=False), self.assertRaises(ValueError):
+        with patch("peach.distribution.in_app_update", return_value=False), self.assertRaises(ValueError):
             self.updates.save({"mode": "download", "interval_hours": 24})
         self.updates.save({"mode": "off", "interval_hours": 24})
         with patch("peach.release_updates.check") as check:
@@ -48,8 +48,36 @@ class AutomaticUpdateTests(unittest.TestCase):
             check.assert_called_once()
         self.assertEqual(self.updates.read()["result"]["state"], "error")
 
+    def test_legacy_results_are_hidden_and_rechecked_without_waiting_the_old_interval(self):
+        from peach import release_updates
+
+        version = release_updates.snapshot()['current_version']
+        self.updates.write({'mode': 'check', 'interval_hours': 24, 'checked_at': 200000,
+                            'result': {'current_version': version, 'latest_version': '0.50.0',
+                                       'state': 'ahead'}})
+        self.assertNotIn('result', self.updates.snapshot())
+        fresh = {'current_version': version, 'state': 'error', 'latest_version': None}
+        with patch('peach.release_updates.check', return_value=fresh) as check, \
+                patch('peach.automatic_updates.time.time', return_value=200001):
+            self.updates.tick()
+            self.updates.tick()
+        check.assert_called_once()
+        self.assertEqual(self.updates.snapshot()['result']['state'], 'error')
+        self.assertNotIn('listing_rule', self.updates.snapshot())
+
+    def test_manual_check_replaces_legacy_results_without_enabling_automatic_checks(self):
+        from peach import release_updates
+
+        self.updates.write({'mode': 'off', 'interval_hours': 168, 'result': {'state': 'ahead'}})
+        self.updates.remember({'current_version': release_updates.snapshot()['current_version'],
+                               'state': 'current'})
+        result = self.updates.snapshot()
+        self.assertEqual(result['mode'], 'off')
+        self.assertEqual(result['interval_hours'], 168)
+        self.assertEqual(result['result']['state'], 'current')
+
     def test_download_prepares_once_and_never_requests_restart(self):
-        with patch("peach.distribution.standalone", return_value=True), patch(
+        with patch("peach.distribution.in_app_update", return_value=True), patch(
                 "peach.release_updates.check", return_value={"state": "available"}), patch(
                 "peach.standalone_update.public", return_value={"state": "idle"}), patch(
                 "peach.standalone_update.start") as start, patch("peach.standalone_update.request_restart") as restart:
@@ -59,13 +87,24 @@ class AutomaticUpdateTests(unittest.TestCase):
             start.assert_called_once()
             restart.assert_not_called()
         for state in ("ready", "downloading", "installing"):
-            with patch("peach.distribution.standalone", return_value=True), patch(
+            with patch("peach.distribution.in_app_update", return_value=True), patch(
                     "peach.release_updates.check", return_value={"state": "available"}), patch(
                     "peach.standalone_update.public", return_value={"state": state}), patch(
                     "peach.standalone_update.start") as start:
                 self.updates.write({"mode": "download", "interval_hours": 24})
                 self.updates.tick()
                 start.assert_not_called()
+
+    def test_macos_standalone_only_checks_even_with_saved_download_mode(self):
+        self.updates.write({"mode": "download", "interval_hours": 24})
+        with patch("peach.distribution.in_app_update", return_value=False), patch(
+                "peach.release_updates.check", return_value={"state": "available"}) as check, patch(
+                "peach.standalone_update.start") as start:
+            self.assertFalse(self.updates.snapshot()["download_available"])
+            self.updates.tick()
+            check.assert_called_once()
+            start.assert_not_called()
+        self.assertNotIn("error", self.updates.read(), "没有应用内安装的系统不能每轮记一次下载失败")
 
     def test_unmanaged_and_corrupt_settings_fail_closed(self):
         other = AutomaticUpdates(self.root, available=False)

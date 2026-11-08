@@ -7,7 +7,9 @@ import { api } from '@peach/legacy/core';
 import { normalizeJavPreferences } from '../jav-artwork';
 import { boundedPreference } from '../number-setting';
 import { createSettingsStore, type SettingsStore } from '../settings-store';
+import { MANAGE_MENU_SECTIONS, normalizeManageOrder } from '../application/navigation-items';
 import { DEFAULT_SIDEBAR_ORDER, normalizeSidebarOrder } from '../sidebar';
+import { normalizeNavigationOrders, type NavigationOrders } from '../navigation-order';
 import { SORT_ALIASES, SORT_KEYS } from '../sort-preferences';
 import { DEFAULT_ACCENT, DEFAULT_HOME_GLOW, normalizeAccent, normalizeHomeGlow, type HomeGlow } from './home-glow';
 
@@ -33,9 +35,11 @@ export interface AppSettings {
   seekSeconds: number;
   searchHistoryLimit: number;
   relatedLimit: number;
+  feedLimit: number;
   javLayout: string;
   homeLayout: string;
   javImage: string;
+  performerNameLanguage: 'zh-CN' | 'ja';
   followLayout: string;
   peopleLayout: string;
   photoSize: string;
@@ -54,16 +58,21 @@ export interface AppSettings {
   feedHideExcerpts: boolean;
   followInitialDays: number;
   sidebarOrder: string[];
+  manageOrder: string[];
+  navigationOrders: NavigationOrders;
+  libraryOrder: string[];
   homeGlow: HomeGlow;
   accent: string;
 }
 
 export const DEFAULT_SETTINGS = {
   batchSize: 60, defaultSort: 'seed', sortDefaultsVersion: 3, hoverDelaySeconds: 5, seekSeconds: 10,
-  searchHistoryLimit: 10, relatedLimit: 20, javLayout: 'big', homeLayout: 'small', javImage: 'cover',
+  searchHistoryLimit: 10, relatedLimit: 20, feedLimit: 12, javLayout: 'big', homeLayout: 'small', javImage: 'cover',
   followLayout: 'default', peopleLayout: 'big', photoSize: 'small', ambientMode: true, miniplayer: true,
-  theaterMode: false, theme: 'system', groupCollapse: true, sidebarOrder: [...DEFAULT_SIDEBAR_ORDER],
-  homeGlow: DEFAULT_HOME_GLOW, accent: DEFAULT_ACCENT,
+  theaterMode: false, theme: 'system', groupCollapse: true, sidebarOrder: [...DEFAULT_SIDEBAR_ORDER], manageOrder: [...MANAGE_MENU_SECTIONS],
+  homeGlow: DEFAULT_HOME_GLOW, accent: DEFAULT_ACCENT, performerNameLanguage: 'zh-CN',
+  navigationOrders: {},
+  libraryOrder: [],
 } as const;
 
 /** 白名单里的值原样给回，否则给 `fallback`。 */
@@ -103,11 +112,16 @@ export function normalizeAppSettings(raw: unknown): { settings: AppSettings; mig
   settings.feedHideExcerpts = settings.feedHideExcerpts !== false;
   settings.searchHistoryLimit = boundedPreference(+(settings.searchHistoryLimit as number), 0, 50, 10);
   settings.relatedLimit = boundedPreference(+(settings.relatedLimit as number), 0, 60, 20);
+  settings.feedLimit = boundedPreference(+(settings.feedLimit as number), 1, 100, 12);
   Object.assign(settings, normalizeJavPreferences(settings));
   settings.theme = allowedSetting(settings.theme, THEME_CHOICES, 'system');
+  settings.performerNameLanguage = allowedSetting(settings.performerNameLanguage, ['zh-CN', 'ja'], 'zh-CN');
   settings.homeGlow = normalizeHomeGlow(settings.homeGlow);
   settings.accent = normalizeAccent(settings.accent);
   settings.sidebarOrder = normalizeSidebarOrder(settings.sidebarOrder);
+  settings.manageOrder = normalizeManageOrder(settings.manageOrder);
+  settings.navigationOrders = normalizeNavigationOrders(settings.navigationOrders);
+  settings.libraryOrder = Array.isArray(settings.libraryOrder) ? [...new Set(settings.libraryOrder.filter(key => typeof key === 'string'))] : [];
   return { settings: settings as AppSettings, migrated };
 }
 
@@ -130,16 +144,20 @@ export function appSettingsStore(): SettingsStore<AppSettings> {
 }
 
 /** 数据库那一份要求某个壳侧效果跟着做时报的名字（同设置面板的效果名）。 */
-export type SyncedEffect = 'searchHistoryLimit';
+export type SyncedEffect = 'searchHistoryLimit' | 'performerNameLanguage';
 
 /** 搜索记录条数在 `/api/settings` 上的形状：还没定过时是 null。 */
 export interface SyncedSettings {
+  performerNameLanguage?: unknown;
   followInitialDays?: unknown;
   feedHideGroupCompilations?: unknown;
   feedHideSoloCompilations?: unknown;
   feedHideExcerpts?: unknown;
   searchHistoryLimit?: unknown;
   sidebarOrder?: unknown;
+  manageOrder?: unknown;
+  navigationOrders?: unknown;
+  libraryOrder?: unknown;
 }
 
 /* 数据库那一份落进本地缓存。启动时壳取一次、设置面板每次打开再取一次，都交到这里；开着的面板与
@@ -150,6 +168,12 @@ export function applySyncedSettings(
   target: SettingsStore<AppSettings> = appSettingsStore(),
 ): void {
   const settings = target.value;
+  const language = remote?.performerNameLanguage;
+  if ((language === 'zh-CN' || language === 'ja') && language !== settings.performerNameLanguage) {
+    settings.performerNameLanguage = language;
+    target.save();
+    changed('performerNameLanguage');
+  }
   const initial = remote && remote.followInitialDays;
   if (FOLLOW_INITIAL_DAYS.includes(initial as number)) { settings.followInitialDays = initial as number; target.save() }
   for (const key of FEED_COMPILATION_KEYS) {
@@ -165,7 +189,23 @@ export function applySyncedSettings(
     }
   } else if (remote && remote.searchHistoryLimit === null
     && settings.searchHistoryLimit !== DEFAULT_SETTINGS.searchHistoryLimit) postSearchHistoryLimit(target);
+  if (Array.isArray(remote?.manageOrder)) {
+    const manageOrder = normalizeManageOrder(remote.manageOrder);
+    if (manageOrder.join(',') !== settings.manageOrder.join(',')) { settings.manageOrder = manageOrder; target.save() }
+  }
   const order = Array.isArray(remote && remote.sidebarOrder) ? remote!.sidebarOrder as string[] : null;
+  if (Array.isArray(remote?.libraryOrder) && remote.libraryOrder.every(key => typeof key === 'string')
+    && remote.libraryOrder.join(',') !== settings.libraryOrder.join(',')) {
+    settings.libraryOrder = remote.libraryOrder;
+    target.save();
+  }
+  if (remote?.navigationOrders) {
+    const navigationOrders = normalizeNavigationOrders(remote.navigationOrders);
+    if (JSON.stringify(navigationOrders) !== JSON.stringify(settings.navigationOrders)) {
+      settings.navigationOrders = navigationOrders;
+      target.save();
+    }
+  }
   if (!order || !order.length || order.join(',') === settings.sidebarOrder.join(',')) return;
   settings.sidebarOrder = order;
   target.save();

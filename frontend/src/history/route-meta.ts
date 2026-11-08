@@ -14,7 +14,9 @@
  * 解码过的路径，名字里的斜杠吃掉剩下全部段，空尾段不算）。 */
 import { overlayMatch } from './overlay';
 import { entityLinkName } from '../core/entity-links';
-import { PREFERENCE_SECTIONS, CONFIGURATION_SECTIONS } from './settings-route';
+import { entityDisplayName } from '../core/entity-names';
+import { CLEANUP_CRUMB_PAGES, type CleanupToolPath } from '../cleanup-tools';
+import { PREFERENCE_SECTIONS, CONFIGURATION_SECTIONS, REPAIR_CENTER_PATH } from './settings-route';
 
 export interface RouteMeta {
   readonly title?: string;
@@ -24,15 +26,17 @@ export interface RouteMeta {
   readonly reload?: 'reopen';
 }
 
-export const ROUTE_META: Readonly<Record<string, RouteMeta>> = {
+const ROUTE_ENTRIES = {
   '/settings': { title: '设置', refresh: 'skip' },
   ...Object.fromEntries(Object.entries(PREFERENCE_SECTIONS).map(([key, title]) => [`/settings/${key}`, { title, refresh: 'skip' }])),
   ...Object.fromEntries(Object.entries(CONFIGURATION_SECTIONS).map(([key, title]) => [`/settings/${key}`, { title, section: 'configuration', refresh: 'reopen' }])),
+  [REPAIR_CENTER_PATH]: { title: '修复与迁移', section: 'configuration', refresh: 'reopen' },
   '/jav': { nav: 'jav', title: 'JAV', refresh: 'reopen' },
   '/stats': { section: 'stats', title: '统计' },
   '/taste': { section: 'taste', title: '口味', refresh: 'reopen' },
   '/review': { section: 'review', title: '人工复核', refresh: 'reopen' },
   '/data-cleanup': { section: 'cleanup', title: '数据管理' },
+  ...Object.fromEntries(Object.entries(CLEANUP_CRUMB_PAGES).map(([path, title]) => [path, { section: 'cleanup', title, refresh: 'reopen' }])),
   '/duplicates': { section: 'cleanup', title: '重复文件', refresh: 'reopen' },
   '/quality-goals': { section: 'quality', title: '高清版', refresh: 'reopen' },
   '/sources': { section: 'cleanup', title: '来源和凭证', refresh: 'reopen' },
@@ -45,6 +49,7 @@ export const ROUTE_META: Readonly<Record<string, RouteMeta>> = {
   '/creators': { title: '卖家', reload: 'reopen' },
   '/studios': { nav: 'studios', title: '厂牌', reload: 'reopen' },
   '/agencies': { title: '事务所', reload: 'reopen' },
+  '/series': { nav: 'studios', title: '系列', reload: 'reopen' },
   '/tags': { nav: 'tags', title: '标签', reload: 'reopen' },
   '/performers/*': { reload: 'reopen' },
   '/studios/*': { reload: 'reopen' },
@@ -69,7 +74,12 @@ export const ROUTE_META: Readonly<Record<string, RouteMeta>> = {
   // 沉浸模式进页面组，不算覆盖。
   '/immerse': { nav: 'immerse', title: '沉浸模式' },
   '/wall': { nav: 'wall', title: '播放墙' },
-};
+} satisfies Readonly<Record<string, RouteMeta>>;
+
+export type RegisteredRoutePath = keyof typeof ROUTE_ENTRIES
+  | `/settings/${keyof typeof PREFERENCE_SECTIONS | keyof typeof CONFIGURATION_SECTIONS}`
+  | CleanupToolPath;
+export const ROUTE_META: Readonly<Record<string, RouteMeta>> = ROUTE_ENTRIES;
 
 /** 这条路径登记的元数据；没登记是 `null`。 */
 export function routeMetaOf(path: string): RouteMeta | null {
@@ -82,5 +92,5 @@ export function routeMetaOf(path: string): RouteMeta | null {
   const pattern = `/${segment}/*`;
   const kinds: Record<string, string> = { performers: 'performer', studios: 'studio', creators: 'creator', agencies: 'agency', series: 'series', tags: 'tag' };
   const name = /^\d+$/.test(rest.join('/')) ? entityLinkName(kinds[segment] || '', Number(rest[0])) : rest.join('/');
-  return Object.hasOwn(ROUTE_META, pattern) ? { ...ROUTE_META[pattern], title: name || '资料' } : null;
+  return Object.hasOwn(ROUTE_META, pattern) ? { ...ROUTE_META[pattern], title: name ? entityDisplayName(kinds[segment] || '', name) : '资料' } : null;
 }

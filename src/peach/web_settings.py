@@ -6,8 +6,7 @@
 侧栏不一样。左侧导航放哪些入口、什么顺序，是长出来的使用习惯；在 Windows 上排好，
 到 Mac 上又是默认顺序，那不叫两台设备，叫两个应用。所以它跟着账本走。
 
-落点是 `profile.settings_json`——0001 建表时就留好的字段，一直是空的 `{}`。
-不新建表也就不需要迁移。
+名称显示语言也随用户走，落在现有的 `profile.settings_json` 中，不需要新增表或迁移。
 
 写入受 ledger 只读闸门约束：reader（只读端）改不了顺序，但读到的是 writer 的那份，
 这正是「同一份习惯」的意思。
@@ -18,6 +17,7 @@ import json
 import time
 from typing import Protocol
 
+from .catalog_rules import compile_code_patterns
 from .feeds import DEFAULT_HIDDEN_COMPILATIONS, EXCERPT, GROUP_COMPILATION, SOLO_COMPILATION
 from .media_sources import SCANNABLE_LOCATIONS
 from .remote_media_cache import AVATAR_REFRESH_SECONDS, FAVICON_REFRESH_SECONDS
@@ -51,10 +51,11 @@ SEARCH_HISTORY_LIMIT_MAX = 50
 #: 整理模板（ADR-0039）同理：它是「我要我的库长什么样」，不是这台设备上的顺手。
 #: 新作那一行收不收合集（`feeds.compilation_kind`）同样是服务端行为：列表、未读数和
 #: 替哪些壳补封面都按它算，所以跟着账本走。
+#: 番号识别规则描述的是这套馆藏的命名，处理任务按它往账本里写番号，同样跟着账本走。
 SYNCED_SETTING_KEYS = frozenset({
-    "sidebarOrder", "followInitialDays", "postSetupTutorialDone",
+    "sidebarOrder", "manageOrder", "navigationOrders", "libraryOrder", "followInitialDays", "postSetupTutorialDone",
     "organizeTemplates", "feedHideGroupCompilations", "feedHideSoloCompilations",
-    "feedHideExcerpts", "searchHistoryLimit",
+    "feedHideExcerpts", "searchHistoryLimit", "codePatterns", "performerNameLanguage", "taskSpeedMode",
 })
 #: 三个收起开关的键与各自对应的那一类，缺省值取 `feeds.DEFAULT_HIDDEN_COMPILATIONS`。
 FEED_COMPILATION_SWITCHES = (
@@ -67,6 +68,48 @@ FEED_COMPILATION_SWITCHES = (
 class SettingsContract(Protocol):
     def read_connection(self): ...
     def write_transaction(self): ...
+
+
+DEFAULT_MANAGE_ORDER = ('stats', 'taste', 'cleanup', 'follow', 'activity', 'configuration')
+NAVIGATION_ORDERS = {
+    'review': ('metadata_fields', 'creator_tags', 'code_creators', 'western_identity', 'performer_avatars',
+               'studio_logos', 'fc2_markings', 'fc2_similarity', 'video_endcards'),
+    'configuration': ('library', 'sources', 'downloads', 'network', 'maintenance', 'diagnostics'),
+    'favorites': ('all', 'filters', 'performer', 'creator', 'tag', 'series', 'studio', 'agency'),
+    'jav': ('library', 'wants', 'releases', 'discover'),
+    'follow': ('list', 'add', 'tags'),
+    'tags': ('local', 'online'),
+    'preferences': ('appearance', 'browsing', 'jav', 'search', 'content'),
+}
+
+
+def normalise_navigation_orders(raw):
+    """按组归一化已存顺序，新入口追加至个人顺序末尾。"""
+    if not isinstance(raw, dict):
+        return {}
+    result = {}
+    for group, defaults in NAVIGATION_ORDERS.items():
+        entries = raw.get(group)
+        if isinstance(entries, list):
+            fixed = ['all'] if group == 'favorites' else []
+            result[group] = list(dict.fromkeys(fixed + [key for key in entries if isinstance(key, str) and key in defaults]
+                                              + list(defaults)))
+    return result
+
+
+def navigation_orders_patch(raw):
+    if not isinstance(raw, dict) or set(raw) - NAVIGATION_ORDERS.keys():
+        raise ValueError('导航排序需要已知分组与顺序数组')
+    if any(not isinstance(entries, list) or any(not isinstance(key, str) or key not in NAVIGATION_ORDERS[group]
+                                               for key in entries) for group, entries in raw.items()):
+        raise ValueError('导航顺序包含无效项目')
+    return normalise_navigation_orders(raw)
+
+
+def normalise_manage_order(raw):
+    entries = raw if isinstance(raw, list) else []
+    return list(dict.fromkeys([value for value in entries if isinstance(value, str) and value in DEFAULT_MANAGE_ORDER]
+                             + list(DEFAULT_MANAGE_ORDER)))
 
 
 def normalise_sidebar_order(raw) -> list[str]:
@@ -149,6 +192,24 @@ def organize_templates(contract: SettingsContract) -> dict:
     return normalise_organize_templates(_stored(contract).get("organizeTemplates"))
 
 
+def normalise_code_patterns(raw) -> list[str]:
+    """收敛番号识别规则：一组正则，去掉空行。
+
+    存之前就编译一遍：写错的规则在保存那一刻报给用户（`ValueError`，API 翻成 400），
+    不等到下一次处理时才在后台悄悄失效。
+    """
+    compile_code_patterns(raw)
+    return [str(rule).strip() for rule in raw or () if str(rule or "").strip()]
+
+
+def _stored_code_patterns(payload: dict) -> list[str]:
+    """存进去之后又被手改坏的规则当没设置过：页面照常打开，处理也不因此中断。"""
+    try:
+        return normalise_code_patterns(payload.get("codePatterns"))
+    except (TypeError, ValueError):
+        return []
+
+
 def _feed_switches(payload: dict) -> dict[str, bool]:
     return {key: payload[key] if isinstance(payload.get(key), bool)
             else kind in DEFAULT_HIDDEN_COMPILATIONS
@@ -181,14 +242,34 @@ def q_settings(contract: SettingsContract, _args=None) -> dict:
     payload = _stored(contract)
     return {
         "sidebarOrder": normalise_sidebar_order(payload.get("sidebarOrder")),
+        **({"manageOrder": normalise_manage_order(payload["manageOrder"])} if "manageOrder" in payload else {}),
+        **({"navigationOrders": normalise_navigation_orders(payload["navigationOrders"])} if "navigationOrders" in payload else {}),
+        **({"libraryOrder": payload["libraryOrder"]} if isinstance(payload.get("libraryOrder"), list) else {}),
         "avatarRefreshDays": AVATAR_REFRESH_SECONDS // 86400,
         "faviconRefreshDays": FAVICON_REFRESH_SECONDS // 86400,
         "followInitialDays": normalise_follow_initial_days(payload.get("followInitialDays")),
         "postSetupTutorialDone": payload.get("postSetupTutorialDone") is True,
         "organizeTemplates": normalise_organize_templates(payload.get("organizeTemplates")),
+        "codePatterns": _stored_code_patterns(payload),
         **_feed_switches(payload),
         "searchHistoryLimit": normalise_search_history_limit(payload.get("searchHistoryLimit")),
+        "performerNameLanguage": "ja" if payload.get("performerNameLanguage") == "ja" else "zh-CN",
+        "taskSpeedMode": payload.get("taskSpeedMode", "standard"),
     }
+
+
+def _navigation_patch(body):
+    patch = {}
+    if "navigationOrders" in body:
+        patch["navigationOrders"] = navigation_orders_patch(body["navigationOrders"])
+    if "libraryOrder" in body:
+        order = body["libraryOrder"]
+        if (not isinstance(order, list) or len(order) > 1000
+                or any(not isinstance(key, str) or not key or len(key) > 120 for key in order)
+                or len(set(order)) != len(order)):
+            raise ValueError("媒体库顺序须使用不重复的媒体库 ID")
+        patch["libraryOrder"] = order
+    return patch
 
 
 def w_settings(contract: SettingsContract, body) -> dict:
@@ -206,6 +287,17 @@ def w_settings(contract: SettingsContract, body) -> dict:
         raise ValueError("没有要写入的设置")
 
     merged = _stored(contract)
+    merged.update(_navigation_patch(body))
+    if "taskSpeedMode" in body:
+        from .processing_control import valid_mode
+        merged["taskSpeedMode"] = valid_mode(body["taskSpeedMode"])
+    if "performerNameLanguage" in body:
+        language = body["performerNameLanguage"]
+        if language not in ("zh-CN", "ja"):
+            raise ValueError("performerNameLanguage 只收 zh-CN 或 ja")
+        merged["performerNameLanguage"] = language
+    if "manageOrder" in body:
+        merged["manageOrder"] = normalise_manage_order(body["manageOrder"])
     if "sidebarOrder" in body:
         merged["sidebarOrder"] = normalise_sidebar_order(body["sidebarOrder"])
     if "followInitialDays" in body:
@@ -214,6 +306,8 @@ def w_settings(contract: SettingsContract, body) -> dict:
         merged["postSetupTutorialDone"] = body["postSetupTutorialDone"] is True
     if "organizeTemplates" in body:
         merged["organizeTemplates"] = normalise_organize_templates(body["organizeTemplates"])
+    if "codePatterns" in body:
+        merged["codePatterns"] = normalise_code_patterns(body["codePatterns"])
     if "searchHistoryLimit" in body:
         limit = normalise_search_history_limit(body["searchHistoryLimit"])
         if limit is None:
@@ -232,7 +326,11 @@ def w_settings(contract: SettingsContract, body) -> dict:
         except (TypeError, ValueError):
             current = {}
         current = current if isinstance(current, dict) else {}
-        current.update({key: merged[key] for key in body})
+        patch = {key: merged[key] for key in body}
+        if "navigationOrders" in patch:
+            patch["navigationOrders"] = {**normalise_navigation_orders(current.get("navigationOrders")),
+                                         **patch["navigationOrders"]}
+        current.update(patch)
         updated = connection.execute(
             "UPDATE profile SET settings_json=?, updated_at=? WHERE id=?",
             (json.dumps(current, ensure_ascii=False), stamp, DEFAULT_PROFILE_ID),

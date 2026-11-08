@@ -11,13 +11,15 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from peach.follow import FollowHistoryEnd, FollowSourceError, FollowSourceRateLimited
 from peach.follow_check import plan_check, run_check
 from peach.follow_stream import FollowMediaResolver
 from peach.follow_secrets import CredentialError
-from peach.follow_sources import FollowCandidate, SourceFetch, _BaseConnector
+from peach.follow_sources import FanboxConnector, FollowCandidate, SourceFetch, _BaseConnector
 from peach.follow_store import FollowStore
+from peach.http import HttpResponse
 from support.ledger import fresh_ledger
 
 
@@ -320,6 +322,44 @@ class PlanCheckTests(_CheckCase):
                          frozenset())
 
 
+class ScheduledCheckTests(_CheckCase):
+    """定时检查按来源活跃度放慢；手动检查照旧全查（ADR-0134）。"""
+
+    def _checked_with_latest(self, ref, age):
+        source_id = self._register(ref=ref, url=f"https://{ref}.fanbox.cc/")
+        published = (MOMENT - age).isoformat().replace("+00:00", "Z")
+        self.store.record(source_id, _fetch(ref=ref, candidates=(
+            FollowCandidate(provider="fanbox", external_id=ref, title=ref,
+                            published_at=published),)), moment=MOMENT)
+        return source_id
+
+    def _due(self, after):
+        return {row["id"] for row in plan_check(self.store, _Credentials(),
+                                                scheduled=timedelta(hours=1),
+                                                moment=MOMENT + after)}
+
+    def test_sources_that_stopped_updating_are_checked_less_often(self):
+        active = self._checked_with_latest("active", timedelta(days=2))
+        monthly = self._checked_with_latest("monthly", timedelta(days=20))
+        quarterly = self._checked_with_latest("quarterly", timedelta(days=60))
+        dormant = self._checked_with_latest("dormant", timedelta(days=200))
+        empty = self._register(ref="empty", url="https://empty.fanbox.cc/")
+        self.store.record(empty, _fetch(ref="empty"), moment=MOMENT)
+        never = self._register(ref="never", url="https://never.fanbox.cc/")
+        self.assertEqual(self._due(timedelta(hours=1)), {active, never})
+        self.assertEqual(self._due(timedelta(hours=3)), {active, monthly, never})
+        self.assertEqual(self._due(timedelta(hours=12)), {active, monthly, quarterly, never})
+        self.assertEqual(self._due(timedelta(hours=24)),
+                         {active, monthly, quarterly, dormant, empty, never})
+        self.assertEqual(len(plan_check(self.store, _Credentials())), 6)
+
+    def test_a_tick_that_lands_just_before_the_interval_still_checks(self):
+        """调度一跳一个间隔，上次检查总比这一跳晚一点；判据放宽半个间隔，不让它多等一跳。"""
+        active = self._checked_with_latest("active", timedelta(days=2))
+        self.assertEqual(self._due(timedelta(minutes=58)), {active})
+        self.assertEqual(self._due(timedelta(minutes=20)), set())
+
+
 class RunCheckTests(_CheckCase):
     def test_a_normal_check_reads_the_first_page_with_the_stored_cursors(self):
         source_id = self._register()
@@ -386,8 +426,9 @@ class RunCheckTests(_CheckCase):
         self.assertEqual(self._row(first)["last_status"], "error")
         connector = _Connector(_fetch(ref="another"))
         skipped = self._run(second, connector, cooldown=cooldown)
-        self.assertFalse(skipped.ok)
-        self.assertIn("冷却", skipped.error)
+        self.assertTrue(skipped.ok)
+        self.assertEqual(skipped.status, "skipped")
+        self.assertIn("冷却", skipped.message)
         self.assertEqual(connector.calls, [])
         self.assertIsNone(self._row(second)["last_status"])
         clock[0] += 121
@@ -566,6 +607,66 @@ class InitialHistoryTests(_CheckCase):
         self.assertEqual(row['backfill_page'], 2)
         self.assertEqual(json.loads(row['metadata_json'])['initial_history_after'],
                          (start - timedelta(days=40 + 11)).isoformat())
+
+    def test_fanbox_initial_history_archives_identical_posts_from_distinct_urls(self):
+        source = self._register()
+        history_url = 'https://api.fanbox.cc/post.listCreator?creatorId=ffxivinitiala&firstId=2'
+        body = json.dumps({'body': {'posts': [
+            {'id': str(index), 'title': f'作品 {index}', 'feeRequired': 0,
+             'publishedDatetime': '2026-09-02T00:00:00Z'} for index in (2, 1)
+        ]}}).encode()
+        seen = []
+
+        def transport(request, timeout, max_bytes):
+            seen.append(request.url)
+            if 'paginateCreator' in request.url:
+                return HttpResponse(200, {}, json.dumps(
+                    {'body': {'pageUrls': [history_url]}}).encode())
+            return HttpResponse(200, {}, body)
+
+        connector = FanboxConnector(transport=transport, enrich_budget=0)
+        result = self._run(source, connector, initial_days=30)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.outcome.added, 2)
+        self.assertEqual(len(self.store.items(source_id=source)), 2)
+        row = self._row(source)
+        self.assertEqual(row['last_status'], 'ok')
+        self.assertEqual(row['backfill_page'], 1)
+        self.assertEqual(json.loads(row['metadata_json'])['initial_history_floor'], 0)
+        snapshots = list((self.root / 'sources').rglob('*.raw'))
+        self.assertEqual(len(snapshots), 2)
+        self.assertTrue(all(path.read_bytes() == body for path in snapshots))
+        urls = {json.loads(path.with_suffix('.json').read_text(encoding='utf-8'))['request_url']
+                for path in snapshots}
+        self.assertEqual(urls, {seen[0], history_url})
+        again = self._run(source, connector, initial_days=30)
+        self.assertTrue(again.ok)
+        self.assertEqual(again.outcome.added, 0)
+        self.assertEqual(len(self.store.items(source_id=source)), 2)
+        self.assertEqual(len(list((self.root / 'sources').rglob('*.raw'))), 2)
+
+    def test_a_history_evidence_conflict_records_a_source_failure_and_keeps_saved_items(self):
+        source = self._register()
+        pages = {page: _fetch(request_url=f'https://api.fanbox.cc/page/{page}',
+                              raw_body=f'page {page}'.encode(),
+                              candidates=_dated(f'p{page}', 2, MOMENT, provider='fanbox'))
+                 for page in (0, 1)}
+        persist = self.store._persist_evidence
+
+        def evidence(fetch, moment):
+            if fetch.request_url.endswith('/1'):
+                raise FollowSourceError('immutable follow snapshot collision')
+            return persist(fetch, moment)
+
+        with mock.patch.object(self.store, '_persist_evidence', evidence):
+            result = self._run(source, _PagedConnector(pages), initial_days=30)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, 'error')
+        self.assertIn('immutable follow snapshot collision', result.error)
+        self.assertEqual({item.external_id for item in self.store.items(source_id=source)},
+                         {'p0-0', 'p0-1'})
+        self.assertEqual(self._row(source)['last_status'], 'error')
+        self.assertEqual(self._row(source)['backfill_page'], 0)
 
     def test_the_top_up_stops_quietly_at_the_end_of_history(self):
         source = self._register(provider='kemono', ref='fanbox/1', url='https://kemono.cr/fanbox/user/1')

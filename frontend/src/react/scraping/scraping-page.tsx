@@ -19,10 +19,15 @@ import { Input } from '@/components/base/input/input';
 import { Select, SelectItem } from '@/components/base/select/select';
 
 import { apiSend, errorMessage } from '../../api';
+import { momentText } from '../activity/tasks';
 import { useBackgroundJob } from '../background-job';
 import type { ScrapingProps } from '../bundle';
+import { IssueRow } from '../components/issue-row';
 import { LoadingDots } from '../components/loading-dots';
 import { Note } from '../components/note';
+import { Progress } from '../components/progress';
+import { StatusLabel, type StatusTone } from '../components/status-label';
+import { ConnectionStatus } from '../components/connection-status';
 import { Page } from '../components/page';
 import { SiteMark } from '../components/site-mark';
 import { SEGMENT, SEGMENTED_TRACK, SegmentedRadioGroup as RadioGroup } from '../components/segmented';
@@ -33,10 +38,11 @@ import {
 import { busyProps } from '../settings/use-action';
 import { CustomSources } from './custom-sources';
 import {
-  AMANE_BRIDGE_CHECK_URL, AMANE_BRIDGE_KEY, AMANE_BRIDGE_REBUILD_URL,
-  checkText, COOKIE_TEXT_LIMIT, COVER_JOB_KEY, fetchAmaneBridge, fetchCoverJob,
-  fetchSources, SCRAPING_CHECK_URL, SCRAPING_COVER_URL, SCRAPING_KEY, SCRAPING_SETTINGS_URL,
-  type AmaneBridge, type Check, type CoverJob, type ScrapingData, type Source,
+  AMANE_BRIDGE_CHECK_URL, AMANE_BRIDGE_KEY, AMANE_BRIDGE_REBUILD_URL, CHECK_ALL_KEY,
+  checkText, COOKIE_TEXT_LIMIT, COVER_JOB_KEY, fetchAmaneBridge, fetchCheckAllJob, fetchCoverJob,
+  fetchSources, SCRAPING_CHECK_ALL_URL, SCRAPING_CHECK_URL, SCRAPING_COVER_URL, SCRAPING_KEY,
+  SCRAPING_SETTINGS_URL, type AmaneBridge, type Check, type CheckAllJob, type CheckOutcome,
+  type CoverJob, type ReportedCheck, type ScrapingData, type Source, type SourceReport,
 } from './scraping';
 
 const NETWORKS = [['peach', 'Peach 代理'], ['direct', '直接连接']] as const;
@@ -168,7 +174,7 @@ function SourceCard({ source, toast }: { source: Source } & ScrapingProps) {
         </SettingsRow>
       </Rows>
       {source.cooldown_until && source.cooldown_until > Date.now() / 1000 ? (
-        <Note tone="warning">来源正在冷却，截止 {new Date(source.cooldown_until * 1000).toLocaleString('zh-CN')}</Note>
+        <Note tone="warning"><span className="inline-flex flex-wrap items-center gap-2"><StatusLabel tone="warning">冷却中</StatusLabel><span>可在 {new Date(source.cooldown_until * 1000).toLocaleString('zh-CN')} 后重试。</span></span></Note>
       ) : null}
       {detailed ? <Stack divided>
         {network === 'peach'
@@ -185,11 +191,8 @@ function SourceCard({ source, toast }: { source: Source } & ScrapingProps) {
             </p>
           : null}
         {source.accepts_cookie && !source.browser ? <>
-          <p className="text-body-2-regular text-text-secondary">
-            {source.cookie_saved
-              ? 'Cookie 已保存；登录是否有效要到抓取时才知道。'
-              : '需要登录时，任选一种方式提供 Cookie。'}
-          </p>
+          <div className="flex flex-col gap-2"><span className="self-start"><StatusLabel tone={source.cookie_saved ? 'success' : 'neutral'}>{source.cookie_saved ? 'Cookie 已保存' : 'Cookie 未配置'}</StatusLabel></span>
+            <p className="text-body-2-regular text-text-secondary">{source.cookie_saved ? '登录有效性待验证。' : '需要登录时，任选一种方式提供 Cookie。'}</p></div>
           {/* 两种方式互斥，交上去的只能是其中一种：切换时把另一种的输入清掉，
               不让看不见的那一份跟着提交。 */}
           <RadioGroup aria-label="提供 Cookie 的方式（二选一）" value={method}
@@ -219,7 +222,7 @@ function SourceCard({ source, toast }: { source: Source } & ScrapingProps) {
         {problem ? <ErrorText>{problem}</ErrorText> : null}
         {results.map((result) => (
           <Note key={result.label} tone={result.ok ? 'success' : 'error'}>
-            {checkText(result, source.label)}
+            <span className="flex flex-col items-start gap-1"><ConnectionStatus tone={result.ok ? 'success' : 'error'}>{result.ok ? '可访问' : '连接失败'}</ConnectionStatus><span>{checkText(result, source.label)}</span></span>
           </Note>
         ))}
       </Stack> : null}
@@ -236,10 +239,115 @@ function SourceCard({ source, toast }: { source: Source } & ScrapingProps) {
   );
 }
 
+/** 报告口径的着色：要人去处理的标黄，连不上的标红，片商官网那种不在这里查的标灰。 */
+const OUTCOME_TONES: Record<CheckOutcome, StatusTone> = {
+  ok: 'success', auth: 'warning', http: 'error', cooldown: 'warning', network: 'error', skipped: 'neutral',
+};
+/** 摘要里各口径的先后：先可连接，再按要人动手的程度排。 */
+const OUTCOME_ORDER: CheckOutcome[] = ['ok', 'auth', 'cooldown', 'http', 'network', 'skipped'];
+
+/** 一项检查的名字：只查一跳的来源就是它本身。 */
+function targetName(report: SourceReport, check: ReportedCheck): string {
+  return check.label === '来源页面' ? report.label : `${report.label} 高清图片`;
+}
+
+/** 全部来源一次检查完，与 `peach check-sources` 同一检查、同一报告口径。这一趟在后台跑，
+ *  离开页面再回来，读到的是服务端留着的那一份结果。 */
+function CheckAllCard({ toast }: ScrapingProps) {
+  const { job, running, start, query: taskQuery } = useBackgroundJob<CheckAllJob>({
+    queryKey: CHECK_ALL_KEY,
+    queryFn: ({ signal }) => fetchCheckAllJob(signal),
+    start: () => apiSend<CheckAllJob>(SCRAPING_CHECK_ALL_URL, {}),
+    onFinish: (state) => {
+      // 限流与拒绝访问会记下冷却，各来源卡上的「冷却中」跟着重读。
+      void queryClient.invalidateQueries({ queryKey: SCRAPING_KEY, exact: true });
+      if (state.status === 'complete') toast(state.failed ? `检查完成，${state.failed} 项未通过` : '检查完成，全部可连接');
+    },
+  });
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!taskQuery.data || running || start.isPending) return;
+    start.mutate();
+  };
+
+  const checks = (job?.results ?? []).flatMap(
+    (report) => report.results.map((check) => ({ source: report.source, name: targetName(report, check), check })));
+  // 站标跟名字走，同来源卡标题旁的那一枚。
+  const titled = (source: string, name: string) =>
+    <span className="inline-flex min-w-0 items-center gap-1.5"><SiteMark source={source} />{name}</span>;
+  const passed = checks.filter(({ check }) => check.outcome === 'ok');
+  // 按口径成组，组内保持来源顺序：要人去登录的排前面，不在这里查的片商官网垫底。
+  const problems = checks.filter(({ check }) => check.outcome !== 'ok').sort(
+    (a, b) => OUTCOME_ORDER.indexOf(a.check.outcome) - OUTCOME_ORDER.indexOf(b.check.outcome));
+  const problem = start.error ? errorMessage(start.error)
+    : taskQuery.error ? errorMessage(taskQuery.error)
+    : job?.status === 'failed' ? (job.error || '检查未完成') : '';
+  const finished = job?.status === 'complete' && job.completed_at
+    ? [momentText(new Date(job.completed_at * 1000).toISOString()),
+       job.elapsed_s !== undefined ? `用时 ${job.elapsed_s.toFixed(1)} 秒` : ''].filter(Boolean).join(' · ')
+    : '';
+
+  return (
+    <Section id="check-all" title="连接检查" onSubmit={submit}>
+      <Stack>
+        {taskQuery.isPending ? <div role="status" aria-label="正在读取连接检查状态" data-skeleton="" className="skeleton-sheen h-6 rounded-md" /> : null}
+        {/* 说明写在一行里：拆行的 JSX 文本渲染时多出空格，改字工具就对不上源码。 */}
+        <Help>检查各来源页面与 DMM 高清图片服务器，最多四个来源同时进行；正在冷却的来源不再请求。可连接只说明检查地址可达，不代表登录有效。</Help>
+        {running
+          ? <div className="flex flex-col gap-2">
+              <Progress label="连接检查进度" value={job?.checked ?? 0} max={job?.total ?? 0} />
+              <Help role="status">已检查 {job?.checked ?? 0} / {job?.total ?? 0} 个来源</Help>
+            </div>
+          : null}
+        {problem ? <Note tone="error">{problem}</Note> : null}
+        {checks.length
+          ? <div className="flex flex-wrap gap-2">
+              {OUTCOME_ORDER.map((key) => {
+                const count = checks.filter(({ check }) => check.outcome === key).length;
+                return count ? <StatusLabel key={key} tone={OUTCOME_TONES[key]}>
+                  {checks.find(({ check }) => check.outcome === key)?.check.outcome_label} {count}
+                </StatusLabel> : null;
+              })}
+            </div>
+          : null}
+        {problems.length
+          ? <ul className="flex min-w-0 flex-col">
+              {problems.map(({ source, name, check }) => (
+                <IssueRow key={name} title={titled(source, name)}>
+                  <span className="flex flex-wrap items-center gap-2">
+                    <StatusLabel tone={OUTCOME_TONES[check.outcome]}>{check.outcome_label}</StatusLabel>
+                    {check.message
+                      ? <span className="text-body-2-regular text-text-secondary">{check.message}</span>
+                      : null}
+                  </span>
+                </IssueRow>
+              ))}
+            </ul>
+          : null}
+        {passed.length
+          ? <Disclosure summary={`可连接的 ${passed.length} 项`}>
+              <FactList>
+                {passed.map(({ source, name, check }) => (
+                  <Fact key={name} term={titled(source, name)}>
+                    {[check.width ? `${check.width} × ${check.height}` : '',
+                      check.elapsed_s !== undefined ? `${check.elapsed_s.toFixed(2)} 秒` : ''].filter(Boolean).join(' · ')}
+                  </Fact>
+                ))}
+              </FactList>
+            </Disclosure>
+          : null}
+      </Stack>
+      <Footer status={finished ? `上次检查 ${finished}` : undefined}>
+        <Button type="submit" disabled={!taskQuery.data} {...busyProps(running || start.isPending)}>全部检查</Button>
+      </Footer>
+    </Section>
+  );
+}
+
 /** 按番号补一张高清封面。这一趟在后台跑，页面上留状态。 */
 function CoverCard({ toast }: ScrapingProps) {
   const [code, setCode] = useState('');
-  const { running, outcome, start } = useBackgroundJob<CoverJob>({
+  const { running, outcome, start, query: taskQuery } = useBackgroundJob<CoverJob>({
     queryKey: COVER_JOB_KEY,
     queryFn: ({ signal }) => fetchCoverJob(signal),
     start: () => apiSend<CoverJob>(SCRAPING_COVER_URL, { code }),
@@ -250,21 +358,23 @@ function CoverCard({ toast }: ScrapingProps) {
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (running || start.isPending || !code.trim()) return;
+    if (!taskQuery.data || running || start.isPending || !code.trim()) return;
     start.mutate();
   };
 
   const problem = start.error ? errorMessage(start.error)
+    : taskQuery.error ? errorMessage(taskQuery.error)
     : outcome?.status === 'failed' ? (outcome.error || '采集未取得') : '';
   return (
     <Section title="高清封面" onSubmit={submit}>
       <Stack>
+        {taskQuery.isPending ? <div role="status" aria-label="正在读取封面任务状态" data-skeleton="" className="skeleton-sheen h-6 rounded-md" /> : null}
         <div className="flex flex-wrap items-end gap-2">
           <div className="min-w-0 flex-1">
             <Input aria-label="馆藏番号" isRequired isDisabled={running} value={code} onChange={setCode}
               placeholder="输入馆藏番号，如 ABW-232" />
           </div>
-          <Button type="submit" disabled={!code.trim()} {...busyProps(running || start.isPending)}>
+            <Button type="submit" disabled={!taskQuery.data || !code.trim()} {...busyProps(running || start.isPending)}>
             抓取封面
           </Button>
         </div>
@@ -302,7 +412,7 @@ function AmaneBridgeCard({ toast }: ScrapingProps) {
 
   if (!data) {
     return bridge.error
-      ? <Section title="amane"><Stack><Note tone="error">{errorMessage(bridge.error)}</Note></Stack></Section>
+      ? <Section id="amane" title="amane"><Stack><Note tone="error">{errorMessage(bridge.error)}</Note></Stack></Section>
       : null;
   }
   const busy = running || rebuild.isPending || check.isPending;
@@ -310,7 +420,7 @@ function AmaneBridgeCard({ toast }: ScrapingProps) {
     : check.error ? errorMessage(check.error)
     : outcome?.status === 'failed' ? (outcome.error || '重建未完成') : '';
   return (
-    <Section title="amane" aside={<ExternalLink href={data.repository} leadingIcon={GitHubMark}>{data.repository}</ExternalLink>}>
+    <Section id="amane" title="amane" aside={<ExternalLink href={data.repository} leadingIcon={GitHubMark}>{data.repository}</ExternalLink>}>
       <FactList>
         <Fact term="已安装版本">{data.installed_version || '未安装'}</Fact>
         <Fact term="上游最新版本">{check.data?.latest ?? '尚未检查'}</Fact>
@@ -323,10 +433,12 @@ function AmaneBridgeCard({ toast }: ScrapingProps) {
               <p className="text-body-2-regular text-text-secondary">{data.sites.map((site) => site.label).join('、')}</p>
             </Disclosure>
           : null}
-        <Help>
-          已安装版本：{data.installed_version || '未安装'}。amane（{data.license}）提供这些内置站点的解析能力。
-          重新安装会使用 Peach 内置的 {data.version} 版本，不随上游自动升级。
-        </Help>
+        {data.problem
+          ? <Note tone="error">{data.problem}</Note>
+          : <Help>
+              amane（{data.license}）提供这些内置站点的解析能力。首次需要时，Peach 会自动准备锁定的 {data.version} 版本；安装包内已有可用环境时直接使用。
+              手动安装也使用此版本，不随上游自动升级。
+            </Help>}
         {running ? <LoadingDots label="正在重建运行环境" /> : null}
         {problem ? <Note tone="error">{problem}</Note> : null}
         {outcome?.status === 'complete' ? <Note tone="success">{outcome.result || 'amane 桥已重建'}</Note> : null}
@@ -335,7 +447,8 @@ function AmaneBridgeCard({ toast }: ScrapingProps) {
         <Button variant="secondary" onClick={() => { if (!busy) check.mutate() }} {...busyProps(check.isPending)}>
           检查上游版本
         </Button>
-        <Button onClick={() => { if (!busy) rebuild.mutate() }} {...busyProps(running || rebuild.isPending)}>
+        <Button disabled={Boolean(data.problem)} onClick={() => { if (!busy) rebuild.mutate() }}
+          {...busyProps(running || rebuild.isPending)}>
           {data.installed ? '重新安装' : '安装'}
         </Button>
       </Footer>
@@ -358,6 +471,7 @@ export function ScrapingPage({ toast }: ScrapingProps) {
   return (
     <Page>
       <p className="text-body-2-regular text-text-secondary">高清图片可能要经代理才能下载，先检查连接。</p>
+      <CheckAllCard toast={toast} />
       <CoverCard toast={toast} />
       <CustomSources receipt={toast} />
       {(data.sources || []).map(

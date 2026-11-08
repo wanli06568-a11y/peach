@@ -2,13 +2,17 @@
  * 两处各写各的时，整页刷新会连播两段动画：先一张通用大布局骨架，再各页自己的加载态。取同一份，
  * `data-skeleton` 的键就相同，后铺的那一处认出是同一张后不再重画（`paintManagementPlaceholder`）。
  *
- * 版式照 `boardPageSkeleton` 画的那几页之外，数据管理、复核、诊断与采集来源各有一张，其余路径落到通用面板。 */
+ * 版式照 `boardPageSkeleton` 画的那几页之外，数据管理首页与各个维护工具（`cleanup-tool-skeletons.ts`）、复核和
+ * 采集来源各有一张，其余路径落到通用面板。 */
 import { esc } from '@peach/legacy/core';
-import { configurationSkeletonHtml, fitSkeleton, skeletonHtml } from '@peach/legacy/ui';
+import { fitSkeleton, skeletonHtml } from '@peach/legacy/ui';
 
 import { boardPageSkeleton } from './board-skeleton';
+import { cleanupToolSkeletonHtml } from './cleanup-tool-skeletons';
+import { CLEANUP_TOOLS } from './cleanup-tools';
 import { cleanupSkeletonHtml } from './management';
-import { CONFIGURATION_SECTIONS } from './history/settings-route';
+import { appSettingsStore } from './appearance/settings';
+import { NAVIGATION_GROUPS, normalizeNavigationOrder } from './navigation-order';
 
 export interface PageSkeletonOptions {
   cards?: boolean;
@@ -31,7 +35,8 @@ export const pageSkeletonHtml = (
 });
 
 /* 分类名是静态文案，骨架直接写出来；次序就是页签次序，与复核页那一份一致。 */
-const REVIEW_LABELS = ['元数据字段', '创作者标签', '厂牌 Logo', '女优头像', '西方身份回配', '番号目录存疑', 'FC2 评论标记', 'FC2 跨号相似', '片尾/出处证据'];
+const reviewLabels = () => normalizeNavigationOrder('review', appSettingsStore().value.navigationOrders.review)
+  .map(key => NAVIGATION_GROUPS.review.items.find(([id]) => id === key)![1]);
 /* 复核页是左边一列分类、右边工具条加一格一格 Fieldset，骨架就用最终容器的那几个类名，
    分栏、列宽和卡高全由页面自己那套规则给：读完数据只是把占位换成内容，版面一格不挪。
    分类名和「复核分类」这两样与数据无关，直接写出来；等的是每类多少条，所以只有计数
@@ -39,19 +44,20 @@ const REVIEW_LABELS = ['元数据字段', '创作者标签', '厂牌 Logo', '女
    选项和条数，三枚占位一件对一件。 */
 const reviewSkeletonHtml = (label = '正在读取复核队列'): string => `<div class="review review-workspace review-skeleton" data-skeleton="review" aria-busy="true" aria-label="${esc(label)}">
   <div class="reviewcontrols" data-section-nav><h2 class="review-category-title">复核分类</h2>
-    <div class="reviewtabs" data-section-items>${REVIEW_LABELS.map((text, i) =>
+    <div class="reviewtabs" data-section-items>${reviewLabels().map((text, i) =>
       `<button type="button" disabled aria-selected="${i === 0}">${esc(text)}<span class="skeleton reviewcountskeleton" aria-hidden="true"></span></button>`).join('')}</div></div>
   <div class="reviewbulkbar reviewbulktoolbar" aria-hidden="true">${'<span class="skeleton reviewtoolskeleton"></span>'.repeat(3)}</div>
   <section class="reviewsection"><div class="reviewlist">${
     '<div class="skeletoncard" aria-hidden="true"><i></i><b></b><em></em></div>'.repeat(6)}</div></section></div>`;
 
 const PLACEHOLDERS: Record<string, () => string> = {
-  ...Object.fromEntries(Object.keys(CONFIGURATION_SECTIONS).map(key => [`/settings/${key}`, () => configurationSkeletonHtml()])),
   '/data-cleanup': () => cleanupSkeletonHtml(),
-  // /resource-sync 只是数据管理页上的一个锚点，占位也该是数据管理那张。
-  '/resource-sync': () => cleanupSkeletonHtml(),
+  /* 每个维护工具都有自己那一页的骨架，新加的工具不会落到下面那张通用面板上。 */
+  ...Object.fromEntries(CLEANUP_TOOLS.map(tool => [tool.path, () => cleanupToolSkeletonHtml(tool.key)])),
+  // 旧地址 /resource-sync 打开后转到资源同步二级页，占位先画成那一页，转过去时同一个键不重画。
+  '/resource-sync': () => cleanupToolSkeletonHtml('resource-sync'),
   '/review': () => reviewSkeletonHtml(),
-  /* 采集来源是 812px 窄列里一叠同宽的 Fieldset：一块高清封面加六个来源。骨架画四块，
+  /* 采集来源是 812px 窄列里一叠同宽的 Fieldset：连接检查、高清封面，再接各个来源。骨架画四块，
      那是首屏装得下的张数；说明那一句是静态文案，与数据无关，立刻显示。 */
   '/sources': () => `<div class="scraping-page"><p>高清图片可能要经代理才能下载，先检查连接。</p>
     ${pageSkeletonHtml('正在读取采集来源', { cards: true, count: 4, fill: false, className: 'cleanup-skeleton' })}</div>`,

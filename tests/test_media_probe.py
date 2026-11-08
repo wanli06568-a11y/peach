@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 import subprocess
 import tempfile
@@ -77,16 +78,85 @@ class ProbeUnmeasuredTests(unittest.TestCase):
         self.assertEqual(self.row(fresh), (1800.0, 1920, 1080, "2K"))
         self.assertEqual(self.row(measured)[0], 10.0)
 
+    def test_selected_probe_query_fits_the_connection_parameter_limit(self):
+        selected = self.add(ROOT + r'\selected.mp4')
+        self.add(ROOT + r'\unselected.mp4')
+        connect = sqlite3.connect
+        def limited_connection(*args, **kwargs):
+            connection = connect(*args, **kwargs)
+            connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 5)
+            return connection
+        with mock.patch.object(media_probe.sqlite3, 'connect', side_effect=limited_connection), \
+                mock.patch.object(media_probe, '_record', return_value=1) as record:
+            count = media_probe.probe_unmeasured(
+                self.db, 'ffprobe', 'local', ROOT, asset_ids=[selected] * 10)
+        self.assertEqual(count, 1)
+        self.assertEqual([row[0] for row in record.call_args.args[2]], [selected])
+
     def test_a_metered_source_is_left_for_the_explicit_batch(self):
         pending = self.add(r"A:\创作者\a.mp4", location="pikpak")
         self.assertEqual(self.probe("pikpak", "A:\\"), 0)
         self.assertEqual(self.probed, [])
         self.assertIsNone(self.row(pending)[0])
 
+    def test_registered_trailer_is_not_read_or_changed_by_background_probe(self):
+        main = self.add(ROOT + r'\ABC-123.mp4')
+        trailer = self.add(ROOT + r'\ABC-123-trailer.mp4')
+        self.assertEqual(self.probe(), 1)
+        self.assertEqual(self.probed, ['ABC-123.mp4'])
+        self.assertEqual(self.row(main)[0], 1800)
+        self.assertIsNone(self.row(trailer)[0])
+
+    def test_directory_extras_and_numbered_suffixes_are_not_probed(self):
+        main = self.add(ROOT + r'\Film\Film.mp4')
+        extras = [self.add(ROOT + relative) for relative in (
+            r'\Film\Trailers\Teaser.mp4', r'\Film\Extras\Disc 1\Making of.mkv',
+            r'\Film\Actor-interview2.mp4', r'\Film\sample2.mp4')]
+        self.assertEqual(self.probe(), 1)
+        self.assertEqual(self.row(main)[0], 1800)
+        self.assertTrue(all(self.row(aid)[0] is None for aid in extras))
+
     def test_without_ffprobe_the_scan_still_finishes_and_leaves_rows_pending(self):
         pending = self.add(ROOT + r"\a.mp4")
         self.assertEqual(self.probe(ffprobe=None), 0)
         self.assertIsNone(self.row(pending)[0])
+
+    def test_file_scope_reads_exactly_that_file(self):
+        self.add(ROOT + r'\a.mp4')
+        self.add(ROOT + r'\b.mp4')
+        self.assertEqual(self.probe(root=ROOT + r'\a.mp4'), 1)
+        self.assertEqual(self.probed, ['a.mp4'])
+
+    def test_measured_short_promotion_is_isolated_and_bound_main_is_protected(self):
+        from peach.repository import LedgerDatabase
+        for aid in (1, 2):
+            self.add(ROOT + rf'\bbsxv.xyz-ABC-123\附件{aid}.mp4')
+        with LedgerDatabase(self.db).write_transaction() as connection:
+            connection.execute("UPDATE asset SET size=1048576,creator='bbsxv.xyz',code='ABC-123'")
+        with mock.patch.object(media_probe, 'probe_file', return_value=(10, 1280, 720, 'h264', 30, None)), \
+                mock.patch.object(media_probe, 'resolve_case_insensitive', str):
+            count = media_probe.probe_unmeasured(self.db, 'ffprobe', 'local', ROOT, protected_ids=[1])
+        self.assertEqual(count, 2)
+        with LedgerDatabase(self.db).read_connection() as connection:
+            self.assertEqual([tuple(row) for row in connection.execute(
+                'SELECT id,duration,disposal FROM asset ORDER BY id')], [(1, 10, None), (2, 10, 'trash')])
+
+    def test_personal_records_reattach_before_measured_junk_isolation(self):
+        from peach.repository import LedgerDatabase
+        fresh = self.add(ROOT + r'\bbsxv.xyz\点击进入.mp4')
+        with LedgerDatabase(self.db).write_transaction() as connection:
+            connection.execute("UPDATE asset SET size=1000,creator='bbsxv.xyz' WHERE id=?", (fresh,))
+            connection.execute("INSERT INTO asset(location,path,name,medium,size,creator,duration,play_count,disposal) "
+                "VALUES('local','R:\\gone\\点击进入.mp4','点击进入.mp4','video',1000,'bbsxv.xyz',10,1,'vanished')")
+        checked = []
+        with mock.patch.object(media_probe, 'probe_file', return_value=(10, 1280, 720, 'h264', 30, None)), \
+                mock.patch.object(media_probe, 'resolve_case_insensitive', str):
+            media_probe.probe_unmeasured(self.db, 'ffprobe', 'local', ROOT, on_junk=checked.append)
+        with LedgerDatabase(self.db).read_connection() as connection:
+            self.assertEqual(tuple(connection.execute('SELECT disposal,play_count FROM asset WHERE id=?',
+                                                     (fresh,)).fetchone()), (None, 1))
+            self.assertEqual(connection.execute('SELECT count(*) FROM record_rehome').fetchone()[0], 1)
+        self.assertEqual(checked[0]['isolated'], 0)
 
     def test_an_unreadable_file_is_marked_failed_so_the_next_scan_skips_it(self):
         broken = self.add(ROOT + r"\坏.mp4")
@@ -135,6 +205,21 @@ class ProbeUnmeasuredTests(unittest.TestCase):
 
 
 class ProbeProcessTests(unittest.TestCase):
+    def test_probe_uses_positive_sar_then_dar_and_keeps_unknown_ratios_unscaled(self):
+        cases = [('256:81', '16:9', 2276), ('N/A', '16:9', 2276),
+                 ('0:1', '16:9', 2276), ('1:1', '16:9', 720),
+                 ('-1:1', 'N/A', 720), ('1:0', None, 720)]
+        for sar, dar, width in cases:
+            payload = json.dumps({'format': {'duration': '12.5'}, 'streams': [dict(
+                width=720, height=1280, sample_aspect_ratio=sar, display_aspect_ratio=dar)]}).encode()
+            with self.subTest(sar=sar, dar=dar), mock.patch.object(media_probe.subprocess, 'run',
+                    return_value=SimpleNamespace(stdout=payload, returncode=0, stderr=b'')), \
+                    mock.patch.object(media_probe, 'resolve_case_insensitive', return_value='sample.mp4'):
+                result = media_probe.measure('ffprobe', 1, 'sample.mp4')
+            self.assertEqual(result[1:3], (width, 1280))
+            self.assertEqual(result[7], '横屏' if width > 1280 else '竖屏')
+            self.assertEqual(result[8], '2K' if width > 1280 else '720P')
+
     def test_probe_reads_metadata_with_a_hidden_windows_process(self):
         payload = b'{"format":{"duration":"12.5"},"streams":[{"width":320,"height":240,' \
                   b'"codec_name":"h264","avg_frame_rate":"25/1"}]}'

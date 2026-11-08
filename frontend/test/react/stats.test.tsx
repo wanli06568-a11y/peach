@@ -16,9 +16,10 @@ import {
   fmtCount, lengthRows, mediumRows, percentOf, percentText, playedFor, prefetchStats, radialArc,
   radialBarSize, radialCeiling, radialSlices, replayRows, STATS_URL, watchNote, type StatsData,
 } from '../../src/react/stats/stats';
+import { RadialCard } from '../../src/react/stats/radial-card';
 import { StatsPage } from '../../src/react/stats/stats-page';
 
-import { buttonNamed, click, mount, mountRoot } from './render';
+import { actionOrder, buttonNamed, click, mount, mountRoot } from './render';
 
 // 客户端是模块级的单例（所有 React 根共用一个），用例之间不清就互相喂数据。
 afterEach(() => queryClient.clear());
@@ -64,8 +65,6 @@ const payload = (overrides: Partial<StatsData> = {}): StatsData => ({
 const legacyProps = () => ({
   tagLabel: (key: string) => `标签 ${key}`,
   onTag: vi.fn<(key: string) => void>(),
-  openMediaSettings: vi.fn<() => void>(),
-  configurable: true,
 });
 
 /** 依次回这几份数据，最后一份之后一直回它。`null` 那一份回 500。 */
@@ -141,6 +140,38 @@ it('满圈是最长那段的 1.1 倍，圈数越多每圈越细', () => {
   expect([2, 12, 40].map(radialBarSize)).toEqual([14, 8, 4]);
 });
 
+it('指到垫到最小弧长的那一段，浮层读原始数，不读画图用的弧长', async () => {
+  // 拿掉 `ResizeObserver` 让 Recharts 按初始尺寸画；声明减少动态效果，圈直接是终态。
+  vi.stubGlobal('ResizeObserver', undefined);
+  vi.stubGlobal('matchMedia', (query: string) => ({
+    matches: query.includes('reduce'), media: query, addEventListener() {}, removeEventListener() {},
+  }));
+  // 满圈 3023 × 1.1，最小弧长是它的 2%：66.506，比欧美剧情的 36 大，那一段画的是垫高的弧。
+  const rows = [
+    { name: '单人剧情', value: 3023 }, { name: '共演剧情', value: 128 },
+    { name: '欧美剧情', value: 36 }, { name: '写真', value: 198 },
+  ];
+  const host = await mount(<RadialCard title="媒体库" rows={rows} empty="" />);
+  // 每圈的底色扇区：路径头一段是 `M cx,cy-外径`，第二段弧是内径，取中间那条半径指上去。
+  const rings = [...host.querySelectorAll('path.recharts-radial-bar-background-sector')].map((path) => {
+    const [outer, inner] = [...(path.getAttribute('d') ?? '').matchAll(/A ([\d.]+),/g)].map(([, r]) => Number(r));
+    return { cx: Number(path.getAttribute('cx')), cy: Number(path.getAttribute('cy')), r: (outer! + inner!) / 2 };
+  });
+  expect(rings).toHaveLength(rows.length);
+  const tipFor = async (index: number) => {
+    const { cx, cy, r } = rings[index]!;
+    await act(async () => {
+      host.querySelector('.recharts-wrapper')!.dispatchEvent(new MouseEvent('mousemove',
+        { bubbles: true, clientX: cx, clientY: cy - r }));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+    const tip = host.querySelector('.recharts-tooltip-wrapper')!;
+    return [...tip.querySelectorAll('span')].map((span) => span.textContent);
+  };
+  expect(await tipFor(2)).toEqual(['欧美剧情', '36']);
+  expect(await tipFor(0)).toEqual(['单人剧情', '3,023']);
+});
+
 it('点图例把那一段钉住，读数跟着换；再点一次放开', async () => {
   const { host } = await open();
   const card = radialCharts(host)[0]!.closest('section')!;
@@ -194,6 +225,28 @@ it('看过那一层有播放时间的两张热力图，指到一格读数换成�
   expect(panel.querySelector('section[aria-label="播放次数"] header b')?.textContent).toBe('2');
   const liked = [...panel.querySelectorAll('span')].find((term) => term.textContent === '喜欢');
   expect(liked?.nextElementSibling?.textContent).toBe('1');
+});
+
+it('一张热力图只占一个 Tab 停靠点，方向键在格子之间挪', async () => {
+  const { host } = await open();
+  await click(tabNamed(host, '看过'));
+  const card = host.querySelector('[role=tabpanel] svg[role=img]')!.closest('section')!;
+  const stops = () => [...card.querySelectorAll<SVGRectElement>('rect[tabindex="0"]')];
+  expect(card.querySelectorAll('rect').length).toBe(168);
+  expect(stops().map((cell) => cell.dataset.cell)).toEqual(['0']);
+  const first = stops()[0]!;
+  await act(async () => { first.focus(); });
+  await act(async () => {
+    first.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+  });
+  expect(document.activeElement?.getAttribute('data-cell')).toBe('24');
+  expect(stops().map((cell) => cell.dataset.cell)).toEqual(['24']);
+  expect(card.querySelector('header small')?.textContent).toBe(
+    document.activeElement?.getAttribute('aria-label')?.split('，')[0]);
+  await act(async () => {
+    document.activeElement!.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true }));
+  });
+  expect(document.activeElement?.getAttribute('data-cell')).toBe('47');
 });
 
 it('没有播放时间记录时看过那一层不出热力图，留一张说明卡', async () => {
@@ -273,7 +326,7 @@ it('类别名放不下就截断加省略号，轴宽跟着最长的名字走并�
 it('覆盖率那一层的每条进度用同一对分子分母，不另算一遍', async () => {
   const { host } = await open();
   await click(tabNamed(host, '内容标签'));
-  const bars = [...host.querySelectorAll('[role=progressbar]')];
+  const bars = [...host.querySelectorAll('[role=meter]')];
   expect(bars.map((bar) => bar.getAttribute('aria-label'))).toEqual([
     '有创作者：3 / 4', '有番号：2 / 4', '有厂牌：1 / 4', '已抽帧：4 / 4', '已探测时长：4 / 4',
   ]);
@@ -288,7 +341,7 @@ it('取不到容量的卷不画使用率，只说取不到', async () => {
   const panel = host.querySelectorAll('[role=tabpanel]')[0]!;
   expect(panel.textContent).toContain('容量未取得');
   expect(panel.textContent).toContain('未映射');
-  expect(panel.querySelector('[role=progressbar]')).toBeNull();
+  expect(panel.querySelector('[role=meter]')).toBeNull();
 });
 
 it('按字节计的卷在百格画布上按真实比例画出已用那一段，读屏值仍是字节', async () => {
@@ -299,7 +352,7 @@ it('按字节计的卷在百格画布上按真实比例画出已用那一段，�
     storage_summary: { volumes: 1, online: 1, measured: 1, free: total - used, used, total },
   }));
   await click(tabNamed(host, '使用空间'));
-  const bar = host.querySelectorAll('[role=tabpanel]')[0]!.querySelector('[role=progressbar]')!;
+  const bar = host.querySelectorAll('[role=tabpanel]')[0]!.querySelector('[role=meter]')!;
   expect(bar.getAttribute('aria-valuemax')).toBe(String(total));
   expect(bar.getAttribute('aria-valuenow')).toBe(String(used));
   expect(bar.getAttribute('viewBox')).toBe('0 0 100 1');
@@ -340,21 +393,21 @@ it('快进扫过和正常看完是两回事，一行里分得出来', async () =
   expect(entry.textContent).toContain('真实 50% · 到达 90%');
 });
 
-it('一个视频都没有时给空态，能改配置就给去添加媒体目录', async () => {
-  const { host, props } = await open(payload({ by_loc: [], by_library: [] }));
+it('空馆藏提供添加媒体入口，链到媒体库设置', async () => {
+  const { host } = await open(payload({ by_loc: [], by_library: [] }));
   expect(host.querySelector('h3')?.textContent).toBe('还没有视频');
   expect(radialCharts(host)).toEqual([]);
   expect(host.querySelector('[role=tabpanel] section[aria-label]')).toBeNull();
-  await click(buttonNamed('添加媒体目录', host));
-  expect(props.openMediaSettings).toHaveBeenCalledTimes(1);
+  expect(buttonNamed('添加媒体', host)).toBeNull();
+  expect(linkNamed(host, '添加媒体')?.getAttribute('href')).toBe('/settings/library');
 });
 
-it('这台机器不能改配置时空态不给那个按钮，只留能走的那条路', async () => {
-  const props = { ...legacyProps(), configurable: false };
+it('媒体配置与添加关注是两个独立去向，次要的添加关注在左', async () => {
+  const props = legacyProps();
   const { host } = await open(payload({ by_loc: [], by_library: [] }), props);
-  expect(buttonNamed('添加媒体目录', host)).toBeNull();
-  expect(host.querySelector('a')?.textContent).toBe('添加关注');
-  expect(looksLikeButton(host.querySelector('a'))).toBe(true);
+  expect(actionOrder(host.querySelector('[data-empty-state]'))).toEqual(['添加关注', '添加媒体']);
+  expect(linkNamed(host, '添加关注')?.getAttribute('href')).toBe('/subscriptions?tab=add');
+  expect(looksLikeButton(linkNamed(host, '添加关注'))).toBe(true);
 });
 
 /** 空态里的去处画成次级实底按钮（白底、发丝边框），不是一行带下划线的文字链接。 */

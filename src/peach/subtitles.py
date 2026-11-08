@@ -1,28 +1,34 @@
 """字幕 sidecar：识别、配对、登记，以及播放器要的那份 WebVTT。
 
-三段职责，边界刻意分开：
+职责边界如下：
 
 - **识别与配对**（`directory_sidecars`）只看一个目录里的文件名，不碰数据库，也不读
   文件内容。sidecar 按定义就和正片同目录，跨目录的相似文件名一律不算——番号相同的
   两个目录在这个库里很常见，跨目录配对会把「另一版的字幕」挂到这一版上。
 - **登记**（`record`）把配对结论 upsert 进 `asset_subtitle`，幂等，重扫只更新
   `last_seen` 与可变字段；消失的行不删，沿用 `asset` 的约定。
+- **即时发现**（`discover_sidecars`）只读当前视频目录，复用配对判据，不进入子目录或写账本。
 - **出口**（`decode`、`to_webvtt`）把磁盘上的 srt/ass/ssa/vtt 换成浏览器唯一认识的
   WebVTT。这一段在 Python 里做而不是叫 FFmpeg：每请求一次字幕就起一个子进程，代价
   落在挂载网盘的目录遍历上；而且 FFmpeg 解码失败只给一个退出码，界面要说的是
   「这份字幕的编码认不出来」，两者不是同一件事。
 
 本模块不 import `scan`：方向是 `scan` → `subtitles`。哪些扩展名算视频是扫描层的
-判断，`directory_sidecars` 因此要求调用方把视频文件名传进来。
+判断，调用方传入视频文件名或视频扩展名集合。
 """
 from __future__ import annotations
 
 import codecs
+import hashlib
+import os
 import re
 import sqlite3
+import threading
+import time
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import PureWindowsPath
+from pathlib import Path, PureWindowsPath
 
 from .catalog_rules import VERSION_TAIL_TOKENS, release_code_from_filename
 
@@ -49,7 +55,7 @@ LANGUAGE_TOKENS.update({token: ("ja", "日语") for token in ("ja", "jp", "jpn",
 LANGUAGE_TOKENS.update({token: ("ko", "韩语") for token in ("ko", "kor", "korean", "韩文", "韩语")})
 
 #: 剥去之后仍应与正片同名的 token：语言之外，还有 `catalog_rules` 已经认定的版次标记
-#: （`-C` 中文字幕版、`-UC` 无码流出、画质词）。版次表只此一份，不在这里重抄。
+#: （`-C` 中文字幕版、`-UC` 无码、画质词）。版次表只此一份，不在这里重抄。
 _STRIPPABLE = (frozenset(LANGUAGE_TOKENS) | frozenset(VERSION_TAIL_TOKENS)
                | {"forced", "sdh", "default"})
 _SEPARATORS = ".-_ "
@@ -247,6 +253,77 @@ def subtitles_for(connection: sqlite3.Connection, asset_id: int) -> list[sqlite3
     return list(connection.execute(
         "SELECT id,path,name,language,format,size,pairing FROM asset_subtitle "
         "WHERE asset_id=? ORDER BY name COLLATE NOCASE, id", (asset_id,)))
+
+
+def file_key(name: str) -> str:
+    """字幕在当前视频目录内的稳定身份。"""
+    return "local:" + hashlib.sha256(name.casefold().encode("utf-8")).hexdigest()
+
+
+def discover_sidecars(video: Path, video_suffixes: set[str]) -> list[dict]:
+    """读取正片所在目录，返回配给当前视频的字幕，不写账本。"""
+    from .smb_media import SmbResource
+
+    def wanted(name: str) -> bool:
+        return Path(name).suffix.lower() in video_suffixes or bool(subtitle_format(name))
+
+    try:
+        if isinstance(video, SmbResource):
+            # SMB 共享上的作品不是操作系统路径，经共享列目录；传输层错误已映射为 OSError。
+            names = [entry.name for entry in video.parent.scandir()
+                     if wanted(entry.name) and not entry.is_dir and not entry.is_symlink]
+        else:
+            with os.scandir(video.parent) as entries:
+                names = [entry.name for entry in entries
+                         if wanted(entry.name) and entry.is_file(follow_symlinks=False)]
+    except OSError:
+        return []
+    videos = [name for name in names if Path(name).suffix.lower() in video_suffixes]
+    found = []
+    for name in sorted(names, key=str.casefold):
+        fmt = subtitle_format(name)
+        if not fmt:
+            continue
+        paired, pairing = pair(name, videos)
+        if not paired or paired.casefold() != video.name.casefold():
+            continue
+        found.append({"id": file_key(name), "path": str(video.parent / name),
+                      "name": name, "language": language_of(name), "format": fmt,
+                      "size": None, "pairing": pairing})
+    return found
+
+
+#: 同目录字幕的发现结果留这么久（`SidecarListings`）。新放进去的字幕最多晚这么久出现。
+SIDECAR_LISTING_TTL = 120.0
+
+
+class SidecarListings:
+    """`discover_sidecars` 按视频路径缓存一小段时间。
+
+    打开一部片子时，字幕列表一次、每条轨各一次，都要先列一遍正片目录；目录在网盘上时
+    每次都是一趟网络往返。只缓存目录列举，字幕正文照旧现读：删掉的字幕立即取不到。
+    """
+
+    def __init__(self, *, ttl: float = SIDECAR_LISTING_TTL, limit: int = 256, clock=time.monotonic):
+        self.ttl, self.limit, self.clock = ttl, limit, clock
+        self._rows: OrderedDict[str, tuple[float, list[dict]]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def discover(self, video: Path, video_suffixes: set[str]) -> list[dict]:
+        key = str(video)
+        now = self.clock()
+        with self._lock:
+            hit = self._rows.get(key)
+            if hit is not None and now - hit[0] < self.ttl:
+                self._rows.move_to_end(key)
+                return [dict(row) for row in hit[1]]
+        rows = discover_sidecars(video, video_suffixes)
+        with self._lock:
+            self._rows[key] = (now, rows)
+            self._rows.move_to_end(key)
+            while len(self._rows) > self.limit:
+                self._rows.popitem(last=False)
+        return [dict(row) for row in rows]
 
 
 class SubtitleUndecodable(ValueError):

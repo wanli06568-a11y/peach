@@ -17,7 +17,7 @@ export interface SetupQuestion {
   default: string;
   required: boolean;
   advanced: boolean;
-  input: 'folders' | 'choice' | 'text' | 'number';
+  input: 'folders' | 'folder' | 'choice' | 'text' | 'number';
   prefix: string;
   suffix: string;
   options?: SetupOption[];
@@ -27,6 +27,12 @@ export interface SetupQuestion {
 export interface MountDependency { name: string; message: string; download_url: string; download_label: string }
 
 export interface SetupQuestions {
+  peach_proxy?: import('../../bundle').PeachProxyState;
+  docker?: boolean;
+  /** Docker 固定的数据目录（`/data`），不出题，只在确认页列出；其余部署为 `null`。 */
+  data_root?: string | null;
+  /** 容器启动时已按 `PEACH_ACCESS_PASSWORD` 写下访问密码，访问那一项不再出题。 */
+  access_preset?: boolean;
   remote_reporting?: import('../../settings/remote-reporting-settings').RemoteReportingState;
   windows: boolean;
   standalone: boolean;
@@ -40,10 +46,11 @@ export interface SetupQuestions {
   history_guide: boolean;
 }
 
-export interface SetupFact { term: string; value: string; download_url?: string; download_label?: string }
+export interface SetupFact { term: string; value: string; download_url?: string; download_label?: string; install_tool?: string }
 
 export interface SetupDone {
   restored?: boolean;
+  skip_media?: boolean;
   url: string;
   scan_requested: boolean;
   history_guide: boolean;
@@ -54,20 +61,32 @@ export interface SetupDone {
 
 export type SetupErrors = Partial<Record<string, string | string[]>>;
 
-export interface SetupFolder { path: string; location: string; root: string; cost?: 'free' | 'metered' | '' }
+export interface SetupFolder {
+  path: string;
+  location: string;
+  root: string;
+  library_id?: string;
+  library?: string;
+  library_icon?: string;
+  library_color?: string;
+  cost?: 'free' | 'metered' | '';
+  library_policy?: import('../../settings/library-policy-settings').Preset;
+  library_stages?: string;
+}
 
 export interface SetupSubmission {
   media_dir: SetupFolder[];
+  skip_media: boolean;
   access_enabled: boolean;
   access_password?: string;
   access_confirm?: string;
   scan_now: boolean;
-  history_guide: boolean;
+  history_guide?: boolean;
   [key: string]: unknown;
 }
 
 export class SetupRequestError extends Error {
-  constructor(readonly status: number, message: string, readonly errors?: SetupErrors) {
+  constructor(readonly status: number, message: string, readonly errors?: SetupErrors, readonly docker = false) {
     super(message);
   }
 }
@@ -83,8 +102,8 @@ async function request<T>(url: string, init: RequestInit, fallback: string): Pro
     if (init.signal?.aborted) throw cause;
     throw new SetupRequestError(0, '连接不到 Peach，请确认它仍在运行后重试');
   }
-  const body = await response.json().catch(() => null) as { error?: string; errors?: SetupErrors } | null;
-  if (!response.ok) throw new SetupRequestError(response.status, body?.error || fallback, body?.errors);
+  const body = await response.json().catch(() => null) as { error?: string; errors?: SetupErrors; docker?: boolean } | null;
+  if (!response.ok) throw new SetupRequestError(response.status, body?.error || fallback, body?.errors, body?.docker === true);
   return body as T;
 }
 

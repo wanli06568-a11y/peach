@@ -16,7 +16,7 @@ from peach.avatar_followup import TASK_KEY as AVATAR_TASK_KEY
 from peach.avatar_followup import followup_key, parse_key, plan
 from peach.followups import FollowupRunner, FollowupType, lanes
 from peach.jav_cover_fetch import NotFound
-from peach.jobs import BackgroundJob
+from peach.jobs import BackgroundJob, JobDeferred
 from peach.library_processing import process_library
 from peach.repository import LedgerDatabase
 from peach.task_runs import MAX_FOLLOWUPS, TaskRunStore
@@ -141,6 +141,30 @@ class EnqueueTests(LedgerTestCase):
 
 
 class RunnerTests(LedgerTestCase):
+    def test_retention_keeps_failed_followups_available_for_retry(self):
+        parent = self.parent()
+        rows = self.store.enqueue_followups(parent.id, [(f'avatar:{i}', AVATAR_TASK_KEY, str(i))
+                                                       for i in range(23)])['queued']
+        self.store.finish(rows[0], 'failed', error='source unavailable')
+        self.store.finish(parent.id, 'succeeded')
+        with registered(echo_type(AVATAR_TASK_KEY)):
+            self.assertEqual(FollowupRunner(self.contract()).drain(), 22)
+        self.assertEqual(self.store.get(rows[0]).status, 'failed')
+        with self.database.read_connection() as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM task_run WHERE task_key=? "
+                                                "AND status='succeeded'", (AVATAR_TASK_KEY,)).fetchone()[0], 20)
+
+    def test_finished_followups_obey_retention_after_their_parent_settles(self):
+        parent = self.parent()
+        self.store.enqueue_followups(parent.id, [(f'avatar:{i}', AVATAR_TASK_KEY, str(i)) for i in range(21)])
+        self.store.finish(parent.id, 'succeeded')
+        with registered(echo_type(AVATAR_TASK_KEY)):
+            self.assertEqual(FollowupRunner(self.contract()).drain(), 21)
+        with self.database.read_connection() as connection:
+            self.assertEqual(connection.execute('SELECT count(*) FROM task_run WHERE task_key=?',
+                                                (AVATAR_TASK_KEY,)).fetchone()[0], 20)
+            self.assertEqual(connection.execute('PRAGMA foreign_key_check').fetchall(), [])
+
     def contract(self):
         return SimpleNamespace(task_runs=self.store)
 
@@ -170,7 +194,7 @@ class RunnerTests(LedgerTestCase):
 
         with registered(echo_type("code-samples", run=chunk), echo_type(AVATAR_TASK_KEY, run=avatar)):
             self.store.enqueue_followups(parent.id, [
-                ("code-samples:stock", "code-samples", "补番号样张"),
+                ("code-samples:stock", "code-samples", "番号样张采集"),
                 ("entity-avatar:performer:1", AVATAR_TASK_KEY, "甲")])
             self.assertEqual(FollowupRunner(self.contract()).drain(), 4)
         self.assertEqual(order, ["code-samples:stock", "entity-avatar:performer:1",
@@ -209,6 +233,115 @@ class RunnerTests(LedgerTestCase):
         self.assertEqual(peak[0], 1)
         self.assertEqual(
             {row.status for row in self.store.children(parent.id)}, {"succeeded"})
+
+    def test_a_followup_that_steps_aside_waits_in_the_queue_and_runs_once_the_way_is_clear(self):
+        """给扫描与采集让路的后继回到队列，不判失败；路让回来以后同一条接着跑完。"""
+        clear = threading.Event()
+        attempts = []
+
+        class Blocked(JobDeferred):
+            def ready(self):
+                return clear.is_set()
+
+        def busy_until_clear(_contract, key, _handle):
+            attempts.append(key)
+            if not clear.is_set():
+                raise Blocked("等待扫描与采集完成后继续")
+            return {"outcome": key}
+
+        parent = self.parent()
+        with registered(echo_type("ledger-a", run=busy_until_clear)), \
+                mock.patch.object(followups_module, "DEFER_POLL_SECONDS", 0.01):
+            child = self.store.enqueue_followups(parent.id, [("ledger-a:1", "ledger-a", "甲")])["queued"][0]
+            runner = FollowupRunner(self.contract())
+            runner.wake()
+            deadline = time.monotonic() + 10
+            while not attempts and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.05)
+            waiting = self.store.get(child)
+            self.assertEqual(waiting.status, "pending")
+            self.assertEqual(waiting.progress_label, "等待扫描与采集完成后继续")
+            self.assertEqual(attempts, ["ledger-a:1"])
+            clear.set()
+            self.wait_until_settled(parent.id)
+            runner.stop(timeout=10)
+        self.assertEqual(self.store.get(child).status, "succeeded")
+        self.assertEqual(attempts, ["ledger-a:1", "ledger-a:1"])
+
+    def test_a_busy_task_gate_keeps_the_lane_alive_until_the_followup_is_claimed(self):
+        """闸门锁被别人拿着时领取等满超时：通道不退出，锁放开后照样领到这一条。"""
+        from filelock import FileLock
+        from peach import update_tasks
+        parent = self.parent()
+        held, release = threading.Event(), threading.Event()
+        # 闸门锁可重入要靠同一个对象；替身也按目录缓存，只把等待期限缩短。
+        locks = {}
+
+        def short_gate(root):
+            return locks.setdefault(root, FileLock(root / "admission.lock", timeout=0.05))
+
+        def hold():
+            with FileLock(update_tasks.state_for(self.db) / "admission.lock"):
+                held.set()
+                release.wait(10)
+
+        with registered(echo_type("ledger-a")), \
+                mock.patch.object(followups_module, "DEFER_POLL_SECONDS", 0.01), \
+                mock.patch.object(update_tasks, "_mutex", short_gate):
+            child = self.store.enqueue_followups(parent.id, [("ledger-a:1", "ledger-a", "甲")])["queued"][0]
+            holder = threading.Thread(target=hold)
+            holder.start()
+            self.assertTrue(held.wait(5))
+            runner = FollowupRunner(self.contract())
+            try:
+                runner.wake()
+                time.sleep(0.3)
+                self.assertTrue(runner._threads[followups_module.LEDGER_LANE].is_alive())
+                self.assertEqual(self.store.get(child).status, "pending")
+            finally:
+                release.set()
+                holder.join(5)
+            self.wait_until_settled(parent.id)
+            runner.stop(timeout=10)
+        self.assertEqual(self.store.get(child).status, "succeeded")
+
+    def test_draining_leaves_a_followup_that_steps_aside_in_the_queue(self):
+        attempts = []
+
+        def busy(_contract, key, _handle):
+            attempts.append(key)
+            raise JobDeferred("等待扫描与采集完成后继续")
+
+        parent = self.parent()
+        with registered(echo_type("ledger-a", run=busy)):
+            child = self.store.enqueue_followups(parent.id, [("ledger-a:1", "ledger-a", "甲")])["queued"][0]
+            self.assertEqual(FollowupRunner(self.contract()).drain(), 1)
+        self.assertEqual(attempts, ["ledger-a:1"])
+        self.assertEqual(self.store.get(child).status, "pending")
+
+    def test_a_type_that_jumps_the_queue_is_claimed_before_earlier_ones_in_its_lane(self):
+        """下载后处理这类人在等的后继，排在已经在排的后台批次前面；同一档里仍是先排先跑。"""
+        order = []
+
+        def record(_contract, key, _handle):
+            order.append(key)
+            return {"outcome": key}
+
+        urgent = FollowupType(task_key="urgent", label="urgent", writes_ledger=True,
+                              run=record, jumps_queue=True)
+        parent = self.parent()
+        with registered(echo_type("backlog", run=record), urgent):
+            self.store.enqueue_followups(parent.id, [
+                ("backlog:1", "backlog", "甲"), ("backlog:2", "backlog", "乙"),
+                ("urgent:1", "urgent", "丙"), ("urgent:2", "urgent", "丁")])
+            self.assertEqual(FollowupRunner(self.contract()).drain(), 4)
+        self.assertEqual(order, ["urgent:1", "urgent:2", "backlog:1", "backlog:2"])
+
+    def test_the_download_postprocess_jumps_the_ledger_lane(self):
+        from peach import download_postprocess
+        self.assertTrue(download_postprocess.TYPE.writes_ledger)
+        self.assertTrue(download_postprocess.TYPE.jumps_queue)
 
     def test_types_that_do_not_write_the_ledger_get_their_own_lane(self):
         with registered(echo_type("ledger-a"), echo_type("cheap", writes_ledger=False)):
@@ -280,7 +413,7 @@ class BackgroundJobDispatchTests(LedgerTestCase):
 
     def declared(self):
         return [{"key": "entity-avatar:performer:1", "task_key": AVATAR_TASK_KEY,
-                 "label": "补全资料图片：甲"}]
+                 "label": "资料图片补全：甲"}]
 
     def test_a_successful_run_dispatches_what_it_declared(self):
         job = self.job()
@@ -409,6 +542,10 @@ class CoverFaceFollowupTests(LedgerTestCase):
         self.covers = self.root / "covers"
         self.covers.mkdir()
         self.person = self.entity("performer", "梨奈")
+        self.providers = self.root / "generated" / "provider-cache" / "performer-avatars"
+        index_dir = self.providers / "gfriends"
+        index_dir.mkdir(parents=True)
+        (index_dir / "gfriends-filetree.json").write_text('{"Content": {}}', encoding="utf-8")
         faces = self.FACES
 
         class Probe:
@@ -560,6 +697,23 @@ class CoverFaceFollowupTests(LedgerTestCase):
         self.assertEqual(summary["outcome"], "图库里没有这个名字，封面上没有能截的脸")
         self.assertFalse((self.avatars / f"performer-{self.person}.img").exists())
 
+    def test_a_missing_face_model_is_flagged_and_not_recorded_as_tried(self):
+        """检不了与检不出是两件事：前者在任务中心标成问题，模型回来之后还要再派到她。"""
+        self.work(1, "FC2-PPV-1", (1800, 1000))
+
+        class Down:
+            unavailable = "取人脸模型失败：断网"
+
+            def on_bytes(self, _body):
+                return None
+
+        with mock.patch("peach.avatar_face.FaceProbe", Down):
+            summary = self.run_followup()
+        self.assertEqual(summary["outcome"], "图库里没有这个名字，人脸模型不可用：取人脸模型失败：断网")
+        self.assertIs(summary["face_match_unavailable"], True)
+        from peach.followups import attempts_root
+        self.assertFalse(any(attempts_root(self.root / "generated").glob("*")))
+
     def test_a_new_cover_plans_her_again_only_while_her_picture_is_a_crop(self):
         self.work(2, "FC2-PPV-2", (276, 154))
         chosen = self.entity("performer", "人挑过")
@@ -597,6 +751,9 @@ class FaceStubCase(LedgerTestCase):
         self.covers.mkdir()
         self.person = self.entity("performer", "梨奈")
         self.providers = self.root / "generated" / "provider-cache" / "performer-avatars"
+        index_dir = self.providers / "gfriends"
+        index_dir.mkdir(parents=True)
+        (index_dir / "gfriends-filetree.json").write_text('{"Content": {}}', encoding="utf-8")
         self.gallery: dict[str, dict[str, str]] = {}
         self.unavailable = ""
         vectors, test = self.VECTORS, self
@@ -709,6 +866,74 @@ class FaceMatchFollowupTests(FaceStubCase):
                          ["IPX-001", "SSIS-002"])
         self.assertTrue(all(cover["score"] >= 0.363 for cover in match["covers"]))
         self.assertEqual((match["candidates"], match["compared"]), (3, 2))
+
+    def test_a_changed_gallery_requeues_an_unresolved_person(self):
+        from peach.avatar_followup import stock
+        from peach.followups import Attempts, attempts_root
+
+        self.work(1, "IPX-001", self.BLANK)
+        self.run_followup()
+        attempts = Attempts(attempts_root(self.root / "generated"))
+        with self.database.read_connection() as connection:
+            self.assertEqual(stock(connection, self.avatars, attempts, limit=10), [])
+        self.candidate("1-S1", (400, 600), self.HER)
+        with self.database.read_connection() as connection:
+            planned = stock(connection, self.avatars, attempts, limit=10)
+        self.assertEqual([item.key for item in planned], [followup_key("performer", self.person)])
+
+    def test_an_expired_gallery_can_refresh_when_unresolved_people_are_settled(self):
+        import os
+        from peach import gfriends
+        from peach.avatar_followup import stock
+        from peach.followups import Attempts, attempts_root
+
+        self.work(1, "IPX-001", self.BLANK)
+        self.run_followup()
+        index_path = self.providers / "gfriends" / gfriends.INDEX_NAME
+        stamp = time.time() - gfriends.INDEX_MAX_AGE_SECONDS - 1
+        os.utime(index_path, (stamp, stamp))
+        attempts = Attempts(attempts_root(self.root / "generated"))
+        with self.database.read_connection() as connection:
+            found = stock(connection, self.avatars, attempts, limit=10)
+        self.assertEqual([item.key for item in found], [followup_key("performer", self.person)])
+
+    def test_a_missing_gallery_is_prepared_before_candidate_selection(self):
+        from peach import avatar_picker, gfriends
+        from peach.http import HttpResponse
+
+        self.candidate("1-S1", (400, 600), self.HER)
+        index_path = self.providers / "gfriends" / gfriends.INDEX_NAME
+        body = index_path.read_bytes()
+        index_path.unlink()
+        requests = []
+
+        def send(request, *_args):
+            requests.append(request.url)
+            return HttpResponse(200, {}, body, request.url)
+
+        contract = self.contract()
+        contract.gfriends_index = avatar_picker.IndexRefresher(index_path.parent, lambda: send)
+        from peach.avatar_followup import run
+        summary = run(contract, followup_key("performer", self.person), mock.Mock())
+        self.assertEqual(summary["outcome"], "已装上")
+        self.assertEqual(self.provenance()["provider"], "gfriends")
+        self.assertEqual(requests, [gfriends.INDEX_URL])
+
+    def test_a_failed_gallery_fetch_does_not_settle_an_absent_index(self):
+        from peach import avatar_picker, gfriends
+        from peach.followups import attempts_root
+        from peach.http import HttpResponse
+        from peach.avatar_followup import run
+
+        index_path = self.providers / "gfriends" / gfriends.INDEX_NAME
+        index_path.unlink()
+        self.work(1, "IPX-001", self.BLANK)
+        contract = self.contract()
+        contract.gfriends_index = avatar_picker.IndexRefresher(index_path.parent, lambda: lambda request, *_: HttpResponse(503, {}, b"", request.url))
+        with self.assertLogs(avatar_picker.LOGGER, "WARNING"):
+            summary = run(contract, followup_key("performer", self.person), mock.Mock())
+        self.assertTrue(summary["source_unavailable"])
+        self.assertFalse(any(attempts_root(contract.candidate_root).glob("*.json")))
 
     def test_only_her_pictures_are_eligible_when_someone_else_shares_the_name(self):
         """同名的另一个人那张更大、排得更前，照样落选；检不出脸的那张不算她。"""
@@ -1419,9 +1644,13 @@ class ProcessLibraryTests(LedgerTestCase):
             avatar_root=self.root / 'generated' / 'avatars',
             candidate_root=self.root / 'generated', cover_root=self.root / 'covers',
             cache_bust=lambda: None)
+        index_dir = contract.candidate_root / 'provider-cache' / 'performer-avatars' / 'gfriends'
+        index_dir.mkdir(parents=True, exist_ok=True)
+        (index_dir / 'gfriends-filetree.json').write_text('{"Content": {}}', encoding='utf-8')
         offline = {performer_alias_followup.MINNANO: Offline(),
                    performer_alias_followup.AV_NEME: Offline()}
         profile_offline = {performer_profile_followup.MINNANO: Offline(),
+                           performer_profile_followup.AVBASE: Offline(),
                            performer_profile_followup.AVWIKIDB: Offline(),
                            performer_profile_followup.JAVDB: Offline()}
         with mock.patch.object(performer_alias_followup, 'open_sites', return_value=offline), \
@@ -1442,13 +1671,40 @@ class ProcessLibraryTests(LedgerTestCase):
 
 
 class TaskPayloadTests(LedgerTestCase):
+    def test_installation_pause_preserves_the_same_followup_for_resume(self):
+        from peach import update_tasks
+        from peach.jobs import JobPaused
+        calls = []
+        tokens = []
+        def work(_contract, _key, _handle):
+            calls.append('run')
+            if len(calls) == 1:
+                tokens.append(update_tasks.reserve(self.db))
+                raise JobPaused('安装期间暂停')
+            return {'outcome':'完成'}
+        kind = echo_type('upgrade-test', run=work)
+        parent = self.parent()
+        with registered(kind):
+            child = self.store.enqueue_followups(parent.id, [('upgrade-test:1','upgrade-test','处理')])['queued'][0]
+            runner = FollowupRunner(SimpleNamespace(task_runs=self.store))
+            try:
+                self.assertEqual(runner.drain(), 1)
+                self.assertEqual(self.store.get(child).status, 'pending')
+            finally:
+                for token in tokens:
+                    update_tasks.release(self.db, token)
+            self.assertEqual(runner.drain(), 1)
+        self.assertEqual(self.store.get(child).status, 'succeeded')
+        self.assertEqual(calls, ['run','run'])
+
     def test_the_detail_endpoint_gives_both_ends_of_the_chain(self):
         from peach.web_tasks import q_task
+        from peach.web_contract import WebContract
 
         parent = self.parent()
         queued = self.store.enqueue_followups(
             parent.id, [("entity-avatar:performer:1", AVATAR_TASK_KEY, "甲")])["queued"]
-        contract = SimpleNamespace(task_runs=self.store)
+        contract = WebContract(self.db)
         payload = q_task(contract, parent.id)
         self.assertIsNone(payload["parent"])
         self.assertEqual([row["id"] for row in payload["followups"]], queued)

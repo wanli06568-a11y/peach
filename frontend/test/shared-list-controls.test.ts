@@ -31,7 +31,9 @@ it('在横排上开头的滚轮手势整段归这一排，鼠标一格逐帧走�
   // 半路再来一格，从上一格的终点接着算，一路走到头停下。
   now+=40;node.dispatchEvent(wheel(60));flush();
   expect(left).toBe(100);expect(frames).toHaveLength(0);
-  node.dispatchEvent(new Event('scroll'));expect(node.dataset.overflowRight).toBe('false');
+  // 一帧里的几次 scroll 合成下一帧写一次渐隐标记。
+  node.dispatchEvent(new Event('scroll'));node.dispatchEvent(new Event('scroll'));expect(frames).toHaveLength(1);
+  step();expect(node.dataset.overflowRight).toBe('false');
   // 到头以后还在转、隔一会再转，都不交给页面：要滚整页得把指针挪出这一排。
   now+=40;const still=wheel(60);node.dispatchEvent(still);expect(still.defaultPrevented).toBe(true);
   now+=1000;const next=wheel(60);node.dispatchEvent(next);expect(next.defaultPrevented).toBe(true);
@@ -83,4 +85,22 @@ it('横排推过头按橡皮筋收敛，顶在边上再推也弹，一次滚轮�
   expect(node.style.getPropertyValue('--edge-pull')).toBe('');
   expect(animate).toHaveBeenCalledTimes(3);
   clock.mockRestore();
+});
+
+it('按住拖动横排时整页锁成抓取光标，松手或窗口失焦就撤掉，点在控件上不起拖', () => {
+  vi.stubGlobal('ResizeObserver',class {observe(){}disconnect(){}});
+  const node=document.createElement('div');document.body.append(node);
+  const control=document.createElement('button');node.append(control);
+  Object.defineProperties(node,{clientWidth:{value:100},scrollWidth:{value:200}});
+  wireHorizontalScroller(node,{drag:true,dragIgnore:'button'});
+  const dragging=()=>document.documentElement.hasAttribute('data-drag-scrolling');
+  node.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,button:0}));
+  expect(dragging()).toBe(true);
+  window.dispatchEvent(new MouseEvent('mouseup'));
+  expect(dragging()).toBe(false);
+  node.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,button:0}));
+  window.dispatchEvent(new Event('blur'));
+  expect(dragging()).toBe(false);
+  control.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,button:0}));
+  expect(dragging()).toBe(false);
 });

@@ -10,9 +10,8 @@ import json
 import os
 import sqlite3
 import tempfile
-import time
 import unittest
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest import mock
 
 from peach import web_batch
@@ -42,6 +41,8 @@ class PurgeMissingTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name).resolve()
+        self.mount = self.root / "mount"
+        self.mount.mkdir()
         self.db_path = str(fresh_ledger(self.root))
         con = sqlite3.connect(self.db_path)
         sep = chr(92)
@@ -64,12 +65,12 @@ class PurgeMissingTests(unittest.TestCase):
         con.close()
         self.contract = rm_web.WebContract(Path(self.db_path))
         # 只有 001 和 a.mp4 还在盘上；002、003 当作已被手动删除。
-        for name in ("001.jpg", "a.mp4"):
-            (self.root / name).write_bytes(b"x")
+        for path in (self.mount / "creator/P/001.jpg",
+                     self.mount / "creator/V/a.mp4"):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"x")
         # 检查会遍历在线来源的目录来找空文件夹；测试目录必须固定在临时目录中，否则会遍历
         # 这台机器上真实的 `R:\media` 与网盘挂载。
-        self.mount = self.root / "mount"
-        self.mount.mkdir()
         for module in (rm_sync, web_batch):
             declared = mock.patch.object(module, "LOCATION_ROOT_DECLARATIONS",
                                          {"115": (str(self.mount),)})
@@ -84,8 +85,15 @@ class PurgeMissingTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def _translate(self, raw):
-        """把账本的 Windows 路径映射到临时目录里的同名文件。"""
-        return self.root / str(raw).rsplit(chr(92), 1)[-1]
+        """把来源盘符和相对目录映射进临时挂载；Unix 根路径保持原样。"""
+        text = str(raw)
+        windows = PureWindowsPath(text)
+        drive = windows.drive.upper()
+        if drive == "B:":
+            return self.mount.joinpath(*windows.parts[1:])
+        if drive == "R:":
+            return (self.root / "local").joinpath(*windows.parts[1:])
+        return Path(raw)
 
     def _synced(self, online=lambda location: location == "115"):
         """账本路径映射到临时目录；删除那一侧（`web_batch`）要跟着映射，否则它去问真实的 B:。"""
@@ -292,8 +300,8 @@ class PurgeMissingTests(unittest.TestCase):
             preview = rm_sync.w_resource_sync_scan(self.contract)
 
         self.assertEqual(preview["missing"], 2)
-        # 账本那几行同住一个目录，列一次；来源根为找空文件夹再列一次。
-        self.assertEqual(scandir.call_count, 2)
+        # 两个账本目录各列一次，再遍历来源树的根、父目录和两个子目录。
+        self.assertEqual(scandir.call_count, 6)
         source = next(row for row in preview["sources"] if row["location"] == "115")
         self.assertEqual(source["total"], 4)
         self.assertEqual(source["unreadable"], 0)
@@ -316,6 +324,45 @@ class PurgeMissingTests(unittest.TestCase):
                 self.contract, {'confirm': True, 'clean_cache': False, 'scan_id': scan['scan_id']})
         self.assertEqual((result['purged'], result['vanished']), (2, 1))
         self.assertEqual(self.ids(), [1, 2, 4])
+
+    def _add_removed_folder_row(self):
+        """这一行原先在一个媒体目录下，那个目录已从设置里移除、盘上也删掉了；所在的盘还在。"""
+        (self.root / "local").mkdir()
+        with self.contract.write_transaction() as connection:
+            connection.execute("INSERT INTO asset(id,location,path,name,medium,size) "
+                               "VALUES(5,'115','R:\\strm\\CESD-499.strm','CESD-499.strm','video',10)")
+
+    def test_rows_under_a_removed_media_folder_are_cleaned_with_the_rest(self):
+        self._add_removed_folder_row()
+        with self._synced():
+            scan = finish_scan(self.contract)
+            self.assertEqual(scan["missing"], 3)
+            result = rm_sync.w_resource_sync_apply(
+                self.contract, {"confirm": True, "clean_cache": False, "scan_id": scan["scan_id"]})
+        self.assertEqual((result["purged"], result["vanished"], result["blocked_count"]), (2, 1, 0))
+        self.assertEqual(self.ids(), [1, 2, 4])
+
+    def test_rows_under_a_removed_media_folder_stay_when_their_disk_cannot_be_read(self):
+        self._add_removed_folder_row()
+        readable = web_batch.root_online
+        with self._synced(), mock.patch.object(
+                web_batch, "root_online", lambda path: path != Path(path.anchor) and readable(path)):
+            scan = finish_scan(self.contract)
+            result = rm_sync.w_resource_sync_apply(
+                self.contract, {"confirm": True, "clean_cache": False, "scan_id": scan["scan_id"]})
+        self.assertEqual(result["blocked"], [{"id": 5, "name": "CESD-499.strm", "reason": "媒体来源未挂载或不可读取"}])
+        self.assertEqual(self.ids(), [1, 2, 4, 5])
+
+    def test_deleting_media_outside_every_media_folder_is_still_refused(self):
+        self._add_removed_folder_row()
+        kept = self.root / "local" / "strm" / "CESD-499.strm"
+        kept.parent.mkdir()
+        kept.write_bytes(b"x")
+        with self._synced(), self.contract.write_transaction() as connection:
+            row = connection.execute("SELECT id,location,path,snapshot_path FROM asset WHERE id=5").fetchone()
+            outcome = web_batch.purge_assets(connection, [row])
+        self.assertEqual((outcome["purged"], len(outcome["blocked"])), (0, 1))
+        self.assertTrue(kept.is_file())
 
     def test_apply_resumes_after_a_committed_chunk_with_cumulative_receipt(self):
         saved = {}
@@ -362,8 +409,8 @@ class PurgeMissingTests(unittest.TestCase):
 
         self.assertEqual(preview["missing"], 0)
         source = next(row for row in preview["sources"] if row["location"] == "115")
-        # 账本那几行所在的目录一个，来源根一个：同一个目录只数一次。
-        self.assertEqual(source["unreadable"], 2)
+        # 两个账本目录加来源根：同一个目录只数一次。
+        self.assertEqual(source["unreadable"], 3)
         self.assertEqual(preview["empty"], 0)
 
     def test_background_sync_polls_then_rechecks_only_missing_candidates(self):
@@ -374,13 +421,12 @@ class PurgeMissingTests(unittest.TestCase):
             started = rm_sync.w_resource_sync_scan(
                 self.contract, {"background": True, "restart": True})
             self.assertIn(started["status"], {"running", "complete"})
-            status = started
-            deadline = time.monotonic() + 2
-            while status["status"] == "running":
-                status = rm_sync.w_resource_sync_scan(
-                    self.contract, {"background": True})
-                self.assertLess(time.monotonic(), deadline)
-                time.sleep(0.01)
+            status = rm_sync.w_resource_sync_scan(self.contract, {"background": True})
+            self.assertIn(status['status'], {'running', 'complete'})
+            self.contract.resource_scan.thread.join(10)
+            self.assertFalse(self.contract.resource_scan.thread.is_alive(), '后台检查未结束')
+            status = rm_sync.w_resource_sync_scan(
+                self.contract, {"background": True, "status_only": True})
             self.assertEqual(status["status"], "complete")
             self.assertEqual(status["missing"], 2)
             resumed = rm_sync.w_resource_sync_scan(
@@ -415,6 +461,26 @@ class PurgeMissingTests(unittest.TestCase):
         self.assertTrue(shared.is_file())
         self.assertNotIn("covers", preview["cache"]["by_kind"])
 
+    def test_cache_cleanup_keeps_covers_of_followed_wanted_and_codeless_works(self):
+        """关注新作、想要清单和无番号作品的封面不在馆藏番号里，同样有主。"""
+        covers = self.root / "covers"
+        covers.mkdir()
+        con = sqlite3.connect(self.db_path)
+        con.executemany("INSERT INTO feed_discovery(code,discovered_at,ignored_at) VALUES(?,'t',?)",
+                        [("NGOD-365", None), ("IGNO-001", "t")])
+        con.execute("INSERT INTO want_item(code,code_key,origin,state,created_at,updated_at)"
+                    " VALUES('WANT-001','WANT-001','code','wanted','t','t')")
+        con.commit();con.close()
+        kept = [covers / name for name in ("NGOD-365.jpg", "NGOD-365.face.json", "WANT-001.jpg", "ASSET-ID-1.jpg")]
+        gone = [covers / "IGNO-001.jpg", covers / "ORPH-001.jpg"]
+        for path in (*kept, *gone):
+            path.write_bytes(b"cover")
+        self.contract.cover_root = covers
+        self.contract.resource_cleanup_enabled = True
+        plan = rm_sync._resource_orphan_plan(self.contract)
+        self.assertEqual(sorted(path.name for _kind, path, _size in plan["files"]),
+                         ["IGNO-001.jpg", "ORPH-001.jpg"])
+
     def test_cache_cleanup_never_crosses_the_database_data_root(self):
         """临时数据库漏配缓存根时，宁可不清理，也不能越界碰真实 generated。"""
         with tempfile.TemporaryDirectory() as outside_tmp:
@@ -437,7 +503,7 @@ class PurgeMissingTests(unittest.TestCase):
 
     def test_intact_directory_reports_no_change(self):
         for name in ("002.jpg", "003.jpg"):
-            (self.root / name).write_bytes(b"x")
+            (self.mount / "creator/P" / name).write_bytes(b"x")
         result = self._run()
         self.assertEqual(result["removed"], 0)
         self.assertEqual(result["checked"], 3)
@@ -471,7 +537,7 @@ class PurgeMissingTests(unittest.TestCase):
         `unreadable` 数不到它，所以清理那一侧照名单删就会删掉几百行文件还在的资产。
         """
         for name in ("002.jpg", "003.jpg"):
-            (self.root / name).write_bytes(b"x")
+            (self.mount / "creator/P" / name).write_bytes(b"x")
         with mock.patch.object(rm_sync, "translate_ledger_path", self._translate), \
              mock.patch.object(rm_sync, "_missing_resource_ids",
                                return_value=([1, 2, 3], 0)):

@@ -10,8 +10,9 @@ import io
 import sqlite3
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from pathlib import Path, PureWindowsPath
+from unittest import mock
 
 from peach import scan, subtitles
 from support.ledger import fresh_ledger
@@ -215,6 +216,32 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(len(self._rows()), 3)
 
 
+class SmbDiscoveryTests(unittest.TestCase):
+    """SMB 共享上的作品不是操作系统路径，同目录字幕经 SMB 列目录发现。"""
+
+    def _video(self):
+        from peach.smb_media import SmbResource
+        from peach.smb_transport import SmbConnection
+        return SmbResource("nas", r"R:\Media", "smb://files.invalid/media", ("ABP-758", "ABP-758.mp4"),
+                           SmbConnection("files.invalid", "media"))
+
+    def test_sidecars_next_to_an_smb_video_are_listed_through_the_share(self):
+        from peach.smb_media import SmbResource
+        from peach.smb_transport import SmbEntry
+        listing = [SmbEntry(9, 1, 1, False, "ABP-758.mp4"), SmbEntry(3, 1, 1, False, "ABP-758.chs.srt"),
+                   SmbEntry(3, 1, 1, False, "OTHER-1.srt"), SmbEntry(0, 1, 1, True, "ABP-758.srt"),
+                   SmbEntry(3, 1, 1, False, "ABP-758.ass", True)]
+        with mock.patch.object(SmbResource, "scandir", return_value=listing):
+            found = subtitles.discover_sidecars(self._video(), scan.VIDEO)
+        self.assertEqual([(row["name"], row["path"], row["language"]) for row in found],
+                         [("ABP-758.chs.srt", r"R:\Media\ABP-758\ABP-758.chs.srt", "zh-Hans")])
+
+    def test_an_unreachable_share_yields_no_sidecars(self):
+        from peach.smb_media import SmbResource
+        with mock.patch.object(SmbResource, "scandir", side_effect=OSError(113, "SMB 连接不可用")):
+            self.assertEqual(subtitles.discover_sidecars(self._video(), scan.VIDEO), [])
+
+
 class DecodeTests(unittest.TestCase):
     def test_a_bom_names_the_encoding(self):
         self.assertEqual(subtitles.decode("台词".encode("utf-8-sig")), "台词")
@@ -346,7 +373,8 @@ class SubtitleApiTests(unittest.TestCase):
                          ["ABP-758.chs.srt", "ABP-758.en.srt", "ABP-758.jp.srt"])
         self.assertEqual([track["index"] for track in tracks], [0, 1, 2])
         self.assertEqual(tracks[0]["label"], "简体中文")
-        self.assertEqual(tracks[0]["src"], "/api/assets/1/subtitles/0")
+        self.assertEqual(tracks[0]["src"],
+                         f"/api/assets/1/subtitles/0?track={subtitles.file_key('ABP-758.chs.srt')}")
         self.assertTrue(tracks[0]["playable"])
         self.assertEqual(tracks[1]["note"], "不在正片所在目录")
         self.assertEqual(tracks[2]["note"], "编码未识别")
@@ -359,6 +387,72 @@ class SubtitleApiTests(unittest.TestCase):
         self.assertTrue(response.headers["content-type"].startswith("text/vtt"))
         self.assertIn("00:00:01.000 --> 00:00:02.000", response.text)
         self.assertIn("简体台词", response.text)
+
+    def test_same_directory_files_are_discovered_without_registration(self):
+        sibling = self.media / "ABP-758.srt"
+        sibling.write_text("1\n00:00:00,000 --> 00:00:05,000\n同目录字幕\n", encoding="utf-8")
+        (self.media / "OTHER-123.mp4").write_bytes(b"0")
+        (self.media / "OTHER-123.srt").write_text("无关字幕", encoding="utf-8")
+        nested = self.media / "ABP-758.trickplay"
+        nested.mkdir()
+        (nested / "ABP-758.ass").write_text("不遍历子目录", encoding="utf-8")
+        with self._client() as client:
+            tracks = client.get("/api/assets/1/subtitles").json()["subtitles"]
+            self.assertEqual(len(tracks), 4)
+            found = next(row for row in tracks if row["name"] == sibling.name)
+            self.assertTrue(found["playable"])
+            self.assertTrue(found["id"].startswith("sidecar:local:"))
+            self.assertIn("同目录字幕", client.get(found["src"]).text)
+            self.assertEqual(sum(row["name"] == "ABP-758.chs.srt" for row in tracks), 1)
+        with closing(sqlite3.connect(self.db)) as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM asset_subtitle").fetchone()[0], 3)
+
+    def test_discovered_track_identity_survives_directory_changes(self):
+        (self.media / "ABP-758.srt").write_text("1\n00:00:00,000 --> 00:00:05,000\n原字幕\n", encoding="utf-8")
+        with self._client() as client:
+            tracks = client.get("/api/assets/1/subtitles").json()["subtitles"]
+            original = next(row for row in tracks if row["name"] == "ABP-758.srt")
+            (self.media / "ABP-758.fr.srt").write_text("1\n00:00:00,000 --> 00:00:05,000\n新字幕\n", encoding="utf-8")
+            self.assertIn("原字幕", client.get(original["src"]).text)
+            current = client.get("/api/assets/1/subtitles").json()["subtitles"]
+            self.assertEqual(next(row for row in current if row["name"] == "ABP-758.srt")["id"], original["id"])
+            (self.media / "ABP-758.srt").unlink()
+            self.assertEqual(client.get(original["src"]).status_code, 404)
+
+    def test_discovery_stays_inside_authorized_media_roots(self):
+        from peach.routes_media import _subtitle_rows
+        with self._client() as client:
+            state = client.app.state
+            state.media_engine.filesystem.allowed_roots = (self.outside,)
+            with mock.patch("peach.routes_media.subtitles.discover_sidecars") as discover:
+                _subtitle_rows(state, 1)
+            discover.assert_not_called()
+
+    def test_opening_a_video_lists_its_directory_once(self):
+        """字幕列表一次、每条轨各一次：正片目录在网盘上时，每次列目录都是一趟网络往返。"""
+        (self.media / "ABP-758.srt").write_text("1\n00:00:00,000 --> 00:00:05,000\n旁挂\n", encoding="utf-8")
+        with self._client() as client, mock.patch(
+                "peach.routes_media.subtitles.discover_sidecars", wraps=subtitles.discover_sidecars) as discover:
+            tracks = client.get("/api/assets/1/subtitles").json()["subtitles"]
+            for track in tracks:
+                client.get(track["src"])
+        self.assertEqual(len(tracks), 4)
+        self.assertEqual(discover.call_count, 1)
+
+    def test_discovered_identity_is_stable_when_the_file_is_registered(self):
+        path = self.media / "ABP-758.srt"
+        path.write_text("1\n00:00:00,000 --> 00:00:05,000\n旁挂字幕\n", encoding="utf-8")
+        with self._client() as client:
+            first = next(row for row in client.get("/api/assets/1/subtitles").json()["subtitles"]
+                         if row["name"] == path.name)
+            with closing(sqlite3.connect(self.db)) as connection, connection:
+                subtitles.record(connection, "local", [subtitles.Sidecar(
+                    str(path), path.name, "srt", "", subtitles.EXACT, str(self.video))], "2026-10-23")
+            current = next(row for row in client.get("/api/assets/1/subtitles").json()["subtitles"]
+                           if row["name"] == path.name)
+            self.assertEqual(current["id"], first["id"])
+            self.assertTrue(current["legacy_id"].startswith("sidecar:"))
+            self.assertIn("旁挂字幕", client.get(first["src"]).text)
 
     def test_a_path_outside_the_video_directory_is_refused(self):
         with self._client() as client:

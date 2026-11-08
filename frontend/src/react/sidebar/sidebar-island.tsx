@@ -23,7 +23,7 @@
  * `sidebar.css`，不用工具类。 */
 import {
   createContext, useContext, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore,
-  type DragEvent, type MouseEvent, type ReactNode,
+  type CSSProperties, type MouseEvent, type ReactNode,
 } from 'react';
 import { createPortal, flushSync } from 'react-dom';
 
@@ -34,7 +34,10 @@ import { Icon } from '../settings-panel/icon';
 import type {
   SidebarApi, SidebarChip, SidebarContent, SidebarDot, SidebarFacets, SidebarHost, SidebarProps,
 } from './sidebar-api';
-import { moveSidebarKey, useCommitSidebarOrder } from './sidebar-order';
+import { useCommitNavigationOrder } from './sidebar-order';
+import { useSidebarReorder } from './use-sidebar-reorder';
+import { resetSidebarOrder } from '../../sidebar';
+import { NavigationOrderMenu } from '../components/navigation-order';
 
 /* 首页那一项的键是空串；空串写进 dataTransfer 等于没写，给它一个占位。 */
 const HOME = '__home__';
@@ -94,7 +97,7 @@ function Sidebar({ host: at, props: view, epoch }: { host: SidebarHost; props: S
 /* ── 导航 ── */
 
 function Navigation({ host: at, epoch, version }: { host: SidebarHost; epoch: number; version: number }) {
-  const commit = useCommitSidebarOrder(at.store);
+  const commit = useCommitNavigationOrder(at.store);
   const order = at.store.value.sidebarOrder;
   const byKey = new Map(at.navCatalog.map((item) => [item[0], item]));
   const items = order.map((key) => byKey.get(key)).filter((item) => item !== undefined);
@@ -112,50 +115,41 @@ function Navigation({ host: at, epoch, version }: { host: SidebarHost; epoch: nu
     const head = scroll.querySelector<HTMLElement>(':scope > [data-sidebar-head]');
     const resize = new ResizeObserver(() => sync());
     [drawer, scroll, head].forEach((node) => { if (node) resize.observe(node) });
-    document.addEventListener('board:sidebar', sync);
-    return () => { resize.disconnect(); document.removeEventListener('board:sidebar', sync) };
+    /* 开合事件在点击回调里同步发出，那一刻整页样式刚因开合类名变脏，当场量就是一次整树重算；
+       挪到下一帧和尺寸观察器一起量。 */
+    let frame = 0;
+    const later = () => { if (!frame) frame = requestAnimationFrame(() => { frame = 0; sync() }) };
+    document.addEventListener('board:sidebar', later);
+    return () => { resize.disconnect(); cancelAnimationFrame(frame); document.removeEventListener('board:sidebar', later) };
   }, [at, sync]);
 
-  const [dragging, setDragging] = useState<string | null>(null);
-  const [drop, setDrop] = useState<{ key: string; after: boolean } | null>(null);
-  const clearDrag = () => { setDragging(null); setDrop(null) };
-  const drag = (key: string) => ({
-    draggable: true,
-    onDragStart: (event: DragEvent<HTMLButtonElement>) => {
-      setDragging(key);
-      event.dataTransfer.effectAllowed = 'move';
-      event.dataTransfer.setData('text/plain', key || HOME);
-    },
-    onDragOver: (event: DragEvent<HTMLButtonElement>) => {
-      if (dragging === null || dragging === key) return;
-      event.preventDefault();
-      event.dataTransfer.dropEffect = 'move';
-      const after = event.clientY > event.currentTarget.getBoundingClientRect().top + event.currentTarget.offsetHeight / 2;
-      if (drop?.key !== key || drop.after !== after) setDrop({ key, after });
-    },
-    onDrop: (event: DragEvent<HTMLButtonElement>) => {
-      event.preventDefault();
-      const from = dragging, after = drop?.key === key ? drop.after : false;
-      clearDrag();
-      const next = from === null ? null : moveSidebarKey(order, from, key, after);
-      if (next) commit(next);
-    },
-    onDragEnd: clearDrag,
-  });
+  const reorder = useSidebarReorder(column, order, commit, () => requestAnimationFrame(sync));
 
   const drawer = at.scroll.parentElement;
   return (
     <>
-      <div data-sidebar-nav="" ref={column} onPointerLeave={glide.leave}>
-        {items.map(([key, label, glyph], index) => (
+      <div data-sidebar-nav="" ref={column} onPointerLeave={glide.leave}
+        data-reordering={reorder.picked ? '' : undefined} onClickCapture={reorder.clickCapture}>
+        {items.map(([key, label, glyph], index) => {
+          const nudge = reorder.nudge(key);
+          return (
           <button type="button" key={key || HOME} data-nav={key} aria-pressed={pressed[index]} aria-label={label}
-            data-dragging={dragging === key ? '' : undefined}
-            data-drop={drop?.key === key ? (drop.after ? 'after' : 'before') : undefined}
-            onClick={() => at.navTo(key)} onPointerEnter={glide.hover} {...drag(key)}>
-            {key === '' ? <img data-sidebar-home-logo="" src="/peach-logo.png" alt="" /> : <Icon name={glyph} />}
+            data-dragging={reorder.picked?.key === key ? '' : undefined}
+            aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown"
+            style={{ '--sidebar-picked-top': reorder.picked?.key === key ? `${reorder.picked.offset}px` : undefined,
+              '--sidebar-nudge': `${nudge.distance}px`, '--sidebar-delay': `${nudge.delay}ms` } as CSSProperties}
+            onClick={() => at.navTo(key)} onDoubleClick={() => at.navToTop()} onPointerEnter={glide.hover}
+            {...reorder.bindings(key)}>
+            {key === '' ? <img data-sidebar-home-logo="" src="/peach-logo-64.png"
+              srcSet="/peach-logo-64.png 64w, /peach-logo-128.png 128w" sizes="24px" width={24} height={24} alt=""
+              decoding="async" draggable={false} /> : <Icon name={glyph} />}
             <span>{label}</span>
           </button>
-        ))}
+        )})}
+        {reorder.hint ? <span data-sidebar-drop-line="" aria-hidden="true"
+          style={{ '--sidebar-line-top': `${reorder.linePosition}px` } as CSSProperties}><span /></span> : null}
+        <NavigationOrderMenu order={{ label: '左侧导航', keys: order, defaults: resetSidebarOrder(order), commit }} />
+        <span role="status" aria-live="polite" data-sidebar-order-status="">{reorder.announcement}</span>
       </div>
       {drawer ? createPortal(<span data-sidebar-glide="" aria-hidden="true" ref={pane} />, drawer) : null}
     </>
@@ -178,7 +172,7 @@ function countsOf(latest: SidebarFacets | null): Map<string, number> | null {
   if (!latest) return null;
   const counts = new Map<string, number>();
   const rows: [string, SidebarChip[]][] = [['loc', latest.locations], ['orient', latest.orientations],
-    ['region', latest.regions], ['creator', latest.creators], ['tag', latest.tags], ['tag', latest.tech]];
+    ['region', latest.regions], ['year', latest.years || []], ['creator', latest.creators], ['tag', latest.tags], ['tag', latest.tech]];
   for (const [key, chips] of rows) for (const chip of chips) counts.set(`${key}\n${chip.value}`, chip.n ?? 0);
   return counts;
 }
@@ -232,6 +226,7 @@ function catalogGroups(
       : null,
     /* 产地紧挨着来源：两者回答的都是「这批片打哪来」，一个说存储，一个说发行体系。可多选。 */
     spec('产地', 'general', facets.regions, 'region', true),
+    spec('发行年份', 'meta', facets.years || [], 'year', true),
     spec('画幅', 'meta', facets.orientations, 'orient', false),
     spec('创作者', 'artist', facets.creators, 'creator', false, 'creator'),
     spec('内容标签', 'general', facets.tags, 'tag', false, 'tag'),

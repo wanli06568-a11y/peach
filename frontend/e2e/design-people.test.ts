@@ -13,6 +13,35 @@ describe('设计决定：人物与厂牌资料页', () => {
   let browser: Browser;
   installDesignBrowser((next) => { browser = next; });
 
+  it('取景前的懒加载头像保留可见性，加载后显示人像', { timeout: 60_000 }, async () => {
+    const opened = await openProfiledPerformer(browser, DESKTOP);
+    try {
+      const page = opened.page;
+      let release!: () => void;
+      const pending = new Promise<void>(resolve => { release = resolve; });
+      await page.route('**/avatar-loading-probe', async route => {
+        await pending;
+        await route.fulfill({ contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128"><rect width="128" height="128" fill="green"/></svg>' });
+      });
+      const state = await page.evaluate(() => {
+        const ring = document.createElement('span');
+        ring.style.cssText = 'position:fixed;top:20px;left:20px;width:80px;height:80px';
+        ring.innerHTML = '<img id="avatar-loading-probe" loading="lazy" width="128" height="128" data-facebox="0.5 0.5 60 128 128" src="/avatar-loading-probe">';
+        document.body.append(ring);
+        const image = ring.querySelector('img')!;
+        return { visibility: getComputedStyle(image).visibility, opacity: getComputedStyle(image).opacity };
+      });
+      release();
+      assert.deepEqual(state, { visibility: 'visible', opacity: '0' });
+      await page.waitForFunction(() => {
+        const image = document.querySelector<HTMLImageElement>('#avatar-loading-probe')!;
+        return image.naturalWidth > 0 && getComputedStyle(image).opacity === '1';
+      });
+    } finally {
+      await opened.close();
+    }
+  });
+
   for (const [viewport, split] of [[WIDE, true], [MOBILE, false]] as const) {
     it(`搜索下拉按种类分页签；宽屏分两栏、人名带头像与近作、视频排成封面格，窄屏一栏（${viewport.name}）`, { timeout: 60_000 }, async () => {
       const opened = await visit(browser, '/', viewport);
@@ -94,7 +123,6 @@ describe('设计决定：人物与厂牌资料页', () => {
         // 人名那一行点开的是资料页，不是按名字再搜一遍。
         await page.keyboard.press('ArrowDown');
         await page.keyboard.press('Enter');
-        await page.waitForURL(/\/performers\//, { timeout: 5_000 });
         await page.waitForURL('**/performers/90301');
         assert.deepEqual(opened.problems, []);
       } finally {
@@ -191,7 +219,7 @@ describe('设计决定：人物与厂牌资料页', () => {
     }
   });
 
-  it('空搜索的头像与封面分栏，搜索记录位于推荐之后，分隔线覆盖两栏', { timeout: 60_000 }, async () => {
+  it('空搜索的头像与封面分栏，搜索记录排在左栏最下面，分隔线覆盖两栏', { timeout: 60_000 }, async () => {
     const opened = await visit(browser, '/', WIDE);
     try {
       const page = opened.page;
@@ -202,21 +230,28 @@ describe('设计决定：人物与厂牌资料页', () => {
       await settle(page);
       await page.locator('#q').click();
       await page.locator('#searchMenu [data-search-recommendations] [data-search-results][data-split]').waitFor({ state: 'visible', timeout: 5_000 });
+      // 推荐是预取好的、打开就在；搜索记录随后才到，排进左栏末尾。
+      await page.waitForFunction(() => [...document.querySelectorAll('#searchMenu [data-search-col]:first-child > [data-search-group] > h3')]
+        .some((title) => title.textContent === '搜索记录'), undefined, { timeout: 5_000 });
       const split = await page.evaluate(() => {
         const results = document.querySelector('#searchMenu [data-search-results]')!;
         const [left, right] = [...results.querySelectorAll(':scope > [data-search-col]')].map((col) => col.getBoundingClientRect());
         const box = results.getBoundingClientRect();
         const line = getComputedStyle(results, '::before');
-        const history = document.querySelector('#searchMenu [data-search-root] > [data-search-group]')!;
+        // 搜索记录比推荐晚到，排在左栏末尾，到了也不把上面的往下推。
+        const groups = [...results.querySelectorAll(':scope > [data-search-col]:first-child > [data-search-group]')];
+        const history = groups.at(-1)!;
         return {
           box: box.height, leftWidth: left.width, rightWidth: right.width, line: parseFloat(line.height),
-          historyAfter: history.getBoundingClientRect().top >= box.bottom,
+          historyLabel: history.querySelector('h3')?.textContent,
+          historyAfter: history.getBoundingClientRect().top >= groups.at(-2)!.getBoundingClientRect().bottom,
           historyCount: history.querySelectorAll('[data-search-option]').length,
           offset: parseFloat(line.left) + parseFloat(line.width) / 2 - ((left.right + right.left) / 2 - box.left),
         };
       });
       assert.ok(split.rightWidth > split.leftWidth, '封面栏应比头像栏宽');
-      assert.equal(split.historyAfter, true, '搜索记录应在推荐之后');
+      assert.equal(split.historyLabel, '搜索记录', '左栏最后一组应是搜索记录');
+      assert.equal(split.historyAfter, true, '搜索记录应排在左栏推荐之后');
       assert.equal(split.historyCount, 10);
       assert.ok(Math.abs(split.line - split.box) <= 1, `分隔线高 ${split.line}px，两栏高 ${split.box}px`);
       assert.ok(Math.abs(split.offset) <= 1, `分隔线偏离两栏之间的缝 ${split.offset}px`);
@@ -323,7 +358,7 @@ describe('设计决定：人物与厂牌资料页', () => {
     }
   });
 
-  it('详情出演区每一组的标题、头像和名字共用一条左边缘', { timeout: 60_000 }, async () => {
+  it('详情出演区每一组的标题与头像共用一条左边缘，名字在头像正下方居中', { timeout: 60_000 }, async () => {
     const opened = await visit(browser, '/', DESKTOP);
     try {
       const page = opened.page;
@@ -352,15 +387,18 @@ describe('设计决定：人物与厂牌资料页', () => {
           const group = document.querySelector(`[data-item-identity] [data-id-group="${kind}"]`)!;
           const name = document.createRange();
           name.selectNodeContents(group.querySelector('[data-id-name]')!);
+          const face = group.querySelector('[data-id-face]')!.getBoundingClientRect();
+          const text = name.getBoundingClientRect();
           return [kind, {
             label: group.querySelector('[data-id-label]')!.getBoundingClientRect().left,
-            face: group.querySelector('[data-id-face]')!.getBoundingClientRect().left,
-            name: name.getBoundingClientRect().left,
+            face: face.left, faceCenter: face.left + face.width / 2,
+            nameCenter: text.left + text.width / 2,
           }];
         })));
       for (const [kind, edge] of Object.entries(edges)) {
         assert.ok(Math.abs(edge.face - edge.label) < 0.5, `${kind} 组头像左缘 ${edge.face} 不在标题左缘 ${edge.label}`);
-        assert.ok(Math.abs(edge.name - edge.label) < 0.5, `${kind} 组名字左缘 ${edge.name} 不在标题左缘 ${edge.label}`);
+        assert.ok(Math.abs(edge.nameCenter - edge.faceCenter) < 0.5,
+          `${kind} 组名字中线 ${edge.nameCenter} 不在头像中线 ${edge.faceCenter}`);
       }
       assert.deepEqual(opened.problems, []);
     } finally {
@@ -528,13 +566,15 @@ describe('设计决定：人物与厂牌资料页', () => {
           const count = classification.nextElementSibling!;
           const label = classification.getBoundingClientRect(), video = count.getBoundingClientRect();
           const glyph = classification.querySelector('svg')!.getBoundingClientRect();
+          // 行内字形取 `--icon-inline`，是所在文字字号的 1.2 倍。
+          const inline = parseFloat(getComputedStyle(classification.querySelector('svg')!).fontSize) * 1.2;
           return { first: element.firstElementChild === classification, top: [label.top, video.top],
-            edges: [label.right, video.left], glyph: [glyph.width, glyph.height] };
+            edges: [label.right, video.left], glyph: [glyph.width, glyph.height].map(side => Math.abs(side - inline) < 0.5) };
         });
         assert.equal(geometry.first, true);
         assert.ok(Math.abs(geometry.top[0]! - geometry.top[1]!) < 1, '分类与视频数量另起了行');
         assert.ok(geometry.edges[0]! <= geometry.edges[1]!, '分类没有排在视频数量左侧');
-        assert.deepEqual(geometry.glyph, [16, 16]);
+        assert.deepEqual(geometry.glyph, [true, true]);
         const measured = await layout(opened.page);
         assert.ok(measured.scrollWidth <= measured.viewportWidth + 1);
         assert.deepEqual(measured.offenders, []);
@@ -578,9 +618,7 @@ describe('设计决定：人物与厂牌资料页', () => {
 
   it('看片那一行：两枚标识隔 32px、按 22px 字高对齐；MISSAV 按它站上的排字，AV 用它的粉；第二枚带序号', { timeout: 60_000 }, async () => {
     const name = '七沢みあ';
-    const opened = await visit(browser, '/', DESKTOP);
-    try {
-      const page = opened.page;
+    const opened = await visit(browser, `/performers/${encodeURIComponent(name)}`, DESKTOP, async page => {
       await page.route(/\/api\/entity\?/, (route) => route.fulfill({ json: {
         id: 90_001, kind: 'performer', canonical_name: name, aliases: [], display_aliases: [],
         user_aliases: [], asset_count: 0, tags: [], related_performers: [], links: [], metadata: {},
@@ -590,7 +628,9 @@ describe('设计决定：人物与厂牌资料页', () => {
           { site: 'missav', label: 'MISSAV', ordinal: '2', slot: 'mark', mark: '', url: 'https://missav.ws/actresses/x' },
         ],
       } }));
-      await page.goto(new URL(`/performers/${encodeURIComponent(name)}`, page.url()).href, { waitUntil: 'load' });
+    });
+    try {
+      const page = opened.page;
       await page.locator('[data-missav-mark]').waitFor({ timeout: 15_000 });
       const marks = await page.locator('[data-entry-marks]').evaluate((row) => {
         const wordmark = row.querySelector('[data-missav-mark]')!;
@@ -668,9 +708,10 @@ describe('设计决定：人物与厂牌资料页', () => {
     }
   });
 
-  it('人物页骨架第一帧就带着这一位有的新作行与同台艺人，数据到了一次换齐、高度不变、封面不再等第二遍', { timeout: 60_000 }, async () => {
+  it('人物页首帧保留新作和同台艺人的高度，文字先呈现、封面独立加载', { timeout: 60_000 }, async () => {
     const name = '七沢みあ';
     const opened = await visit(browser, '/', DESKTOP);
+    let releaseCover = () => {};
     try {
       await opened.page.route(/\/api\/entity\/shapes/, (route) => route.fulfill({ json: {
         ok: true, entities: [{ id: 90_001, kind: 'performer', names: [name], parts: ['feed', 'costars'] }] } }));
@@ -718,9 +759,10 @@ describe('设计决定：人物与厂牌资料页', () => {
           has_cover: true, cover_frame: null, poster_box: null, release_date: '2026-09-01',
           studio: '厂牌', performers: name, source_name: '', read: false, ignored: false,
           scrape_error: null }] } }));
-      // 封面比数据晚到一截：整页要等它，而不是先换上真卡、再在封面格里微光一遍。
+      // 封面尚未返回时，身份、标题和操作仍应可见。
+      const coverWaiting = new Promise<void>(resolve => { releaseCover = resolve });
       await opened.page.route(/\/cover\?code=ABC-001/, async (route) => {
-        await new Promise((resolve) => setTimeout(resolve, 400));
+        await coverWaiting;
         await route.fulfill({ contentType: 'image/png', body: Buffer.from(PIXEL, 'base64') });
       });
       await opened.page.goto(new URL(`/performers/${encodeURIComponent(name)}`,
@@ -749,12 +791,13 @@ describe('设计决定：人物与厂牌资料页', () => {
       assert.equal(sheen, '1', '新作骨架卡的微光晚于骨架出现，中间露出封面格的黑底');
       assert.ok(before.footHeight > 0, '骨架的资料卡底没有同台艺人那一条');
       assert.equal(before.sheen, before.plain, '新作骨架的微光另起了一种颜色');
-      // 画好的页面上那一行一出现就得是真卡：再露一回它自己的骨架，就是同一行等了两遍。
+      // 身份就绪后新作可以独立等待；真卡出现后不能再退回骨架。
       await opened.page.evaluate(() => {
-        const seen = { second: false };
+        const seen = { ready: false, second: false };
         (window as unknown as { feedSeen: typeof seen }).feedSeen = seen;
         new MutationObserver(() => {
-          if (document.querySelector('[data-feed-new] .feednewskeleton')) seen.second = true;
+          if (document.querySelector('[data-feed-new] [data-feed-id]')) seen.ready = true;
+          if (seen.ready && document.querySelector('[data-feed-new] .feednewskeleton')) seen.second = true;
         }).observe(document.querySelector('#index')!, { childList: true, subtree: true });
       });
       release();
@@ -769,9 +812,14 @@ describe('设计决定：人物与厂牌资料页', () => {
       assert.equal(after.footHeight, before.footHeight, '同台艺人那一条占位和真的不一样高，资料卡会伸缩');
       assert.equal(after.busy, null);
       assert.equal(after.second, false, '整页画出来之后新作那一行又单独骨架了一轮');
-      assert.equal(after.waiting, 0, '骨架退场后封面格里又微光了一遍');
+      assert.equal(after.waiting, 1, '封面独立等待时保留卡片标题和操作');
+      releaseCover();
+      await opened.page.waitForFunction(() => !document.querySelector('[data-feed-id] .pic.imgwait'));
+      assert.equal(await row.locator('[data-feed-id] img').first().evaluate(image =>
+        (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0), true);
       assert.deepEqual(opened.problems, []);
     } finally {
+      releaseCover();
       await opened.close();
     }
   });
@@ -813,6 +861,30 @@ describe('设计决定：人物与厂牌资料页', () => {
         `悬停面离邻卡只剩 ${geometry.clearance}px，比它自己往外铺的 ${geometry.spread}px 还窄`);
       assert.equal(geometry.skeleton, geometry.home, '壳画的骨架网格的列距和首页不一样，真卡换上来时整排挪位');
       assert.equal(geometry.follow, geometry.home, '关注页视频列表的列距和首页不一样');
+      assert.deepEqual(opened.problems, []);
+    } finally {
+      await opened.close();
+    }
+  });
+
+  it('相邻两张稍后看卡的底色之间隔着整段列距', { timeout: 60_000 }, async () => {
+    const opened = await openCatalogFixture(browser, (payload) => {
+      if (payload.items.length < 2) throw new Error('演示目录不足两张卡');
+      for (const item of payload.items.slice(0, 2)) item.watch_later = true;
+    });
+    try {
+      await opened.page.mouse.move(0, 0);
+      const geometry = await opened.page.evaluate(() => {
+        const [first, second] = [...document.querySelectorAll<HTMLElement>('#grid [data-media-grid] > [data-media-card][data-watch-later]')];
+        const spread = (element: HTMLElement) => Number(/0px 0px 0px (\d+(?:\.\d+)?)px/.exec(getComputedStyle(element).boxShadow)?.[1] ?? 0);
+        return {
+          sameRow: Math.abs(first!.getBoundingClientRect().top - second!.getBoundingClientRect().top) < 1,
+          clearance: second!.getBoundingClientRect().left - spread(second!) - (first!.getBoundingClientRect().right + spread(first!)),
+          columnGap: parseFloat(getComputedStyle(first!.parentElement!).columnGap),
+        };
+      });
+      assert.ok(geometry.sameRow, '前两张稍后看卡不在同一排');
+      assert.equal(geometry.clearance, geometry.columnGap, `两张稍后看卡的底色之间只剩 ${geometry.clearance}px`);
       assert.deepEqual(opened.problems, []);
     } finally {
       await opened.close();
@@ -998,7 +1070,7 @@ describe('设计决定：人物与厂牌资料页', () => {
           })),
         } }));
         await page.reload({ waitUntil: 'load' });
-        await page.getByRole('tab', { name: 'JAV 订阅源', exact: true }).click();
+        await page.getByRole('tab', { name: '关注列表', exact: true }).waitFor();
         const card = page.getByRole('region', { name: 'JAV 订阅列表', exact: true });
         await card.getByText('1–20 / 25 个订阅源', { exact: true }).waitFor();
         assert.equal(await card.locator('[role="row"][data-key]').count(), 20);
@@ -1038,9 +1110,16 @@ describe('设计决定：人物与厂牌资料页', () => {
             document.documentElement.dataset.theme = value;
             document.documentElement.classList.toggle('dark', value === 'dark');
           }, theme);
-          await tabs.getByRole('tab', { name: 'JAV 订阅源', exact: true }).click();
+          await tabs.getByRole('tab', { name: '添加关注', exact: true }).click();
+          await page.waitForFunction(() => {
+            const host = document.querySelector('[role="tablist"][aria-label="关注管理区域"]')!;
+            const selected = host.querySelector('[aria-selected=true]')!.getBoundingClientRect();
+            const surface = host.querySelector('[data-pill-thumb]')?.getBoundingClientRect();
+            return surface && Math.abs(selected.left - surface.left) <= 1
+              && Math.abs(selected.width - surface.width) <= 1;
+          });
           const face = await tabs.evaluate((element) => {
-            const selected = element.querySelector('[aria-selected=true]')!;
+            const selected = element.querySelector('[data-pill-thumb]')!;
             return { track: getComputedStyle(element).backgroundColor,
               selected: getComputedStyle(selected).backgroundColor,
               shadow: getComputedStyle(selected).boxShadow };
@@ -1048,7 +1127,7 @@ describe('设计决定：人物与厂牌资料页', () => {
           assert.equal(face.track, 'rgba(0, 0, 0, 0)', 'Pills 容器应透明');
           assert.notEqual(face.selected, face.track, '当前分类应有独立底色');
           assert.equal(face.shadow, 'none', 'Pills 不使用浮起滑块');
-          await tabs.getByRole('tab', { name: 'JAV 订阅源', exact: true }).focus();
+          await tabs.getByRole('tab', { name: '添加关注', exact: true }).focus();
           await page.keyboard.press('Home');
           await page.keyboard.press('Enter');
           assert.equal(await tabs.getByRole('tab', { name: '关注列表', exact: true }).getAttribute('aria-selected'), 'true');
@@ -1064,7 +1143,7 @@ describe('设计决定：人物与厂牌资料页', () => {
         }));
         await tabs.getByRole('tab', { name: '添加关注', exact: true }).click();
         await page.getByRole('textbox', { name: '来源链接、名字或 id' }).fill('主题测试来源');
-        await page.getByRole('button', { name: '查找', exact: true }).click();
+        await page.getByRole('region', { name: '添加创作者关注', exact: true }).getByRole('button', { name: '查找', exact: true }).click();
         const result = page.getByText('主题测试来源', { exact: true }).locator('..');
         await result.waitFor();
         for (const theme of ['light', 'dark']) {
@@ -1087,7 +1166,7 @@ describe('设计决定：人物与厂牌资料页', () => {
       const opened = await openFollowManage(browser, viewport);
       try {
         const page = opened.page;
-        await page.getByRole('button', { name: /^来源与订阅设置/ }).click();
+        await page.getByRole('link', { name: /^来源与订阅设置/ }).click();
         await page.getByRole('tab', { name: '来源与订阅', exact: true, selected: true }).waitFor();
         await page.getByRole('region', { name: '可配置凭据', exact: true }).waitFor();
         await settle(page);

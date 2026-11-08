@@ -9,13 +9,15 @@ export { rememberRepresentatives, representativeOf } from './representatives';
 export type { RepresentativeRow } from './representatives';
 export {
   avatarInner, cardArtwork, cardIdentity, coverImage, coverUrl, detailPosterUrl, entityAvatar, entityFaceImg,
-  faceBoxAttrs, faceOrigin, facePos, javArtwork, logoUrl, mixFace, mixLabel, performerLabel, queueAvatarHtml,
-  queueThumbHtml, withVersion,
+  faceBoxAttrs, faceOrigin, facePos, frameArtwork, javArtwork, logoUrl, mixFace, mixLabel, performerLabel,
+  queueAvatarHtml, queueThumbHtml, remoteCoverUrl, withVersion,
 } from './markup';
 export type { Artwork, ArtworkKind, CoverItem, FaceFocus, FaceRef, IdentityItem } from './markup';
 export {
   avatarFrame, coverAnchor, coverFace, coverRatio, fitNativeImage, frameCachedImages, installCardArt,
   posterPanel, refitNativeImages, relayoutCovers, settleImage, upgradeCover, watchPendingImages,
 } from './framing';
+export { COVER_STATE_TITLE, coverFetchingHtml, coverStateAction, coverStateHtml } from './cover-state';
+export type { CoverState, CoverStateItem } from './cover-state';
 export { configureHoverPreview, releaseHover, releaseHoverPreviews, setHoverState, wireHover } from './hover';
 export type { HoverItem, HoverPreviewConfig } from './hover';

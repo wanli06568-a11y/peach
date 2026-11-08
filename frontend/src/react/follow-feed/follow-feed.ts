@@ -135,6 +135,8 @@ export interface FollowSource {
   provider: string;
   provider_label?: string;
   author_key?: string;
+  entity_id?: number | null;
+  entity_name?: string;
   last_status?: string;
   can_backfill?: boolean;
   backfill_page?: number;
@@ -178,9 +180,8 @@ export interface FollowCredentials { providers?: { provider: string; present?: b
 
 /* ── 取数键 ── */
 
-/** 离开关注页以后，列表在缓存里留多久。回到关注页时照这一份原样画，已经加载的几页和滚动位置
- *  才接得上；默认的 5 分钟太短，点开别处看一部片子回来就没了。 */
-export const FOLLOW_FEED_GC_MS = 30 * 60_000;
+/** 同一标签页保留已加载的关注内容，主动刷新仍按新代次取数。 */
+export const FOLLOW_FEED_GC_MS = Infinity;
 
 /** 列表的键。媒体切换是纯前端分组，不进键：换视图不重取。`revision` 是壳要求重读的代次。 */
 export function followFeedQuery(view: FollowView, revision: number) {
@@ -199,27 +200,25 @@ export function followFeedQuery(view: FollowView, revision: number) {
 
 export const FOLLOW_CREDENTIALS_KEY: QueryKey = ['follow-feed', 'credentials'];
 
-/** 凭据取不到时当作一个都没有：它只决定「需要登录会话」那句提示出不出，不该拦住整页。 */
+/** 凭据独立读取；失败保存在查询状态里，不当作未配置。 */
 export const fetchFollowCredentials = (signal?: AbortSignal) =>
-  apiGet<FollowCredentials>(FOLLOW_CREDENTIALS_URL, signal).catch((): FollowCredentials => ({ providers: [] }));
+  apiGet<FollowCredentials>(FOLLOW_CREDENTIALS_URL, signal);
 
-/** 首屏：两趟并行，挂上就是最终样子。同一个键（同一份筛选、同一个代次）缓存里还有，就是离开前
+/** 首屏条目与凭据并行，条目就绪即可显示。同一个键（同一份筛选、同一个代次）缓存里还有，就是离开前
  *  看着的那一份，原样拿来接着看，连同已经加载的几页；要重读由壳推一个新代次换键。凭据每次都重取：
  *  它在管理页上改，回到这里就该是新的。 */
 export async function prefetchFollowFeed(props: { view: FollowView; revision: number }, signal: AbortSignal) {
   const query = followFeedQuery(props.view, props.revision);
   queryClient.removeQueries({ queryKey: FOLLOW_CREDENTIALS_KEY, exact: true });
   const kept = queryClient.getQueryData(query.queryKey) !== undefined;
-  await Promise.all([
-    kept ? null : queryClient.fetchInfiniteQuery({
+  void queryClient.prefetchQuery({ queryKey: FOLLOW_CREDENTIALS_KEY, queryFn: () => fetchFollowCredentials(signal) });
+  if (!kept) await queryClient.fetchInfiniteQuery({
       queryKey: query.queryKey,
       queryFn: ({ pageParam }) => query.queryFn({ pageParam: pageParam as number, signal }),
       initialPageParam: 0,
       getNextPageParam: query.getNextPageParam,
       gcTime: FOLLOW_FEED_GC_MS,
-    }),
-    queryClient.fetchQuery({ queryKey: FOLLOW_CREDENTIALS_KEY, queryFn: () => fetchFollowCredentials(signal) }),
-  ]);
+    });
 }
 
 /** 几页合成一份，形状同壳里 `followData`：组接在后面，其余取最后一页（来源随每页刷新）。 */
@@ -432,6 +431,7 @@ export interface FollowContext {
   sources: readonly FollowSource[];
   aliases: readonly unknown[];
   credentials: ReadonlySet<string>;
+  credentialsReady?: boolean;
 }
 
 /** 仍由遗留层给的 HTML 与接线：详情用的是同一份，只有一处实现。署名、头像、来源图标与标题前后
@@ -470,7 +470,6 @@ export interface FollowFeedActions {
   loaded(drawer: FollowDrawer): void;
   openDetail(id: number): void;
   openAuthor(name: string): void;
-  openManage(): void;
   /** 多选里的一张：`range` 是 Shift 连选。 */
   toggleSelection(id: number, range: boolean): void;
   /** 照片墙「仅显示图片」与图片布局两样偏好，壳存起来再推回。 */

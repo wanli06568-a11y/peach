@@ -13,6 +13,7 @@ describe('JAV 推荐与加载结构', () => {
     const { page } = opened;
     const reads: string[] = [];
     try {
+      await page.route('**/api/result-updates', route => route.fulfill({ json: { result_versions: {} } }));
       await page.route('**/api/taste?*', route => route.fulfill({ json: { summary: {}, rankings: {} } }));
       await page.route('**/api/jav/discoveries?*', route => {
         reads.push(route.request().url());
@@ -32,6 +33,8 @@ describe('JAV 推荐与加载结构', () => {
       await search.fill('PCH');
       await section.evaluate(node => { (node as HTMLElement).dataset.returnProbe = 'kept' });
       const count = reads.length;
+      const drawer = () => page.evaluate(() => document.body.classList.contains('drawer-open'));
+      const drawerOpen = await drawer();
       for (const exit of ['close', 'escape', 'back']) {
         const link = section.locator('[data-jav-card]').nth(8).locator('[data-jav-cover-box]');
         await link.scrollIntoViewIfNeeded();
@@ -43,13 +46,14 @@ describe('JAV 推荐与加载结构', () => {
         else if (exit === 'escape') await page.keyboard.press('Escape');
         else await page.goBack();
         await page.waitForFunction(() => location.pathname === '/jav' && !document.querySelector('#stage[open]'));
+        assert.equal(await drawer(), drawerOpen, `${exit} 关闭详情时侧栏不能跟着收起`);
         assert.equal(await search.inputValue(), 'PCH');
         assert.equal(await section.locator('[data-entity-tag="library"]').getAttribute('aria-pressed'), 'true');
         assert.equal(await section.locator('[data-catalog-tag="恋足"]').getAttribute('aria-pressed'), 'true');
         assert.equal(await section.locator('[data-entity-sort="release_date"]').getAttribute('aria-pressed'), 'true');
         assert.equal(await section.getAttribute('data-return-probe'), 'kept');
-        assert.equal(reads.length, count);
-        assert.ok(Math.abs(await page.evaluate(() => window.scrollY) - top) < 2);
+        assert.equal(reads.length, count, JSON.stringify(reads));
+        await page.waitForFunction(previous => Math.abs(window.scrollY - previous) < 2, top);
       }
       assert.deepEqual(opened.problems.filter(line => !line.includes('VIDEOJS')), []);
     } finally { await opened.close() }
@@ -83,7 +87,7 @@ describe('JAV 推荐与加载结构', () => {
       });
       const sleeve = '<svg xmlns="http://www.w3.org/2000/svg" width="1480" height="1000"><rect width="1480" height="1000" fill="#135590"/><rect x="800" y="50" width="660" height="900" fill="#f4ad43"/><text x="1050" y="500" font-size="100">FRONT</text></svg>';
       await page.route('**/cover?*', route => route.fulfill({ contentType: 'image/svg+xml', body: sleeve }));
-      await page.route('https://example.com/sleeve.svg', route => route.fulfill({ contentType: 'image/svg+xml', body: sleeve }));
+      await page.route('**/cover-image?code=*', route => route.fulfill({ contentType: 'image/svg+xml', body: sleeve }));
       await page.goto(new URL('/jav?tab=discover', page.url()).href, { waitUntil: 'load' });
       await page.locator('[data-jav-skeleton-cover]').first().waitFor();
       const cover = await page.locator('[data-jav-skeleton-cover]').first().boundingBox();
@@ -91,28 +95,28 @@ describe('JAV 推荐与加载结构', () => {
       assert.ok(cover && Math.abs(cover.width / cover.height - 0.75) < 0.02, '大图封面占位应与馆藏正封同一比例');
       const skeletonWidth = await page.locator('[data-skeleton="jav-discover"]').first().boundingBox();
       const skeletonCard = await page.locator('[data-jav-skeleton-card]').first().boundingBox();
-      const searchBox = await page.locator('input[aria-label="筛选推荐"]').locator('xpath=../../..').boundingBox();
+      const searchBox = await page.locator('[data-index-search]').boundingBox();
       const main = await page.locator('#main').boundingBox();
       assert.ok(skeletonWidth && main && skeletonWidth.width >= main.width - 40);
       const pendingFilter = await page.locator('[data-jav-filter]').boundingBox();
       const pendingBottom = await page.locator('[data-jav-filter] [data-filter-row="bottom"]').boundingBox();
       const pendingSize = await page.locator('[data-jav-filter] [data-entity-layout]').boundingBox();
       const pendingShortcut = await page.locator('[data-jav-filter] [data-shortcuts-trigger]').boundingBox();
-      assert.ok(pendingShortcut && pendingShortcut.width === 30 && pendingShortcut.height === 30, JSON.stringify(pendingShortcut));
+      assert.ok(pendingShortcut && pendingShortcut.width === 32 && pendingShortcut.height === 32, JSON.stringify(pendingShortcut));
       const tagPlaceholders = page.locator('[data-jav-filter] [data-catalog-tags] [data-skeleton="tag"]');
       assert.equal(await tagPlaceholders.count(), 6);
       const pendingTags = await tagPlaceholders.evaluateAll(nodes => nodes.map(node => {
         const style = getComputedStyle(node), box = node.getBoundingClientRect();
         return { height: box.height, y: box.y, pointer: style.pointerEvents, position: style.position, overflow: style.overflow };
       }));
-      assert.ok(pendingTags.every(chip => chip.height === 30 && chip.y === pendingTags[0].y && chip.pointer === 'none'), JSON.stringify(pendingTags));
+      assert.ok(pendingTags.every(chip => chip.height === 32 && chip.y === pendingTags[0].y && chip.pointer === 'none'), JSON.stringify(pendingTags));
       assert.ok(pendingTags.every(chip => chip.position === 'relative' && chip.overflow === 'hidden'), '标签光效在各自占位内定位和裁切');
       const avatarShape = await page.locator('[data-jav-skeleton-avatar]').first().evaluate(node => {
         const style = getComputedStyle(node); return { width: style.width, height: style.height, radius: style.borderRadius };
       });
       assert.deepEqual(avatarShape, { width: '38px', height: '38px', radius: '50%' });
       assert.deepEqual(await page.locator('[data-jav-skeleton-actions]').first().locator('.skeleton').evaluateAll(nodes => nodes.map(node => getComputedStyle(node).height)), ['36px', '36px', '36px']);
-      assert.deepEqual(await page.locator('[data-jav-skeleton-card]').first().locator('[data-jav-skeleton-text]').evaluateAll(nodes => nodes.map(node => getComputedStyle(node).height)), ['20px', '20px', '20px']);
+      assert.deepEqual(await page.locator('[data-jav-skeleton-card]').first().locator('[data-jav-skeleton-text]').evaluateAll(nodes => nodes.map(node => getComputedStyle(node).height)), ['20px', '20px', '18px', '18px']);
       assert.equal(await page.locator('[data-jav-skeleton-cover]').first().evaluate(node => getComputedStyle(node).borderRadius),
         await page.locator('#main').evaluate(node => getComputedStyle(node).getPropertyValue('--surface-radius').trim()));
       assert.equal(await page.locator('[data-jav-filter] [data-entity-sep]').count(), 1);
@@ -185,7 +189,7 @@ describe('JAV 推荐与加载结构', () => {
       } else {
         assert.ok(skeletonCard && Math.abs(skeletonCard.height - heights[0]!) <= 2, JSON.stringify({ skeletonCard, heights }));
       }
-      assert.deepEqual(await search.locator('xpath=../../..').boundingBox(), searchBox);
+      assert.deepEqual(await page.locator('[data-index-search]').boundingBox(), searchBox, '页头筛选框骨架与接管后同一位置');
       assert.equal(await cards.nth(1).locator('h3').evaluate(node => getComputedStyle(node).webkitLineClamp), '2');
       const lookup = page.getByRole('button', { name: '查找资源', exact: true }).first();
       assert.notEqual(await lookup.evaluate(node => getComputedStyle(node).backgroundColor),

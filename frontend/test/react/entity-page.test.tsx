@@ -11,7 +11,7 @@ import * as legacyUi from '@peach/legacy/ui';
 import { fetchItems, itemsParams, prefetchEntityPage, type EntityPageProps } from '../../src/react/entity-page/entity-page';
 import { EntityPage } from '../../src/react/entity-page/entity-page-view';
 import { queryClient } from '../../src/react/query';
-import { buttonNamed, click, mountRoot, settle } from './render';
+import { buttonNamed, click, mountRoot, pending, settle } from './render';
 
 afterEach(() => { queryClient.clear() });
 notifyManager.setScheduler((notify) => notify());
@@ -133,14 +133,14 @@ function shellProps(patch: Partial<EntityPageProps> = {}): EntityPageProps {
       actions: {
         open: vi.fn(), openResource: vi.fn(), openShort: vi.fn(), openShorts: vi.fn(), openMix: vi.fn(),
         openEntity: vi.fn(), openUnowned: vi.fn(), toggleTag: vi.fn(), toggleSelection: vi.fn(),
-        watchLater: vi.fn(async () => {}), resourceOperation: vi.fn(async () => {}), mixRelated: vi.fn(async () => []),
+        watchLater: vi.fn(async () => {}), rate: vi.fn(async () => {}), resourceOperation: vi.fn(async () => {}), mixRelated: vi.fn(async () => []),
         canFlip: () => true, revealSource: vi.fn(async () => ''),
       },
     },
     follow: {
       helpers: { workMark: () => '', tagLabel: (tag) => tag, wireDrag: vi.fn(), wireScroller: vi.fn(),
         listSkeletonHtml: () => '<div data-test-follow-skeleton></div>', jobProgress: vi.fn() },
-      actions: { route: vi.fn(), shuffle: vi.fn(), loaded: vi.fn(), openDetail: vi.fn(), openAuthor: vi.fn(), openManage: vi.fn(),
+      actions: { route: vi.fn(), shuffle: vi.fn(), loaded: vi.fn(), openDetail: vi.fn(), openAuthor: vi.fn(),
         toggleSelection: vi.fn(), setImagesOnly: vi.fn(), setPhotoLayout: vi.fn(), canFlip: () => false, toast: vi.fn(),
         failure: vi.fn(), checkReport: vi.fn() },
     },
@@ -181,6 +181,17 @@ async function open(plan: Plan = {}, patch: Partial<EntityPageProps> = {}) {
 
 const cards = (props: EntityPageProps) =>
   [...props.hosts.body.querySelectorAll<HTMLElement>('[data-media-grid] > [data-media-card]')].map((card) => card.dataset.id);
+
+it('照片未返回时先显示人物身份并保留照片视图，响应后原位显示照片', async () => {
+  const delayed = pending<ReturnType<typeof photos>>();
+  const { host, props } = await open({ photos: () => delayed.answer }, { media: { media: 'photos', set: 0 } });
+  expect(host.textContent).toContain(NAME);
+  expect(props.hosts.body.querySelector('[data-photo-wall]')).not.toBeNull();
+  expect(props.hosts.body.querySelector('[data-media-card]')).toBeNull();
+  await delayed.release(photos(2));
+  await settle();
+  expect(props.hosts.body.querySelectorAll('[data-photo-cell]')).toHaveLength(2);
+});
 const pressedView = (props: EntityPageProps) =>
   props.hosts.filter.querySelector('[data-media-view][aria-pressed="true"]')?.getAttribute('data-media-view');
 const readout = (props: EntityPageProps) => props.hosts.filter.querySelector('[data-entity-readout]')?.textContent;
@@ -302,14 +313,14 @@ describe('换筛选与视图', () => {
     expect(page.props.hosts.body.textContent).toContain('还没有视频');
     expect(page.props.hosts.body.querySelector('[data-media-grid]')).toBeNull();
     expect(page.props.hosts.filter.querySelector('[data-entity-sort]')).toBeNull();
-    expect(buttonNamed('查看全部视频', page.props.hosts.body)).toBeNull();
+    expect(buttonNamed('清除筛选', page.props.hosts.body)).toBeNull();
   });
 
   it('筛完一部不剩：空态给一条回到全部视频的路，撤掉观看状态与交集条上的筛选', async () => {
     const page = await open({ items: (query) => items(query.get('tag') ? [] : [1, 2, 3]) },
       { filters: { tag: '巨乳', state: 'fresh', sort: 'new' } });
     expect(page.props.hosts.body.textContent).toContain('没有符合条件的视频');
-    await click(buttonNamed('查看全部视频', page.props.hosts.body));
+    await click(buttonNamed('清除筛选', page.props.hosts.body));
     expect(page.props.actions.route).toHaveBeenCalledWith(
       expect.objectContaining({ sort: 'new', tag: '', state: '', creator: '', studio: '', owner: '' }),
       expect.objectContaining({ media: 'videos' }));
@@ -467,7 +478,10 @@ describe('写操作', () => {
     let version = 'old';
     const page = await open({
       entityFor: () => entity({ image_version: version }),
-      items: () => (version === 'old' ? items([1, 2, 3]) : items([4, 5, 6])),
+      items: () => ({ ...items([1, 2, 3]), items: items([1, 2, 3]).items.map(item => ({
+        ...item, performers: [NAME], performer_entities: [{ id: 7001, name: NAME,
+          has_image: true, image_version: version }],
+      })) }),
       picked: () => { version = 'new' },
     }, {
       helpers: {
@@ -478,6 +492,7 @@ describe('写操作', () => {
     const portrait = () => page.props.hosts.filter.ownerDocument.querySelector('[data-test-portrait]')?.getAttribute('src');
     expect(portrait()).toBe('/entity-image?v=old');
     expect(cards(page.props)).toEqual(['1', '2', '3']);
+    const feedBefore = page.calls('/api/feeds/discoveries').length;
     await click(document.querySelector(`button[aria-label="更换${NAME}的头像"]`));
     await settle();
     await click(document.querySelector('[data-avatar-choice]'));
@@ -487,7 +502,11 @@ describe('写操作', () => {
     expect(page.writes.map((one) => one.url)).toEqual(['/api/avatar-frame', '/api/avatar-pick']);
     expect(portrait()).toBe('/entity-image?v=new');
     // 网格把第一页当初值存进自己的状态：只重取不换键，卡片（连同署名里她的脸）停在旧的那一份。
-    expect(cards(page.props)).toEqual(['4', '5', '6']);
+    expect(cards(page.props)).toEqual(['1', '2', '3']);
+    const avatars = [...page.props.hosts.body.querySelectorAll<HTMLImageElement>('[data-media-avatar] img')];
+    expect(avatars).toHaveLength(3);
+    expect(avatars.every(image => new URL(image.src).searchParams.get('v') === 'new')).toBe(true);
+    expect(page.calls('/api/feeds/discoveries').length).toBeGreaterThan(feedBefore);
     // 首页顶栏那排头像是壳缓存着的，也得告诉它作废。
     expect(page.props.actions.avatarChanged).toHaveBeenCalledOnce();
   });
@@ -501,13 +520,13 @@ describe('写操作', () => {
     await settle();
     // 换统称会重写整条实体的扁平投影：写之前让人看见换成什么、旧写法去哪；按钮与回执同一个动词。
     expect(legacyUi.confirmModal).toHaveBeenCalledWith(expect.objectContaining({
-      title: '更改统称', confirmLabel: '更改统称',
+      title: '更改统一名称', confirmLabel: '更改统一名称',
       body: `「しのだゆう」将成为这份档案显示的名称，「${NAME}」留作别名。作品上的署名、搜索和标签都会跟着改写。`,
     }));
     expect(page.writes[0]).toEqual({ url: '/api/entity-name', body: { kind: 'performer', name: NAME, canonical: 'しのだゆう' } });
     expect(page.props.actions.openEntity).toHaveBeenLastCalledWith('performer', 'しのだゆう');
     const [message, options] = vi.mocked(page.props.helpers.receipt).mock.calls[0]!;
-    expect(message).toBe('已把统称更改为 しのだゆう');
+    expect(message).toBe('已把统一名称更改为 しのだゆう');
     await act(async () => { await options?.undo?.() });
     expect(page.writes[1]).toEqual({ url: '/api/entity-name', body: { kind: 'performer', name: 'しのだゆう', canonical: NAME } });
     expect(page.props.actions.openEntity).toHaveBeenLastCalledWith('performer', NAME);

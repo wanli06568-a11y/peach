@@ -59,6 +59,8 @@ class CertificateFiles:
 
 def _openssl(*args: str, stdin: bytes | None = None) -> str:
     binary = shutil.which("openssl") or "/usr/bin/openssl"
+    if not Path(binary).is_file():
+        raise RuntimeError("未找到 OpenSSL，请安装并加入 PATH 后重试")
     result = subprocess.run(
         [binary, *args], input=stdin, capture_output=True,
         # 显式给 encoding：text=True 会用平台默认编码，中文输出会静默丢成空 stdout。
@@ -74,10 +76,15 @@ def _openssl(*args: str, stdin: bytes | None = None) -> str:
         "utf-8", "replace")
 
 
+def require_openssl() -> None:
+    """在必须启用 TLS 的首次设置保存前，核对签发工具可执行。"""
+    _openssl("version")
+
+
 def subject_alt_names(cert: Path) -> tuple[set[str], set[str]]:
     """返回 (DNS 名字集合, IP 集合)。读不出来就当成空，调用方会据此重签。"""
     try:
-        text = _openssl("x509", "-in", str(cert), "-noout", "-ext", "subjectAltName")
+        text = _openssl("x509", "-in", str(cert), "-noout", "-text")
     except (RuntimeError, OSError):
         return set(), set()
     return set(_SAN_DNS.findall(text)), set(_SAN_IP.findall(text))
@@ -96,12 +103,23 @@ def not_after(cert: Path) -> datetime | None:
         return None
 
 
+def has_authority_key_identifier(cert: Path) -> bool:
+    """叶子证书包含严格 X.509 校验要求的颁发者密钥标识。"""
+    try:
+        text = _openssl("x509", "-in", str(cert), "-noout", "-text")
+    except (RuntimeError, OSError):
+        return False
+    return "Authority Key Identifier" in text
+
+
 def reissue_reason(
     files: CertificateFiles, names: set[str], addresses: set[str], now: datetime | None = None,
 ) -> str | None:
     """需要重签就返回原因，不需要返回 None。"""
     if not files.cert.is_file() or not files.key.is_file():
         return "服务器证书不存在"
+    if not has_authority_key_identifier(files.cert):
+        return "证书缺少颁发者密钥标识"
     have_names, have_addresses = subject_alt_names(files.cert)
     missing = (names - have_names) | (addresses - have_addresses)
     if missing:
@@ -132,6 +150,8 @@ def reissue(
         "keyUsage = critical, digitalSignature, keyEncipherment\n"
         "extendedKeyUsage = serverAuth\n"
         "basicConstraints = critical, CA:FALSE\n"
+        "subjectKeyIdentifier = hash\n"
+        "authorityKeyIdentifier = keyid, issuer\n"
     )
     with tempfile.TemporaryDirectory() as raw:
         work = Path(raw)
@@ -216,3 +236,34 @@ def ensure_certificate(
     LOGGER.info("重签服务器证书：%s", reason)
     reissue(files, common_name, names, wanted)
     return reason
+
+
+@dataclass(frozen=True)
+class PublicCa:
+    """给其他设备安装的根证书：只有公开部分，私钥从不经过这里。"""
+    pem: bytes
+    fingerprint: str
+    not_after: datetime
+
+
+def public_ca(ca_cert: Path) -> PublicCa | None:
+    """读本机 CA 的公开证书；文件不在返回 None，内容不是证书时抛 ValueError。
+
+    下发的字节由 `cryptography` 解析后重新编码，不是把文件原样吐出去：哪怕有人把私钥拼进了
+    这份 `.crt`，发出去的也只有证书本身。指纹按 openssl `-fingerprint -sha256` 的写法给出，
+    冒号分隔、大写，便于和手机上看到的逐字比对。
+    """
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+
+    try:
+        data = ca_cert.read_bytes()
+    except FileNotFoundError:
+        return None
+    certificate = x509.load_pem_x509_certificate(data)
+    digest = certificate.fingerprint(hashes.SHA256()).hex().upper()
+    return PublicCa(
+        pem=certificate.public_bytes(serialization.Encoding.PEM),
+        fingerprint=":".join(digest[index:index + 2] for index in range(0, len(digest), 2)),
+        not_after=certificate.not_valid_after_utc,
+    )

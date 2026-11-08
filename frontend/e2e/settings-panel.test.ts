@@ -49,6 +49,33 @@ describe('设置面板', () => {
   before(async () => { browser = await launch() });
   after(async () => { await browser?.close() });
 
+  it('持久标注开关不自动加载工具，明确开启仅在当前页面有效', { timeout: 60_000 }, async () => {
+    let loads = 0;
+    const opened = await visit(browser, '/', DESKTOP, async (page) => {
+      await page.addInitScript(() => localStorage.setItem('peach.agentation', 'on'));
+      await page.route('**/dev/agentation.js', (route) => {
+        loads += 1;
+        return route.fulfill({ contentType: 'application/javascript', body: 'document.body.dataset.annotationTool = "ready";' });
+      });
+    });
+    const { page } = opened;
+    try {
+      await page.waitForFunction(() => localStorage.getItem('peach.agentation') === null);
+      assert.equal(loads, 0);
+      assert.equal(await page.evaluate(() => localStorage.getItem('peach.agentation')), null);
+      await page.goto(`${requiredEnv('PEACH_E2E_ORIGIN')}/?agentation=on`);
+      await page.waitForFunction(() => document.body.dataset.annotationTool === 'ready');
+      assert.equal(loads, 1);
+      assert.equal(new URL(page.url()).searchParams.has('agentation'), false);
+      await page.reload();
+      await page.locator('#settingsBtn').waitFor({ state: 'attached' });
+      await settle(page);
+      assert.equal(loads, 1);
+      assert.equal(await page.evaluate(() => document.body.dataset.annotationTool), undefined);
+      assert.deepEqual(opened.problems, []);
+    } finally { await opened.close(); }
+  });
+
   it('五个偏好分区各自显示对应设置，Peach 配置单独直达配置页', { timeout: 60_000 }, async () => {
     const opened = await openHome(browser);
     const { page } = opened;
@@ -127,6 +154,44 @@ describe('设置面板', () => {
     } finally {
       await context.close();
     }
+  });
+
+  it('改过的 SFW 快捷键按物理键位生效，原来的 Shift+S 不再切换', { timeout: 60_000 }, async () => {
+    const opened = await openHome(browser);
+    try {
+      const page = opened.page;
+      const censored = () => page.evaluate(() => document.body.classList.contains('censor'));
+      await page.evaluate(() => localStorage.setItem('peach.sfw-shortcut', 'Alt+KeyH'));
+      await page.reload({ waitUntil: 'load' });
+      await settle(page);
+      await page.locator('body').click({ position: { x: 1, y: 1 } });
+      await page.keyboard.press('Shift+S');
+      assert.equal(await censored(), false);
+      await page.keyboard.press('Alt+KeyH');
+      assert.equal(await censored(), true);
+      await openPanel(page);
+      await page.locator(PANEL).getByRole('tab', { name: '内容显示', exact: true }).click();
+      assert.equal(await page.locator(`${PANEL} [data-shortcut-keys]`).innerText(), 'Alt+H');
+      assert.deepEqual(opened.problems, []);
+    } finally { await opened.close() }
+  });
+
+  it('Shift+S 在页面上切换 SFW 并记住，在输入框里不切换', { timeout: 60_000 }, async () => {
+    const opened = await openHome(browser);
+    try {
+      const page = opened.page;
+      const censored = () => page.evaluate(() => document.body.classList.contains('censor'));
+      await page.locator('body').click({ position: { x: 1, y: 1 } });
+      await page.keyboard.press('Shift+S');
+      assert.equal(await censored(), true);
+      assert.equal(await page.evaluate(() => localStorage.getItem('peach-censor')), '1');
+      await page.keyboard.press('Shift+S');
+      assert.equal(await censored(), false);
+      await page.locator('#q').focus();
+      await page.keyboard.press('Shift+S');
+      assert.equal(await censored(), false, '在搜索框里打大写 S 不该切换 SFW');
+      assert.deepEqual(opened.problems, []);
+    } finally { await opened.close() }
   });
 
   it('界面音效关掉后点按不再出声，打开后又出声', { timeout: 60_000 }, async () => {

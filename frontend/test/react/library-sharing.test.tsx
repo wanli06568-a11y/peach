@@ -1,12 +1,22 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { LibrarySharingSettings, type LibrarySharingState } from '../../src/react/settings/library-sharing-settings';
-import { buttonNamed, click, mount, settle, switches } from './render';
+import { actionOrder, buttonNamed, click, mount, settle, switches } from './render';
 
 const initial: LibrarySharingState = { enabled: false, available: true, schema: 4,
   fields: ['作品编号、标签、评分与全部偏好维度'], notice: '匿名处理后上传馆藏与各类偏好明细。' };
 
 describe('馆藏与口味分享的明确同意', () => {
+  it.each([
+    [{ status: 'waiting-data', attempted: false }, '等待可分析的馆藏或偏好数据。'],
+    [{ status: 'failed', attempted: false }, '馆藏与口味上传未完成，将自动重新准备。'],
+    [{ status: 'failed', attempted: true }, '馆藏与口味上传失败，本周不再发送。'],
+    [{ status: 'unknown', attempted: true }, '未取得上传结果，本周不再发送。'],
+  ])('按实际发送状态显示反馈 %j', async (last_attempt, message) => {
+    const host = await mount(<LibrarySharingSettings initial={{ ...initial, enabled: true, last_attempt }} receipt={vi.fn()} />);
+    expect(host.textContent).toContain(message);
+  });
+
   it('开关始终可见，上传预览和明确同意完整后才能开启', async () => {
     const fetcher = vi.fn(async (url: string) => ({ ok: true, json: async () => url.endsWith('/preview')
       ? { data: { library: [{ code: 'EXM-001' }], preferences: {}, coverage: { uncoded_items: 0 } }, bytes: 80, token: 'preview-token', schema: 4 }
@@ -20,13 +30,14 @@ describe('馆藏与口味分享的明确同意', () => {
     await click(switches(host)[0]);
     expect(fetcher).not.toHaveBeenCalled();
     expect(switches(host)[0]?.checked).toBe(false);
-    expect(host.textContent).not.toContain(initial.fields[0]);
+    expect(host.querySelector('details')?.open).toBe(false);
     expect(host.querySelector('input[type="checkbox"]:not([role="switch"])')).toBeNull();
     await click(buttonNamed('预览上传内容', host));
     await settle();
     expect(fetcher).toHaveBeenCalledTimes(1);
-    expect(host.textContent).toContain('KiB。不含账号、设备、文件路径和浏览器历史记录等个人数据。');
+    expect(host.textContent).toContain('随机标识用于实例去重');
     expect((buttonNamed('同意并开启上传', host) as HTMLButtonElement).disabled).toBe(true);
+    expect(actionOrder(buttonNamed('同意并开启上传', host)!.parentElement)).toEqual(['取消', '预览上传内容', '同意并开启上传']);
     await click(host.querySelector('input[type="checkbox"]:not([role="switch"])'));
     await click(buttonNamed('同意并开启上传', host));
     await settle();
@@ -34,7 +45,7 @@ describe('馆藏与口味分享的明确同意', () => {
     expect(JSON.parse(String(call[1].body))).toEqual({ enabled: true, schema: 4, consent: true, preview_token: 'preview-token' });
     expect(receipt).toHaveBeenCalledWith('已保存馆藏与口味上传选项');
     expect(switches(host)[0]?.checked).toBe(true);
-    expect(host.textContent).not.toContain(initial.fields[0]);
+    expect(host.querySelector('details')?.open).toBe(false);
     expect(host.querySelector('pre')).toBeNull();
     expect(host.querySelector('input[type="checkbox"]:not([role="switch"])')).toBeNull();
     expect(buttonNamed('预览上传内容', host)).not.toBeNull();
@@ -63,5 +74,16 @@ describe('馆藏与口味分享的明确同意', () => {
     expect(host.querySelector('[role="alert"]')?.textContent).toContain('读取失败');
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(receipt).not.toHaveBeenCalled();
+  });
+
+  it('刷新未取得时保留原参与状态，不把缺失响应当作关闭或成功', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({ section_errors: {} }) })));
+    const host = await mount(<LibrarySharingSettings initial={{ ...initial,
+      participation: { status: 'unknown', pending_state: null } }} receipt={vi.fn()} />);
+    await click(buttonNamed('刷新发送状态', host));
+    await settle();
+    expect(host.querySelector('[role="alert"]')?.textContent).toContain('馆藏上传状态未取得');
+    expect(host.querySelector('[aria-label="参与状态"]')?.textContent).toBe('结果未取得');
+    expect(host.querySelector('[aria-label="参与状态"]')?.getAttribute('data-status-tone')).toBe('warning');
   });
 });

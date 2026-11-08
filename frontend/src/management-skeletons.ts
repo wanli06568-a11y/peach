@@ -1,4 +1,6 @@
 import { islandButton, islandSelect, islandSummary } from './island-skeleton';
+import { RESULT_PANEL, RESULT_SECTION } from './react/components/fieldset';
+import { REPAIR_CENTER_INTRO } from './react/settings/repair-center-data';
 
 const placeholder = 'relative overflow-hidden skeleton-sheen bg-background-tertiary-default rounded-lg';
 const text = (width = '60%') => `<span class="${placeholder} inline-block max-w-full align-middle" style="width:${width};height:1em"></span>`;
@@ -85,15 +87,15 @@ export function duplicatesSkeleton(): string {
     <div data-collection-summary class="mb-5 flex items-end justify-between gap-4 rounded-surface bg-background-secondary-default px-6 py-5 max-compact:flex-col max-compact:items-start max-compact:gap-3 max-compact:p-4 dark:bg-background-primary-default">
       <div class="flex min-w-0 flex-col gap-2"><span class="text-body-regular text-text-secondary">重复内容</span><strong class="text-display-4-medium">${text('4em')}</strong></div><p class="text-body-regular text-text-secondary">${text('12em')}</p>
     </div>
-    <div data-filter-glass data-glass-pane class="mb-5.5 flex flex-wrap items-center gap-x-2.5 gap-y-2 px-4 py-2.5"><h3 class="mr-1 text-body-medium">批量保留</h3>${['全部保留最大', '全部保留最长'].map(label => `<button ${wait} class="h-7.5 rounded-full border border-separator-border px-3 text-body-2-medium">${label}</button>`).join('')}</div>
+    <div data-filter-glass data-glass-pane class="mb-5.5 flex flex-wrap items-center gap-x-2.5 gap-y-2 px-4 py-2.5"><h3 class="mr-1 text-body-medium">批量保留</h3>${['全部保留最大', '全部保留最长'].map(label => `<button ${wait} class="h-8 rounded-full border border-separator-border px-3 text-body-2-medium">${label}</button>`).join('')}</div>
     ${group.repeat(2)}
   </div></div>`;
 }
 
 /** 高清版首屏：摘要面与六张待升级的卡，类名同 `QualityGoalsPage` 落地那一版（卡面是
- *  `cardClass({ padding: 'none', bordered: 'soft' })`），接管那一拍间距、卡高与底色都不跳。 */
+ *  `cardClass({ padding: 'none' })`），接管那一拍间距、卡高与底色都不跳。 */
 export function qualityGoalsSkeleton(): string {
-  const card = `<li class="min-w-0 bg-background-secondary-default rounded-2xl shadow-card border border-separator-border flex flex-col gap-3 p-3">
+  const card = `<li class="min-w-0 bg-background-secondary-default rounded-2xl shadow-card flex flex-col gap-3 p-3">
     <div class="flex min-w-0 gap-4"><span class="${placeholder} inline-grid w-card-cover shrink-0 aspect-card-cover rounded-2lg"></span>
       <div class="flex min-w-0 flex-1 flex-col gap-1.5"><h3 class="text-headline-medium">${text('80%')}</h3><p class="text-body-2-regular">${text('60%')}</p></div>
     </div>
@@ -102,5 +104,22 @@ export function qualityGoalsSkeleton(): string {
   return `<div class="peach-react"><div class="mx-auto flex w-full max-w-board flex-col gap-8">
     ${islandSummary('待升级')}
     <ul class="card-grid-cover gap-5">${card.repeat(6)}</ul>
+  </div></div>`;
+}
+
+/** 「修复与迁移」：页首说明与分区标题照写，结果面板里几行占位，和 `react/settings/repair-center.tsx`
+ *  的 `Row` 同一串类名：左边标题与说明，右边读数与状态标签。项数等数据才知道，按常见的三项画。 */
+export function repairCenterPanelSkeleton(rows = 3): string {
+  const row = `<div class="${RESULT_SECTION} flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+    <div class="flex min-w-0 flex-1 flex-col gap-0.5"><span class="text-body-medium">${text('7em')}</span><span class="text-body-2-regular">${text('62%')}</span></div>
+    <div class="flex shrink-0 items-center gap-3"><span class="text-body-2-regular">${text('4em')}</span><span class="${placeholder} inline-block h-6 w-14 rounded-full"></span></div>
+  </div>`;
+  return `<div class="${RESULT_PANEL}">${row.repeat(rows)}</div>`;
+}
+
+export function repairCenterSkeleton(): string {
+  return `<div class="peach-react"><div class="mx-auto flex w-full max-w-board flex-col gap-8">
+    <p class="text-body-regular text-text-secondary">${REPAIR_CENTER_INTRO}</p>
+    <section class="flex flex-col gap-4"><h2 class="text-title-2-medium! m-0! text-text-primary">修复项目</h2>${repairCenterPanelSkeleton()}</section>
   </div></div>`;
 }

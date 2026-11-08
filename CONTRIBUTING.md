@@ -1,15 +1,31 @@
 # 参与 Peach
 
-Issues and pull requests are welcome. Small fixes (bugs, copy, documentation, tests) can go straight to a PR; large changes — new pages, new connectors, contract or data-layer changes, anything an ADR covers — should be discussed in an issue first. Read [`AGENTS.md`](AGENTS.md) before opening a PR: it is the single entry point for development rules, and reviews follow it. Each platform has exactly one test entry point: `& .\scripts\test.ps1` on Windows and `./scripts/test.sh` on macOS/Linux. By submitting a contribution you agree to license it under AGPL-3.0-or-later. The rest of this document is in Chinese.
+Issues and pull requests are welcome. Maintainer-authored changes follow the same PR workflow. Small fixes (bugs, copy, documentation, tests) can go straight to a PR; complex bugs and large changes — new features, default behavior, connectors, contract or data-layer changes, anything an ADR covers — should have an issue first. Read [`AGENTS.md`](AGENTS.md) before opening a PR: it is the single entry point for development rules, and reviews follow it. Issues follow the templates in [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/); the terms and delivery format in `AGENTS.md` are for code changes only. Each platform has exactly one test entry point: `& .\scripts\test.ps1` on Windows and `./scripts/test.sh` on macOS/Linux. By submitting a contribution you agree to license it under AGPL-3.0-or-later. The rest of this document is in Chinese.
 
-Peach 是单人自托管应用，由一个人维护。欢迎提 Issue 和 PR。
+Peach 是单人自托管应用，由一个人维护。欢迎提 Issue 和 PR。维护者自己的改动也遵循同一套流程，通过 PR 保留审阅与验证记录。
 
 - 小修（修缺陷、改文案、补文档、补测试）可以直接提 PR。
-- 大改动（新页面、新连接器、改接口约定或数据层、涉及 ADR 的方向）请先开 issue 讨论，免得做完才发现和既定设计冲突。
+- 复杂缺陷和大改动（新功能、新页面、新连接器、默认行为、接口约定或数据层、涉及 ADR 的方向）先有 issue，复用已有问题记录。
 
 提交贡献即表示同意以 AGPL-3.0-or-later 授权。
 
 ## 开 Issue
+
+Issue 按 [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/) 的模板写：缺陷用 `bug_report.md`，建议用 `feature_request.md`。保留模板的章节标题和顺序，逐节填写；可选章节没有内容可以删掉，原因分析等额外信息放在模板章节之后。从网页「New issue」选模板最省事。用 AI 工具或命令行提交时，复制模板文件，去掉开头的 `---` 信息块和 `<!-- -->` 注释，填好后提交：
+
+```text
+gh issue create --repo peach-mitao/peach --title "<标题>" --type Bug --body-file <填好的模板>
+```
+
+建议把 `Bug` 换成 `Feature`；没有设置类型的权限时省略 `--type`，按模板章节写的 issue 会自动补上类型。正文写给维护者和其他用户看，用通用技术说法；`AGENTS.md` 与技能里的术语和交付格式只用于改代码，不用于 issue。外部新 issue 无论通过网页、命令行还是 API 提交，缺少模板章节都会自动关闭；已有类型不豁免检查，按模板补齐章节后自动重开。
+
+Write issues with the templates in [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/): `bug_report.md` for bugs, `feature_request.md` for features. Keep the template headings in order and fill in each one; drop optional sections you have nothing for, and put extra material such as a root-cause analysis after the template sections. The web form under New issue is the easiest path. When an AI tool or the command line submits the issue, copy the template file, remove the leading `---` block and the `<!-- -->` comments, fill it in, and submit it with the command above; use `--type Feature` for features, and leave out `--type` if you lack permission to set it: issues that follow a template get their type automatically. Write for maintainers and other users in plain technical language; the terms and delivery format in `AGENTS.md` and the skills are for code changes, not issues. New external issues without template sections are closed automatically regardless of their submission method or existing type, and reopen once the sections are filled in.
+
+模板检查只在新建或修改正文时执行，并在执行时读取当前正文和开闭状态。Issue 的看板变更每小时集中同步，新条目先通过模板检查再加入看板。已有条目因待补模板关闭时，关闭后的 2 小时内保持原位置；到期仍未补齐并重开，在后续同步时移到「已取消」。PR、主线提交与发布事件仍可触发同步，同样遵守这段缓冲。
+
+公开截图、录屏和附件使用不含露骨画面的演示资料，并遮盖隐私信息；不要上传影片、封面原图或数据库。公开内容与素材许可要求见[文档规范](docs/WRITING.md#公开与私有记录)。
+
+Use demo data without sexually explicit imagery in public screenshots, recordings and attachments. Redact private information, and do not upload videos, original cover images or databases.
 
 - **报缺陷**：写清 Peach 版本或构建、系统版本及架构、安装方式、复现步骤、期望结果和实际结果，附上完整报错。无法稳定复现时说明发生条件，不要求自行判断根因。Python 版本仅用于源码部署，可选；`/healthz` 返回也可选，服务无法启动时写「无法访问」即可。贴日志或诊断报告前先遮盖本机路径、网络地址、账号及凭据。
 - **提需求**：写清问题和使用场景。开放需求见 [公开路线图](https://github.com/orgs/peach-mitao/projects/7)，设计边界见 [总体架构](docs/ARCHITECTURE.md#明确不做)。涉及多用户、云托管、微服务或 PostgreSQL 的提案，先讨论是否需要新增 ADR。
@@ -41,7 +57,7 @@ Peach 是单人自托管应用，由一个人维护。欢迎提 Issue 和 PR。
 
 `status:needs-info` 表示缺少定位所需的信息，回复中应列明具体缺口；`status:needs-verification` 表示修复已有可下载版本，等待目标环境验证。两者互斥，条件消失时移除。未处理、处理中、已关闭不另设状态标签。没有明确影响的平台或模块可以留空。
 
-`bug`、`enhancement` 保留给 PR 和未设置 Type 的 issue；使用 Type 的新 issue 不重复添加同义标签。`dependencies`、`javascript`、`github_actions`、`python:uv` 用于对应依赖更新，`documentation`、`accessibility` 等按实际内容使用。标签名称保持稳定，颜色和双语说明以清单为准；修改清单时同步 GitHub 并回读核对，不批量删除或重命名已有标签。
+`bug`、`enhancement` 保留给 PR 和未设置 Type 的 issue；使用 Type 的新 issue 不重复添加同义标签。`dependencies`、`javascript`、`github_actions`、`python:uv`、`docker` 用于对应依赖更新，`documentation`、`accessibility` 等按实际内容使用。标签名称保持稳定，颜色和双语说明以清单为准；修改清单时同步 GitHub 并回读核对，不批量删除或重命名已有标签。
 
 ### 关闭、重开与关联
 
@@ -59,7 +75,23 @@ GitHub 的字段与模板机制见 [Issue types](https://docs.github.com/en/issu
 
 1. 不用 `git add .`、`git add -A`、目录路径或通配符，只暂存这次改动的文件。
 2. 实现和它的测试放在同一个提交里。
-3. 一个 PR 只做一件事，并在 PR 模板的「影响面」表里逐项说明（数据层、API、页面、接口约定、测试、文档），不适用的也写出来。
+3. 一个 PR 对应可独立验收的目标。同一目标的实现、测试及必要的 CI、升级补修放在同一个 PR，按逻辑分提交并共享验证；无关需求独立评审，确需拆分时说明独立交付或隔离的理由。在「影响面」表里说明数据层、API、页面、契约、测试和文档的实际影响，不适用的写明原因。
+
+### 变更性质与行为边界
+
+修复说明具体触发、实际错误和既有预期的依据；新功能、主动调整默认行为或设计时说明使用场景、现有能力的不足与取舍，取得维护者对方向的确认。恢复已确认预期的修复按常规验证与集成流程处理。混合 PR 分别说明各部分，不能仅凭 `fix` 标题或测试通过判定为修复。
+
+范围按实际资源和操作判断：同一作品不代表所有版本共享同一份图片；共享资源与独立资源分别验证。改变图片内容、数据归属或处理范围时说明对既有用户的影响，控制项按实际场景设计，不要求所有行为都新增开关。
+
+### AI 参与与提交责任
+
+允许 AI 辅助方案、代码、测试、文档和 PR 文字。使用时简短说明参与范围，以及提交者实际检查的内容；不要求提供提示词或模型名称，提交里也不需要加 AI 署名。
+
+维护者采纳社区补丁时保留原作者为提交作者，用 `Source-PR`、`Original-Commit` 记录来源，不替贡献者补加 AI 署名。提交里的智能体署名表示维护侧智能体的改写或补充，只在它确实改动了代码时出现，不代表贡献者使用了 AI。署名门槛只检查维护者本机提交者自己的提交，见工作树交付约定。
+
+提交者对最终内容负责，能够解释设计与取舍，并核对代码、说明和验证结果。未运行的测试、跳过项、未取得的样本和待原环境验收的部分在「测试结果」中明确标注，不把推测写成已验证结论。维护者按影响和风险评审，授权与确认边界见 `AGENTS.md`。
+
+是否使用 AI 不凭文风、标签或提交通道推断；反馈按事实、上下文和可追查证据处理。报告者无需先使用 AI 排查，也无需自行确定根因。
 
 ## 测试
 

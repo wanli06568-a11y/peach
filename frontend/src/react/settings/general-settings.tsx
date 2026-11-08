@@ -1,4 +1,4 @@
-/* 「应用与维护」中的开机自启、桌面快捷方式与版本更新。 */
+/* 「应用与维护」的前半段：版本更新与开机自启。版本状态最常看，排在整组最前，自动更新的档位紧跟其后。 */
 import { useState, type FormEvent } from 'react';
 
 import { SettingsRow } from '@/components/application/settings/settings-rows';
@@ -10,23 +10,17 @@ import type { ConfigurationGroupProps, StartupState } from '../bundle';
 import { groupRoot } from './configuration-panel';
 import { AutomaticUpdates } from './maintenance-settings';
 import { ReleaseUpdates } from './release-updates';
-import { RemoteReportingSettings } from './remote-reporting-settings';
-import { LibrarySharingSettings } from './library-sharing-settings';
+import { UpgradeRepairs } from './upgrade-repairs';
 import { ErrorText, Footer, Help, Rows, Section, Stack } from './section';
 import { busyProps, useAction } from './use-action';
 
 export function GeneralSettings({ data, receipt, panel }: ConfigurationGroupProps) {
   return (
     <div {...groupRoot(panel)}>
-      {data.remote_reporting || data.library_sharing ? <Section title="数据上传">
-        {data.remote_reporting ? <RemoteReportingSettings initial={data.remote_reporting} receipt={receipt} /> : null}
-        {data.library_sharing ? <div className="border-t border-separator-border">
-          <LibrarySharingSettings initial={data.library_sharing} receipt={receipt} />
-        </div> : null}
-      </Section> : null}
-      {data.startup ? <StartupSettings startup={data.startup} receipt={receipt} /> : null}
-      {data.automatic_updates ? <AutomaticUpdates initial={data.automatic_updates} receipt={receipt} /> : null}
       {data.updates ? <ReleaseUpdates initial={data.updates} initialJob={data.update_job} /> : null}
+      <UpgradeRepairs />
+      {data.automatic_updates ? <AutomaticUpdates initial={data.automatic_updates} receipt={receipt} /> : null}
+      {data.startup ? <StartupSettings startup={data.startup} receipt={receipt} /> : null}
     </div>
   );
 }
@@ -48,12 +42,12 @@ export function StartupSettings({ startup, receipt }: { startup: StartupState; r
   };
 
   return (
-    <Section title="开机自启" onSubmit={submit}>
+    <Section guide="startup" title="开机自启" onSubmit={submit}>
       <Rows>
         <SettingsRow label="开机后启动 Peach">
           <Switch aria-label="开机后启动 Peach" isSelected={enabled} isDisabled={!startup.available} onChange={setEnabled} />
         </SettingsRow>
-        <SettingsRow label="只启动托盘，不打开网页">
+        <SettingsRow label="只启动托盘，不打开网页" description="开机后在后台运行，需要时从托盘打开页面。">
           <Switch aria-label="只启动托盘，不打开网页" isSelected={silent} isDisabled={!startup.available || !enabled} onChange={setSilent} />
         </SettingsRow>
         <SettingsRow label="在桌面创建快捷方式" description={startup.desktop_message || undefined}>

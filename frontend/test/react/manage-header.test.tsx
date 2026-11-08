@@ -12,6 +12,7 @@ import type { BatchDockApi, BatchDockHost } from '../../src/react/batch-dock/bat
 import type { ManageHeaderApi, ManageHeaderHost } from '../../src/react/manage-header/manage-header-api';
 import type { ShellActions } from '../../src/react/router/shell-actions';
 import { click } from './render';
+import { createSettingsStore } from '../../src/settings-store';
 
 // 首次导入会编译路由表带进来的整棵页面子树，编译等待使用独立的有限窗口；之后每条用例重新装载只重跑模块。
 const REACT_IMPORT_TIMEOUT_MS = 30_000;
@@ -68,7 +69,7 @@ function shellActions(): ShellActions {
     openItem: vi.fn(), openEntity: vi.fn(), openTag: vi.fn(), openTasteSignal: vi.fn(), navigate: vi.fn(),
     openManage: vi.fn(), managePath: vi.fn(() => ''), openFollow: vi.fn(), receipt: vi.fn(), toast: vi.fn(),
     failure: vi.fn(), revealSource: vi.fn(async () => ''), reopenTutorial: vi.fn(async () => {}),
-    requestConfigurationSection: vi.fn(), routeReview: vi.fn(),
+    routeReview: vi.fn(),
     routeFollowManage: vi.fn(), saveFollowPreference: vi.fn(), srcBadge: () => '', routeIndex: vi.fn(),
     savePeopleLayout: vi.fn(), exitSelectMode: vi.fn(), personAvatar: vi.fn(() => ({ html: '', face: '' })),
     authorAvatar: vi.fn(() => ''), showIndexTags: vi.fn(), openFollowAuthor: vi.fn(), openFollowTag: vi.fn(),
@@ -100,7 +101,8 @@ function headerHost(first: ManageHeaderProps): ManageHeaderHost {
   root.setAttribute('data-manage-header', '');
   document.body.append(root);
   root.innerHTML = manageHeaderSkeletonHtml(first);
-  return { root, openManage: vi.fn(), openDataCleanup: vi.fn(), emptyTrash: vi.fn() };
+  return { root, store: createSettingsStore('test.manage-order', { manageOrder: ['stats', 'cleanup'] }),
+    openManage: vi.fn(), openPath: vi.fn(), emptyTrash: vi.fn() };
 }
 
 /** 照壳的 `mountManageHeader` 接上：铺骨架、装载，拿到句柄就把手上那份推进去。 */
@@ -147,11 +149,13 @@ describe('换手', () => {
     expect(r.managedEntry(host.root)?.path).toBe('manage-header');
     expect(host.root.childNodes.length, '骨架清掉了，首帧没有 props、画成空').toBe(0);
 
-    act(() => { api!.render(first) });
+    await act(async () => { api!.render(first) });
     const shape = (node: ParentNode) => [...node.querySelectorAll('*')]
+      .filter(el => !el.hasAttribute('data-pill-thumb'))
       .map((el) => [el.tagName, ...[...el.attributes].map((a) => a.name).filter((name) => name.startsWith('data-') || name.startsWith('aria-')).sort()].join(' '))
       .filter((line) => !line.startsWith('USE'));
     expect(shape(host.root)).toEqual(shape(skeleton));
+    expect(host.root.querySelector('[data-pill-thumb]')).not.toBeNull();
     expect(title(host.root)).toBe('垃圾文件');
   });
 
@@ -219,6 +223,17 @@ describe('换手', () => {
 });
 
 describe('管理条与面包屑', () => {
+  it('横向排序更新共享设置并保留当前页面', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ manageOrder: ['cleanup', 'stats'] }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } })));
+    const { root, host } = await setup(props('stats', '/stats'));
+    const target = root.querySelector<HTMLButtonElement>('[data-manage="cleanup"]')!;
+    await act(async () => { target.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', altKey: true, bubbles: true })) });
+    expect([...root.querySelectorAll('[data-manage]')].map(node => node.getAttribute('data-manage'))).toEqual(['cleanup', 'stats']);
+    expect(host.store.value.manageOrder.indexOf('cleanup')).toBeLessThan(host.store.value.manageOrder.indexOf('stats'));
+    expect(host.openManage).not.toHaveBeenCalled();
+  });
+
   it('按下项跟着当前区走，点一项回到壳的 openManage', async () => {
     const { root, host, render } = await setup(props('stats', '/stats'));
     const pressed = () => [...root.querySelectorAll('[data-manage][aria-pressed="true"]')].map((node) => node.getAttribute('data-manage'));
@@ -236,7 +251,10 @@ describe('管理条与面包屑', () => {
     const { root, render } = await setup(first);
     const pressed = () => [...root.querySelectorAll('[data-manage][aria-pressed="true"]')].map((node) => node.getAttribute('data-manage'));
     expect(pressed()).toEqual(['cleanup']);
-    expect(manageHeaderSkeletonHtml(first)).toContain('data-manage="cleanup" aria-pressed="true"');
+    const skeleton = document.createElement('div');
+    skeleton.innerHTML = manageHeaderSkeletonHtml(first);
+    expect([...skeleton.querySelectorAll('[data-manage][aria-pressed="true"]')]
+      .map((node) => node.getAttribute('data-manage'))).toEqual(pressed());
     render(props('cleanup', '/quality-goals'));
     expect(pressed()).toEqual(['cleanup']);
     render(props('stats', '/stats'));
@@ -255,10 +273,10 @@ describe('管理条与面包屑', () => {
       return event.defaultPrevented;
     };
     expect(fire({})).toBe(true);
-    expect(host.openDataCleanup).toHaveBeenCalledTimes(1);
+    expect(host.openPath).toHaveBeenCalledWith('/data-cleanup');
     expect([fire({ ctrlKey: true }), fire({ metaKey: true }), fire({ shiftKey: true }), fire({ button: 1 })])
       .toEqual([false, false, false, false]);
-    expect(host.openDataCleanup).toHaveBeenCalledTimes(1);
+    expect(host.openPath).toHaveBeenCalledTimes(1);
   });
 });
 

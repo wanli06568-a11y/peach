@@ -90,14 +90,98 @@ class SettingsRoundTripTests(unittest.TestCase):
             con.close()
         return json.loads(raw)
 
+    def test_manage_order_persists_independently_and_appends_missing_entries(self):
+        original_sidebar = q_settings(self.contract)['sidebarOrder']
+        saved = w_settings(self.contract, {'manageOrder': ['activity', 'stats', 'activity', 'invalid', 3]})
+        self.assertEqual(saved['manageOrder'], ['activity', 'stats', 'taste', 'cleanup', 'follow', 'configuration'])
+        self.assertEqual(q_settings(self.contract)['manageOrder'], saved['manageOrder'])
+        self.assertEqual(q_settings(self.contract)['sidebarOrder'], original_sidebar)
+        self.assertEqual(w_settings(self.contract, {'manageOrder': []})['manageOrder'],
+                         list(web_settings.DEFAULT_MANAGE_ORDER))
+
+    def test_navigation_groups_keep_independent_orders_and_fixed_first_item(self):
+        w_settings(self.contract, {'navigationOrders': {'review': ['studio_logos', 'metadata_fields']}})
+        saved = w_settings(self.contract, {'navigationOrders': {'favorites': ['tag', 'all', 'filters']}})
+        self.assertEqual(saved['navigationOrders']['review'][:2], ['studio_logos', 'metadata_fields'])
+        self.assertEqual(saved['navigationOrders']['favorites'][:3], ['all', 'tag', 'filters'])
+        self.assertEqual(q_settings(self.contract)['navigationOrders'], saved['navigationOrders'])
+        reset = w_settings(self.contract, {'navigationOrders': {'review': []}})
+        self.assertEqual(reset['navigationOrders']['review'], list(web_settings.NAVIGATION_ORDERS['review']))
+        self.assertEqual(reset['navigationOrders']['favorites'], saved['navigationOrders']['favorites'])
+
+    def test_navigation_order_rejects_unknown_groups_and_entries(self):
+        for value in ([], {'unknown': []}, {'review': ['unknown']}, {'review': [1]}, {'review': 'metadata_fields'}):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                w_settings(self.contract, {'navigationOrders': value})
+        self.assertNotIn('navigationOrders', self._stored_json())
+
+    def test_library_order_preserves_stable_ids_and_rejects_invalid_values(self):
+        saved = w_settings(self.contract, {'libraryOrder': ['lib-b', 'lib-a']})
+        self.assertEqual(saved['libraryOrder'], ['lib-b', 'lib-a'])
+        for order in ([1], ['same', 'same'], [''], {}, None):
+            with self.subTest(order=order), self.assertRaises(ValueError):
+                w_settings(self.contract, {'libraryOrder': order})
+        self.assertEqual(q_settings(self.contract)['libraryOrder'], ['lib-b', 'lib-a'])
+        self.assertEqual(w_settings(self.contract, {'libraryOrder': []})['libraryOrder'], [])
+
     def test_an_unset_profile_reads_the_default_order(self):
         self.assertEqual(q_settings(self.contract),
                          {"sidebarOrder": list(DEFAULT_SIDEBAR_ORDER),
                           "avatarRefreshDays": 90, "faviconRefreshDays": 365,
                           "followInitialDays": 30, "postSetupTutorialDone": False,
-                          "organizeTemplates": {}, "feedHideGroupCompilations": True,
+                          "organizeTemplates": {}, "codePatterns": [],
+                          "feedHideGroupCompilations": True,
                           "feedHideSoloCompilations": False, "feedHideExcerpts": True,
-                          "searchHistoryLimit": None})
+                          "searchHistoryLimit": None, "performerNameLanguage": "zh-CN", "taskSpeedMode": "standard"})
+
+    def test_code_patterns_are_checked_when_saved(self):
+        """写错的规则在保存那一刻报出来；存下的规则去掉空行，读回来是同一份。"""
+        rules = [r"^\+{3}\s*(?<code>FC2-PPV-\d+)", "", r"\[(\w+-\d+)\]"]
+        saved = w_settings(self.contract, {"codePatterns": rules})["codePatterns"]
+        self.assertEqual(saved, [rules[0], rules[2]])
+        self.assertEqual(q_settings(self.contract)["codePatterns"], saved)
+        for broken in (["(unclosed"], "not a list", ["x" * 201], ["a"] * 21):
+            with self.assertRaises(ValueError, msg=repr(broken)[:40]):
+                w_settings(self.contract, {"codePatterns": broken})
+        self.assertEqual(self._stored_json()["codePatterns"], saved)
+
+    def test_default_task_speed_accepts_each_mode_and_rejects_unknown_values(self):
+        from peach.processing_control import default_mode
+        for mode in ('low', 'standard', 'high'):
+            with self.subTest(mode=mode):
+                saved = w_settings(self.contract, {'taskSpeedMode': mode})
+                self.assertEqual(saved['taskSpeedMode'], mode)
+                self.assertEqual(default_mode(self.contract), mode)
+        for value in (None, '', 'fast', 1, ['low']):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                w_settings(self.contract, {'taskSpeedMode': value})
+        self.assertEqual(q_settings(self.contract)['taskSpeedMode'], 'high')
+
+    def test_name_language_is_shared_and_preserves_other_profile_settings(self):
+        self.assertEqual(q_settings(self.contract)['performerNameLanguage'], 'zh-CN')
+        self.assertEqual(self._stored_json(), {})
+        order = ['tags', '']
+        w_settings(self.contract, {'sidebarOrder': order, 'performerNameLanguage': 'ja'})
+        other_device = WebContract(self.db.resolve())
+        self.assertEqual(q_settings(other_device)['performerNameLanguage'], 'ja')
+        w_settings(other_device, {'performerNameLanguage': 'zh-CN'})
+        self.assertEqual(q_settings(self.contract)['performerNameLanguage'], 'zh-CN')
+        self.assertEqual(self._stored_json(), {'sidebarOrder': order, 'performerNameLanguage': 'zh-CN'})
+
+    def test_invalid_name_languages_leave_the_stored_preference_unchanged(self):
+        w_settings(self.contract, {'performerNameLanguage': 'ja'})
+        for value in ('en', 'ja ', None, True, 1, [], {}):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                w_settings(self.contract, {'performerNameLanguage': value})
+            self.assertEqual(self._stored_json(), {'performerNameLanguage': 'ja'})
+
+    def test_a_hand_broken_rule_reads_as_unset(self):
+        con = sqlite3.connect(self.db)
+        con.execute("UPDATE profile SET settings_json=? WHERE id='local-default'",
+                    (json.dumps({"codePatterns": ["(unclosed"]}),))
+        con.commit()
+        con.close()
+        self.assertEqual(q_settings(self.contract)["codePatterns"], [])
 
     def test_the_search_history_limit_stays_unset_until_a_device_writes_it(self):
         """没写过读出 None，前端据此把本机记着的那个数同步上来一次；写过之后各端读同一个数。"""
@@ -134,9 +218,10 @@ class SettingsRoundTripTests(unittest.TestCase):
                          {"ok": True, "sidebarOrder": order,
                           "avatarRefreshDays": 90, "faviconRefreshDays": 365,
                           "followInitialDays": 30, "postSetupTutorialDone": False,
-                          "organizeTemplates": {}, "feedHideGroupCompilations": True,
+                          "organizeTemplates": {}, "codePatterns": [],
+                          "feedHideGroupCompilations": True,
                           "feedHideSoloCompilations": False, "feedHideExcerpts": True,
-                          "searchHistoryLimit": None})
+                          "searchHistoryLimit": None, "performerNameLanguage": "zh-CN", "taskSpeedMode": "standard"})
         self.assertEqual(q_settings(self.contract)["sidebarOrder"], order)
         self.assertEqual(self._stored_json()["sidebarOrder"], order)
 

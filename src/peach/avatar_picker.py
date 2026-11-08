@@ -20,7 +20,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
+import threading
+import time
 import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -34,8 +37,9 @@ from .entities import is_short_single_name
 from .entity_classification import work_portrait_predicate
 from .western_artwork import artwork_cast_size, artwork_key
 from .kanji import fold_glyphs
+from .social_links import is_lit_share_image
 from .avatar_provider import (
-    AvatarCandidateCache, InspectedAvatar, POLICY_VERSION, inspect_avatar,
+    AvatarCandidateCache, AvatarImageError, InspectedAvatar, POLICY_VERSION, inspect_avatar, prepare_avatar,
     install_entity_avatar, provenance_now,
 )
 from .http import HttpRequest, HttpTransport, public_https_url, resolves_publicly
@@ -86,8 +90,100 @@ ADDRESS_CACHE = "url"
 STAND_IN_NOTE = "代表作画面，非本人"
 
 
+#: 图库索引取失败后，隔这么久才再试。头像框一天能开几十次，离线时每开一次就出网
+#: 一回只会白等超时；失败只记一行日志，不进任务中心——下次过期照样会再排。
+INDEX_RETRY_SECONDS = 15 * 60
+
+LOGGER = logging.getLogger(__name__)
+
+
 class PickerError(RuntimeError):
     """这一次换不成，原因可以直接给用户看。"""
+
+
+class IndexRefresher:
+    """图库索引缺失或过期时，在后台补一份。
+
+    `request` 只排一轮、立刻返回，页面照旧读本地缓存（`gfriends.load_index`）；
+    页面按刷新状态读取新候选。同一时刻最多一轮在跑。`transport` 每轮新建、
+    用完关掉：一天取一次，用不着常驻连接池。
+    """
+
+    def __init__(self, cache_dir: Path, transport: Callable[[], HttpTransport]):
+        self.cache_dir = Path(cache_dir)
+        self._transport = transport
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._failed_at: float | None = None
+        self._fetch_lock = threading.Lock()
+        self.error = ""
+
+    @property
+    def refreshing(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def ensure(self) -> bool:
+        """自动任务等待索引就绪；与页面共用单次下载和失败退避。"""
+        with self._fetch_lock:
+            if not gfriends.index_stale(self.cache_dir):
+                return True
+            with self._lock:
+                if (self._failed_at is not None
+                        and time.monotonic() - self._failed_at < INDEX_RETRY_SECONDS):
+                    return False
+            return self.refresh()
+
+    def request(self) -> bool:
+        """需要的话在后台排一轮，返回是否排上了。"""
+        with self._lock:
+            if not gfriends.index_stale(self.cache_dir):
+                return False
+            if self._thread is not None and self._thread.is_alive():
+                return False
+            if (self._failed_at is not None
+                    and time.monotonic() - self._failed_at < INDEX_RETRY_SECONDS):
+                return False
+            self._thread = threading.Thread(target=self.ensure, daemon=True,
+                                            name="PeachGfriendsIndex")
+            self._thread.start()
+            return True
+
+    def refresh(self) -> bool:
+        """在当前线程里取一次。失败不抛，旧缓存原样留着。"""
+        try:
+            transport = self._transport()
+            try:
+                gfriends.fetch_index(transport, self.cache_dir)
+            finally:
+                close = getattr(transport, "close", None)
+                if close is not None:
+                    close()
+        except Exception as error:
+            LOGGER.warning("图库索引未取得：%s", error)
+            with self._lock:
+                self._failed_at = time.monotonic()
+                self.error = str(error)
+            return False
+        with self._lock:
+            self._failed_at = None
+            self.error = ""
+        return True
+
+
+_INDEX_LOCK = threading.Lock()
+
+
+def index_refresher(contract) -> IndexRefresher:
+    """应用的自动头像任务与换头像接口共用同一份索引状态。"""
+    with _INDEX_LOCK:
+        refresher = getattr(contract, "gfriends_index", None)
+        if refresher is None:
+            from .scraping_access import SourceTransport
+            refresher = IndexRefresher(
+                contract.candidate_root / "provider-cache" / "performer-avatars" / GFRIENDS_CACHE,
+                lambda: SourceTransport(contract.follow_secrets_root))
+            contract.gfriends_index = refresher
+        return refresher
 
 
 @dataclass(frozen=True)
@@ -117,6 +213,7 @@ class Choice:
     #: 预览地址带上它才不会显示旧图，交框时回递它，服务端才认得出框是在哪一张上画的。
     #: 图库与历史按内容寻址，九宫格从视频抽帧，都不会原地变，是空串。
     version: str = ""
+    user_cropped: bool = False
 
     def as_dict(self) -> dict:
         focus = (dict(zip(("x0", "y0", "x1", "y1"), self.focus))
@@ -126,7 +223,7 @@ class Choice:
                 "detail": self.detail, "found_by": self.found_by,
                 "current": self.current, "crop": self.crop,
                 "bases": list(self.bases), "focus": focus, "cast": self.cast,
-                "version": self.version}
+                "version": self.version, "user_cropped": self.user_cropped}
 
 
 def cover_version(cover: Path | None) -> str:
@@ -212,6 +309,71 @@ def _focus_face(face: dict | None, cast: int) -> dict | None:
     return face if cast <= 1 else None
 
 
+def _history_records(providers_root: Path, entity_id: int) -> dict[str, list[dict]]:
+    """按当前实体与完整内容哈希收齐来源证据。"""
+    records: dict[str, list[dict]] = {}
+    for path in sorted(providers_root.glob(f"*/evidence/performer-{int(entity_id)}-*.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if record.get("entity_id") != entity_id:
+            continue
+        if (record.get("provider") == "social-web"
+                and is_lit_share_image(str(record.get("upstream_url") or ""))):
+            continue
+        digest = str(record.get("sha256") or "")
+        if digest:
+            records.setdefault(digest, []).append(record)
+    return records
+
+
+def _history_source_label(record: dict) -> str:
+    """标签只使用证据明确给出的站点、账号或图库分类。"""
+    provider = str(record.get("provider") or "")
+    external_id = str(record.get("external_id") or "")
+    url = str(record.get("upstream_url") or "")
+    host = urllib.parse.urlsplit(url).hostname or ""
+    if provider == "social-web":
+        if host == "pbs.twimg.com":
+            return f"X @{external_id[2:]}" if external_id.startswith("x:") else "X"
+        page = urllib.parse.urlsplit(external_id)
+        if page.hostname == "lit.link" and page.path.strip("/"):
+            return f"lit.link @{page.path.strip('/')}"
+        if host in ("prd.storage.lit.link", "prd.resource-api.lit.link"):
+            return "lit.link"
+        return "来源未记录"
+    if provider == "gfriends":
+        category, _, _ = external_id.partition("/")
+        return f"图库 · {gfriends.category_label(category)}" if category else "图库"
+    if provider in ("history", "picker", ""):
+        return "来源未记录"
+    if provider == "url":
+        return f"图片地址 · {host}" if host else "来源未记录"
+    return SOURCE_NAMES.get(provider, "来源未记录")
+
+
+def _history_source(records: dict[str, list[dict]], digest: str) -> dict:
+    """旧裁片的短哈希只有在当前实体内唯一指向原图时才继承来源。"""
+    visited: set[str] = set()
+    record: dict = {}
+    while digest in records and digest not in visited:
+        visited.add(digest)
+        record = min(records[digest], key=lambda row: (
+            _history_source_label(row) == "来源未记录",
+            row.get("provider") in ("history", "picker")))
+        if record.get("provider") != "history":
+            return record
+        original = str(record.get("external_id") or "")
+        if len(original) not in (12, 64) or any(c not in "0123456789abcdef" for c in original):
+            return record
+        matches = [key for key in records if key.startswith(original) and key not in visited]
+        if len(matches) != 1:
+            return record
+        digest = matches[0]
+    return record
+
+
 def _history(providers_root: Path, entity_id: int, current: str,
              cover_root: Path | None = None,
              casts: dict[str, int] | None = None) -> list[Choice]:
@@ -228,28 +390,23 @@ def _history(providers_root: Path, entity_id: int, current: str,
     整张装进圆框只剩一块背景。它们同样先框再装，按证据里的番号在封面边车上取景。
     """
     out: list[Choice] = []
-    seen: set[str] = set()
-    for path in sorted(providers_root.glob(
-            f"*/evidence/performer-{int(entity_id)}-*.json")):
-        try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        digest = str(record.get("sha256") or "")
-        # 同一张图可能在几个来源目录里各留了一份证据——摆出来是两个一模一样的格子。
-        if not digest or digest in seen:
-            continue
-        seen.add(digest)
+    records = _history_records(providers_root, entity_id)
+    for digest, evidence in records.items():
         body = _object_bytes(providers_root, digest)
         if body is None or images.is_flat(body):
             continue
-        provider = str(record.get("provider") or "")
-        label = SOURCE_NAMES.get(provider, provider or "取过的图")
+        record = evidence[0]
+        source = _history_source(records, digest)
+        provider = str(source.get("provider") or "")
+        label = _history_source_label(source)
+        cropped = any(row.get("source_kind") == "user_cropped" for row in evidence)
+        if cropped:
+            label += " · 已裁剪"
         width, height = int(record.get("width") or 0), int(record.get("height") or 0)
-        whole = provider in WHOLE_COVER_PROVIDERS
+        whole = provider in WHOLE_COVER_PROVIDERS and not cropped
         focus, cast = None, 0
         if whole:
-            key = normalise_code_key(record.get("external_id"))
+            key = normalise_code_key(source.get("external_id"))
             label = f"{label} {key}".strip()
             cast = (casts or {}).get(key, 0)
             cover = Path(cover_root) / f"{key}.jpg" if cover_root is not None and key else None
@@ -257,11 +414,13 @@ def _history(providers_root: Path, entity_id: int, current: str,
                 focus = cover_focus(key, cover,
                                     _focus_face(read_sidecar(cover) if cover else None, cast),
                                     width, height)
+        source_url = str(source.get("upstream_url") or "")
         out.append(Choice(
             ref=f"sha256:{digest}", source="history", label=label,
             width=width, height=height,
-            detail=str(record.get("upstream_url") or ""),
-            current=digest == current, crop=whole, focus=focus, cast=cast))
+            detail=source_url if source_url.startswith(("https://", "http://")) else "",
+            current=digest == current, crop=whole, focus=focus, cast=cast,
+            user_cropped=cropped))
     return out
 
 
@@ -409,7 +568,7 @@ def framed(ref: str, body: bytes, probe: Callable[[bytes], dict | None], *,
     默认框和批处理从封面截头像是同一块（`face_square`）；检不出脸时 `focus` 是 None，
     页面居中落框。`crop` 保持 False：这几路的图整张装也成立，框选是可选的那一步。
     """
-    accept_image(body)
+    body = prepare_image(body)
     body = images.upright(body)
     size = images.measure_image_size(body)
     if size is None:
@@ -425,19 +584,31 @@ def typed_address(url: str, providers_root: Path, fetch: Callable[[str], bytes],
     地址必须已经过 `allowed_source`。取到的字节按地址存：框选时页面看的预览、探针检的
     脸和确认时切的都是这一份，不会因为两次取图之间站点换了图而对不上。
     """
-    body = fetch(url)
+    try:
+        body = prepare_image(fetch(url))
+    except PickerError as error:
+        raise PickerError(f"这个地址未取得可用图片：{error}") from error
     AvatarCandidateCache(providers_root / ADDRESS_CACHE).store(url, body, accept_image(body))
     host = urllib.parse.urlsplit(url).hostname or url
     return framed(f"url:{url}", body, probe, source="url", label=host)
 
 
+def uploaded(body: bytes, providers_root: Path, probe: Callable[[bytes], dict | None], *, label: str) -> Choice:
+    """本机图片转换后留作预览候选；安装头像由用户确认触发。"""
+    body = prepare_image(body)
+    inspected = accept_image(body)
+    AvatarCandidateCache(providers_root / "upload").store(f"peach:upload/{inspected.sha256}", body, inspected)
+    return framed(f"sha256:{inspected.sha256}", body, probe, source="upload", label=label)
+
+
 def choices(connection: sqlite3.Connection, providers_root: Path,
             avatar_root: Path, kind: str, entity_id: int,
-            cover_root: Path | None = None, *, deduplicate: bool = True) -> dict:
+            cover_root: Path | None = None, *, deduplicate: bool = True,
+            online: list[Choice] | None = None) -> dict:
     """页面要展示的一切：图库同名候选、取过的历史、当前装着的是哪一张。
 
-    索引只读本地缓存。联网补索引是批处理的事——为一次点击同步拉 6 MB，页面会卡在
-    那里，而卡住的理由用户完全看不见。
+    索引只读本地缓存，过期了由 `IndexRefresher` 在后台补——为一次点击同步拉 6 MB，
+    页面会卡在那里，而卡住的理由用户完全看不见。
     """
     index_dir = providers_root / GFRIENDS_CACHE
     names = name_chain(connection, entity_id)
@@ -477,6 +648,7 @@ def choices(connection: sqlite3.Connection, providers_root: Path,
     listed = items[:MAX_CHOICES]
     if cover_root is not None:
         listed += asset_artwork(connection, cover_root, entity_id)
+    listed += online or []
     if deduplicate:
         listed = _distinct_choices(listed, providers_root, cover_root)
     age = gfriends.index_age(index_dir)
@@ -485,7 +657,7 @@ def choices(connection: sqlite3.Connection, providers_root: Path,
         "names": names, "matched_names": list(match.names),
         "choices": [choice.as_dict() for choice in listed],
         "index_age_hours": round(age / 3600, 1) if age is not None else None,
-        "index_stale": age is None or age > gfriends.INDEX_MAX_AGE_SECONDS,
+        "index_stale": gfriends.index_stale(index_dir),
     }
 
 
@@ -497,14 +669,14 @@ def _distinct_choices(items: list[Choice], providers_root: Path,
     图库的整图框选会重编 JPEG，所以它与来源原图的字节哈希可以不同。
     """
     groups: list[tuple[Choice, set[str]]] = []
-    rank = {"asset": 0, "gfriends": 1, "history": 2}
+    rank = {"asset": 0, "gfriends": 1, "social": 2, "history": 3}
     for choice in items:
         body = None
         if choice.source == "gfriends":
             category, _, filename = choice.ref.partition(":")[2].partition("/")
             body = AvatarCandidateCache(providers_root / GFRIENDS_CACHE).lookup(
                 gfriends.image_url(category, filename))
-        elif choice.source == "history":
+        elif choice.ref.startswith("sha256:"):
             body = _object_bytes(providers_root, choice.ref.partition(":")[2])
         elif choice.source == "asset" and cover_root is not None and choice.ref.endswith(":cover"):
             # 作品组已核对归属；文件名取列表中真实番号，不从客户端 ref 推断路径。
@@ -596,13 +768,26 @@ def allowed_source(url: str) -> bool:
     return resolves_publicly(urllib.parse.urlsplit(url).hostname or "")
 
 
+def prepare_image(body: bytes) -> bytes:
+    """对头像各入口执行相同的格式转换与大小检查。"""
+    if len(body) > MAX_IMAGE_BYTES:
+        raise PickerError("图片超过 16 MiB，请缩小后重新选择")
+    try:
+        prepared = prepare_avatar(body)
+    except AvatarImageError as error:
+        raise PickerError(str(error)) from error
+    if len(prepared) > MAX_IMAGE_BYTES:
+        raise PickerError("图片转换后超过 16 MiB，请缩小后重新选择")
+    return prepared
+
+
 def accept_image(body: bytes) -> InspectedAvatar:
     """确认这堆字节真是一张能用的图。格式由解码结果定，不看扩展名也不信响应头。"""
     if len(body) > MAX_IMAGE_BYTES:
         raise PickerError("图太大了")
     inspected = inspect_avatar(body)
     if inspected is None:
-        raise PickerError("这不是一张能识别的 JPEG 或 PNG 图片")
+        raise PickerError("图片无法完整读取，请重新选择图片")
     return inspected
 
 
@@ -687,8 +872,15 @@ def resolve(ref: str, connection: sqlite3.Connection, providers_root: Path,
     if ref.startswith("sha256:"):
         digest = ref.split(":", 1)[1].strip().lower()
         body = _cached_object(providers_root, digest)
-        return body, {"source": "avatar picker", "provider": "history",
-                      "external_id": digest[:12]}
+        records = _history_records(providers_root, entity_id)
+        source = _history_source(records, digest)
+        origin = {"source": "avatar picker", "provider": "history", "external_id": digest}
+        if _history_source_label(source) != "来源未记录":
+            origin.update({key: source[key] for key in (
+                "provider", "external_id", "upstream_url", "matched_name", "name_source") if key in source})
+        if any(row.get("source_kind") == "user_cropped" for row in records.get(digest, ())):
+            origin["source_kind"] = "user_cropped"
+        return body, origin
     if ref.startswith("asset:"):
         return _asset_image(ref, connection, entity_id, artwork, version)
     if ref.startswith("cover:"):

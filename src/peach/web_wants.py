@@ -100,6 +100,7 @@ def scrape(contract, job_id: str | None = None) -> dict:
     previous = (contract.want_job.snapshot() or {}) if job_id else {}
     done = set(previous.get('completed_wants') or [])
     completed = set(done)
+    incomplete = set(previous.get('incomplete_wants') or [])
     fetched, covers = previous.get('fetched', 0), previous.get('covers', 0)
     provider = _provider(contract)
     while len(done) < MAX_PER_RUN:
@@ -120,11 +121,17 @@ def scrape(contract, job_id: str | None = None) -> dict:
                 saved = wants.get(connection, want_id)
             if covered and saved and saved['scraped_at'] is not None and saved['scrape_error'] is None:
                 completed.add(want_id)
+                incomplete.discard(want_id)
+            elif saved and saved['state'] != wants.ACQUIRED:
+                incomplete.add(want_id)
+            else:
+                incomplete.discard(want_id)
             if job_id and not contract.want_job.checkpoint(job_id, completed_wants=sorted(completed),
-                    checked=len(done), fetched=fetched, covers=covers):
+                    incomplete_wants=sorted(incomplete), checked=len(done), fetched=fetched, covers=covers):
                 raise InterruptedError('想要资料任务已停止')
     contract.cache_bust()
-    return {"ok": True, "total": len(done), "fetched": fetched, "covers": covers}
+    return {"ok": True, "total": len(done), "fetched": fetched, "covers": covers,
+            "incomplete": len(incomplete)}
 
 
 def start_scrape(contract, *, trigger: str = "manual") -> dict | None:
@@ -207,6 +214,7 @@ def _ids(body) -> list[int]:
 
 def q_want_magnets(contract, args) -> dict:
     """只读资源查询；未发售、已入库与没有番号的条目不请求来源。"""
+    from .javdb_public import public_cache_scope
     from .wants_magnets import search_for
 
     raw = str(args.get("id") or "")
@@ -218,8 +226,10 @@ def q_want_magnets(contract, args) -> dict:
         raise KeyError("想要条目不存在")
     if not row["code"] or wants.phase(row, date.today()) in {"unreleased", "acquired"}:
         return {"ok": True, "state": "unavailable", "items": [], "error": "", "checked_at": None}
-    return search_for(contract.follow_secrets_root).query(
-        row["code"], refresh=str(args.get('refresh') or '') == '1', released=row['release_date'])
+    # JavDB 匿名资料与详情页共用快照目录。
+    with public_cache_scope(contract.cover_root.parent / 'jav-public'):
+        return search_for(contract.follow_secrets_root).query(
+            row["code"], refresh=str(args.get('refresh') or '') == '1', released=row['release_date'])
 
 
 def _add(connection, body) -> dict:

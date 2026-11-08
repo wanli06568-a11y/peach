@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+from . import media_libraries, settings_file
 from .follow_discovery import MAX_SUGGESTIONS, MAX_TERM_LENGTH
 from .review_csv import candidate_root_version
 from .web_activity import (
@@ -21,8 +22,11 @@ from .web_activity import (
     w_watch_later,
 )
 from .web_batch import q_ads, q_duplicates, w_batch, w_empty_trash
+from .web_performer_delete import q_performer_delete_candidates, q_performer_delete_plan, w_performer_delete
+from .web_tags import q_tag_management, w_tag_management, w_tag_preview
 from .taste_history import history_source_count
 from .web_catalog import (
+    FACETS_TABLES,
     catalog_filter,
     q_editions,
     q_facets,
@@ -34,11 +38,15 @@ from .web_catalog import (
     w_item_tag,
 )
 from .web_entity import (
+    FEED_SHAPE_TABLES,
     SUGGEST_GROUP_LIMIT,
     SUGGEST_KIND_LIMIT,
+    entity_shape_feed,
+    entity_shape_rest,
+    entity_shapes,
     q_entity,
+    q_entity_latest,
     q_entity_photos,
-    q_entity_shapes,
     q_index,
     q_photo_set,
     q_suggest,
@@ -49,15 +57,19 @@ from .web_entity import (
 from .web_downloads import (q_downloads, w_download_cancel, w_download_postprocess,
                             w_download_submit)
 from .web_resource_search import q_resource_search
-from .web_jav_detail import q_jav_detail, q_jav_image, q_jav_resources, q_jav_reviews
-from .web_jav_discovery import q_jav_discoveries
+from .web_search import q_search_recommendations
+from .web_jav_detail import q_jav_detail, q_jav_resources, q_jav_reviews, w_jav_cover
+from .web_jav_discovery import (q_jav_discoveries, q_jav_discovery_metadata, q_jav_releases,
+                                w_jav_discovery_metadata)
 from .web_feeds import (
     q_feed_check,
     q_feed_discoveries,
     q_feed_lookup,
+    q_feed_schedule,
     q_feeds,
     w_feed_check,
     w_feed_discovery,
+    w_feed_schedule_run,
     w_feed_source,
 )
 from .web_follow import (
@@ -79,29 +91,33 @@ from .web_follow import (
     w_follow_resolve,
     w_follow_save,
     w_follow_schedule,
+    w_follow_schedule_run,
     w_follow_source,
     w_follow_status,
+    w_follow_tag,
 )
 from .web_links import w_links, w_links_check, w_links_prune
 from .web_library_processing import q_library_processing, q_library_processing_issues, w_library_processing
 from .web_media_repair import q_media_repair, w_media_repair
 from .web_organize import (
-    q_organize, w_organize_apply, w_organize_preview, w_organize_rollback,
+    q_organize, q_organize_example, w_organize_apply, w_organize_preview, w_organize_rollback,
 )
 from .web_orphan_records import q_orphan_records, w_orphan_attach
 from .web_playlists import q_playlist, q_playlists, w_playlist
 from .web_custom_metadata import q_custom_metadata, w_custom_metadata
 from .web_resource_sync import w_purge_missing, w_resource_sync_apply, w_resource_sync_scan
-from .web_review import q_review, w_review_decision, w_review_genre
+from .web_review import REVIEW_TABLES, q_review, q_review_counts, w_review_decision, w_review_genre
+from .web_auto_landings import q_auto_landings, w_auto_landing_revert
 from .web_settings import q_settings, w_settings
 from .web_library_shortcuts import q_library_shortcuts, w_library_shortcuts
+from .web_tutorial import q_tutorial_progress, w_tutorial_progress
 from .web_folders import q_folders, w_folder_preview, w_folder_rule
 from .web_scraping import (
     q_scraping, q_scraping_amane_bridge, w_scraping_amane_check, w_scraping_amane_rebuild,
-    w_scraping_check, w_scraping_cover, w_scraping_settings,
+    w_scraping_check, w_scraping_check_all, w_scraping_cover, w_scraping_settings,
 )
-from .web_state import WebContract, path_version
-from .web_tasks import q_tasks
+from .web_state import WebContract, path_version, revision_snapshot
+from .web_tasks import q_result_updates, q_tasks
 from .web_timeline_thumbnails import (
     q_media_processing, q_thumbnail_jobs, q_timeline, w_media_processing, w_thumbnail_jobs,
 )
@@ -110,8 +126,7 @@ from .web_stats import (
     q_quality_goals,
     q_search_history,
     q_stats,
-    q_taste,
-    taste_inputs,
+    taste_snapshot,
     w_search_history,
     w_taste_refresh,
     w_taste_source,
@@ -138,7 +153,8 @@ def _get_index(contract, args):
 
 
 def _get_stats(contract, _args):
-    return contract.cached("stats", lambda: q_stats(contract))
+    # 账本那一段在 `q_stats` 里按版本缓存，存储卷每次现量。
+    return q_stats(contract)
 
 
 def _get_tops(contract, args):
@@ -165,18 +181,34 @@ def _get_ads(contract, args):
     )
 
 
+#: `/api/related` 确定不读的账本表：订阅新作、复核结论，以及在线播放心跳、播放记录与搜索历史
+#: 这几张高频写的表。其余表一律算进版本：推荐卡要的出镜者、关注卡、下载来源散在好几处，
+#: 漏一张，那张表变了之后就一直回旧结果。
+RELATED_UNREAD_TABLES = ("feed_source", "feed_item", "feed_discovery", "feed_discovery_entity",
+                         "review_decision", "review_decision_history", "genre_decision",
+                         "follow_playback", "activity_event", "search_history")
+
+
 def _get_related(contract, args):
     """相关推荐走 LRU 缓存：打分是纯 Python 对几千个候选做 MMR，一次几百毫秒。
 
-    每打开一次资料页都现算太贵，而结果只读不写；写路径（标签、反馈、播放、复核）
-    本来就调 `cache_bust()`，缓存跟着一起作废。上面几个聚合用的是 `cached()`，
-    这里必须用 `cached_lru()`：键跟着浏览过的资产走，键空间不封闭。
+    每打开一次资料页都现算太贵，而结果只读不写。键跟着浏览过的资产走、键空间不封闭，
+    所以用 `cached_lru()`；按读到的账本表版本与图片目录版本核验，不随每次提交清空：
+    后台任务每几秒提交一次时，按提交清空的缓存存不住，几百毫秒的打分也写不回去。
     键里带上 limit——同一个资产要不同条数就是不同结果。
     """
     asset_id = int(args["id"])
     limit = min(int(args.get("limit", "24")), 60)
+    artwork = tuple(path_version(root) for root in (
+        contract.cover_root, contract.avatar_root, contract.logo_root, contract.poster_root))
     return contract.cached_lru(
-        f"related:{asset_id}:{limit}", lambda: q_related(contract, asset_id, limit))
+        f"related:{asset_id}:{limit}", lambda: q_related(contract, asset_id, limit),
+        tables=contract.ledger_tables_except(RELATED_UNREAD_TABLES), inputs=artwork)
+
+
+#: 按账本版本缓存的筛选项口径：状态页与取值有限的几组筛选。
+FACET_STATES = frozenset({"", "fresh", "played", "flagged", "later"})
+FACET_ENUM_FILTERS = frozenset({"loc", "len", "orient", "region", "exclude_vertical", "thumb", "library"})
 
 
 def _get_facets(contract, args):
@@ -189,17 +221,25 @@ def _get_facets(contract, args):
     filters = {key: args[key] for key in (
         'loc', 'creator', 'performer', 'studio', 'series', 'agency', 'tag', 'tag_match',
         'len', 'dur_min', 'dur_max', 'orient', 'region', 'exclude_vertical', 'q', 'thumb',
-        'library', 'folder', 'folder_recursive',
+        'library', 'folder', 'folder_recursive', 'year',
     ) if args.get(key)}
+    if not filters.get("tag"):
+        filters.pop("tag_match", None)
     scope_key += repr(sorted(filters.items()))
-    return contract.cached(
-        f"facets{'-jav' if jav else ''}:{scope_key}",
-        lambda: q_facets(
-            contract,
-            jav=jav, scope_kind=scope_kind, scope_name=scope_name, asset_id=asset_id,
-            state=state, filters=filters or None,
-        ),
+    compute = lambda: q_facets(  # noqa: E731
+        contract,
+        jav=jav, scope_kind=scope_kind, scope_name=scope_name, asset_id=asset_id,
+        state=state, filters=filters or None,
     )
+    # 首页与侧栏几组枚举筛选（来源、时长、画幅、产地、媒体库）的组合有限，按账本版本缓存；
+    # 实体、详情、搜索词、标签与时长区间的键空间不封闭，照旧走 TTL 缓存。
+    if (not (scope_kind or scope_name or asset_id is not None) and state in FACET_STATES
+            and set(filters) <= FACET_ENUM_FILTERS):
+        library = (repr(media_libraries.predicate(settings_file.active(), filters['library']))
+                   if 'library' in filters else '')
+        return contract.cached_until_changed(
+            f"facets{'-jav' if jav else ''}:{scope_key}", compute, library, tables=FACETS_TABLES)
+    return contract.cached(f"facets{'-jav' if jav else ''}:{scope_key}", compute)
 
 
 def _get_suggest(contract, args):
@@ -242,32 +282,31 @@ def _get_search_history(contract, args):
 
 
 def _get_taste(contract, args):
-    window = str(args.get("window") or "all")
-    return contract.cached_until_changed(
-        f"taste:{window}", lambda: q_taste(contract, {"window": window}),
-        *taste_inputs(contract, window))
+    return taste_snapshot(contract, str(args.get("window") or "all"),
+                          retry=str(args.get("retry") or "") == "1")
 
 
 def _get_review(contract, args):
+    if str(args.get("counts") or "") in {"1", "true"}:
+        return q_review_counts(contract)
     # 账本之外，复核读三处磁盘：抓取脚本写的候选 CSV、卡片封面徽章用的封面目录、
     # 创作者头像与取景用的头像目录。
     payload = contract.cached_until_changed(
         "review", lambda: q_review(contract),
         candidate_root_version(contract.candidate_root),
-        path_version(contract.cover_root), path_version(contract.avatar_root))
-    # 数据管理页只要一个待复核条数。完整 payload 带着每条候选的全文，实测是
-    # 兆级；卡片上的一个数字不值这趟传输，但计数本身仍来自同一份缓存快照，
-    # 不另立一套口径。
-    if str(args.get("counts") or "") in {"1", "true"}:
-        return {key: payload[key] for key in ("counts", "sources", "skipped_rows")
-                if key in payload}
+        path_version(contract.cover_root), path_version(contract.avatar_root),
+        tables=REVIEW_TABLES)
     return payload
 
 
 def _get_entity_shapes(contract, args):
-    # 每一页开头都要这一份（骨架照它留位），全部来自账本，账本不变就一直用同一份。
-    return contract.cached_until_changed("entity-shapes",
-                                         lambda: q_entity_shapes(contract, args))
+    # 每一页开头都要这一份（骨架照它留位），全部来自账本，账本不变就一直用同一份。后台采集每几秒
+    # 写一次订阅表，只让新作那一小份跟着重算；其余部分按订阅表以外的表失效。
+    rest = contract.cached_until_changed(
+        "entity-shapes", lambda: entity_shape_rest(contract),
+        tables=contract.ledger_tables_except(FEED_SHAPE_TABLES))
+    feed = contract.cached_until_changed("entity-shapes-feed", lambda: entity_shape_feed(contract))
+    return entity_shapes(rest, feed)
 
 
 #: 安装教程每一项只读这几个字段。载荷形状由 `test_post_setup_tutorial_only_carries_progress_counts`
@@ -316,17 +355,26 @@ def _post_empty_trash(contract, _body):
     return w_empty_trash(contract)
 
 
+def _post_face_models(contract, _body):
+    """活动中心「立即重试」：后台开一轮取人脸模型，进度与结果看 `/api/tasks`。"""
+    from . import face_models
+    return contract.face_models_job.start_result(face_models.download_all)
+
+
 GET_HANDLERS = {
+    "/api/tag-management": q_tag_management,
     "/api/media-processing": q_media_processing,
     "/api/folders": q_folders,
     "/api/tasks": q_tasks,
+    "/api/result-updates": q_result_updates,
     "/api/downloads": q_downloads,
     "/api/resources/search": q_resource_search,
     "/api/jav/detail": q_jav_detail,
     "/api/jav/reviews": q_jav_reviews,
-    "/api/jav/image": q_jav_image,
     "/api/jav/resources": q_jav_resources,
     "/api/jav/discoveries": q_jav_discoveries,
+    "/api/jav/discoveries/metadata": q_jav_discovery_metadata,
+    "/api/jav/releases": q_jav_releases,
     "/api/library-processing": q_library_processing,
     "/api/library-processing/issues": q_library_processing_issues,
     "/api/thumbnail-jobs": q_thumbnail_jobs,
@@ -334,12 +382,15 @@ GET_HANDLERS = {
     "/api/scraping": q_scraping,
     "/api/scraping/cover": lambda contract, args: contract.scraping_cover_job.snapshot() or {"status": "idle"},
     "/api/scraping/amane-bridge": q_scraping_amane_bridge,
+    "/api/scraping/check-all": lambda contract, args: contract.source_check_job.snapshot() or {"status": "idle"},
     "/api/settings": q_settings,
     "/api/library-shortcuts": q_library_shortcuts,
+    "/api/tutorial-progress": q_tutorial_progress,
     "/api/feeds": q_feeds,
     "/api/feeds/check": q_feed_check,
     "/api/feeds/discoveries": q_feed_discoveries,
     "/api/feeds/lookup": q_feed_lookup,
+    "/api/feeds/schedule": q_feed_schedule,
     "/api/follow": q_follow,
     "/api/follow/credentials": q_follow_credentials,
     "/api/follow/tags": q_follow_tags,
@@ -354,12 +405,16 @@ GET_HANDLERS = {
     "/api/media-repair": q_media_repair,
     "/api/orphan-records": q_orphan_records,
     "/api/organize": q_organize,
+    "/api/organize/example": q_organize_example,
     "/api/items": q_items,
     "/api/item": _get_item,
     "/api/parts": q_parts,
     "/api/editions": q_editions,
     "/api/entity": q_entity,
+    "/api/performer/delete-plan": q_performer_delete_plan,
+    "/api/performer/delete-candidates": q_performer_delete_candidates,
     "/api/entity/shapes": _get_entity_shapes,
+    "/api/entity/latest": q_entity_latest,
     "/api/links": w_links,
     "/api/photos": q_entity_photos,
     "/api/photo-set": q_photo_set,
@@ -378,12 +433,16 @@ GET_HANDLERS = {
     "/api/facets": _get_facets,
     "/api/suggest": _get_suggest,
     "/api/search-history": _get_search_history,
+    "/api/search/recommendations": q_search_recommendations,
     "/api/taste": _get_taste,
     "/api/review": _get_review,
+    "/api/review/auto-landings": q_auto_landings,
     "/api/post-setup-tutorial": _get_post_setup_tutorial,
 }
 
 POST_HANDLERS = {
+    "/api/tag-management": w_tag_management,
+    "/api/tag-management/preview": w_tag_preview,
     "/api/media-processing": w_media_processing,
     "/api/folders/preview": w_folder_preview,
     "/api/folders/rule": w_folder_rule,
@@ -394,20 +453,26 @@ POST_HANDLERS = {
     "/api/thumbnail-jobs": w_thumbnail_jobs,
     "/api/scraping/settings": w_scraping_settings,
     "/api/scraping/cover": w_scraping_cover,
+    "/api/jav/cover": w_jav_cover,
+    "/api/jav/discoveries/metadata": w_jav_discovery_metadata,
     "/api/scraping/check": w_scraping_check,
+    "/api/scraping/check-all": w_scraping_check_all,
     "/api/scraping/amane-bridge/check": w_scraping_amane_check,
     "/api/scraping/amane-bridge/rebuild": w_scraping_amane_rebuild,
     "/api/feeds/check": w_feed_check,
     "/api/feeds/source": w_feed_source,
     "/api/feeds/discovery": w_feed_discovery,
+    "/api/feeds/schedule/run": w_feed_schedule_run,
     "/api/follow/check": w_follow_check,
     "/api/follow/schedule": w_follow_schedule,
+    "/api/follow/schedule/run": w_follow_schedule_run,
     "/api/follow/source": w_follow_source,
     "/api/follow/author-alias": w_follow_author_alias,
     "/api/follow/creator": w_follow_creator,
     "/api/follow/resolve": w_follow_resolve,
     "/api/follow/credential": w_follow_credential,
     "/api/follow/status": w_follow_status,
+    "/api/follow/tag": w_follow_tag,
     "/api/follow/media/hide": w_follow_media_hide,
     "/api/follow/image-dims": w_follow_image_dims,
     "/api/follow/save": w_follow_save,
@@ -440,10 +505,14 @@ POST_HANDLERS = {
     "/api/media-repair": w_media_repair,
     "/api/review/decision": w_review_decision,
     "/api/review/genre": w_review_genre,
+    "/api/review/auto-landings/revert": w_auto_landing_revert,
     "/api/settings": w_settings,
     "/api/library-shortcuts": w_library_shortcuts,
+    "/api/tutorial-progress": w_tutorial_progress,
     "/api/entity-name": w_entity_name,
+    "/api/performer/delete": w_performer_delete,
     "/api/entity-alias": w_entity_alias,
+    "/api/face-models": _post_face_models,
 }
 
 
@@ -451,6 +520,7 @@ POST_HANDLERS = {
 #: 不该拦它们——「查找」只联网、「存凭据」只写本机 secrets 文件，都不碰账本。
 #: 追更的「查找」在只读端被拦成 409 是实测踩到的。
 READ_ONLY_POST_ROUTES = frozenset({
+    "/api/tag-management/preview",
     "/api/media-processing",
     "/api/folders/preview",
     "/api/custom-metadata",
@@ -462,6 +532,8 @@ READ_ONLY_POST_ROUTES = frozenset({
     "/api/media-repair",
     # 整理的预览只出一份计划 CSV，不动文件也不改账本；执行与回滚不在这里。
     "/api/organize/preview",
+    # 人脸模型存在本机 tools 目录，取一次不碰账本。
+    "/api/face-models",
 })
 # `/api/resource-sync/apply` 不在上面：它永久删除文件已不在盘上的账本行，走的是
 # `purge_assets`。检查那一步只读盘，候选留在进程内存里；它在任务中心的那一行
@@ -474,7 +546,8 @@ def dispatch_api_get(contract: WebContract, path, args):
         handler = GET_HANDLERS[path]
     except KeyError as exc:
         raise ContractRouteNotFound(path) from exc
-    return handler(contract, args)
+    with revision_snapshot():
+        return handler(contract, args)
 
 
 def dispatch_api_post(contract: WebContract, path, body):

@@ -13,6 +13,7 @@ from typing import Callable
 from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.background import BackgroundScheduler
 from .update_tasks import UpdateBusy
+from .fsutil import atomic_write_text
 
 
 LOGGER = logging.getLogger(__name__)
@@ -33,6 +34,8 @@ def _stamp(moment: datetime | None = None) -> str:
 #: 订阅源拉取（ADR-0042）借用同一个实现，只是换一个 job id 与一份自己的状态文件。
 #: 间隔、退避、跳过与状态上报只有一份：第二套定时会长出第二种「上次什么时候跑的」。
 FEED_JOB_ID = "peach-feed-update"
+RUNTIME_COUNTS = ('last_checked', 'last_added', 'consecutive_failures')
+RUNTIME_TIMES = ('last_started_at', 'last_finished_at', 'last_skipped_at', 'failing_since', 'next_run_at')
 
 
 @dataclass(frozen=True)
@@ -88,9 +91,13 @@ class FollowUpdateScheduler:
     def __init__(self, state_root: Path, run_check: Callable[[], dict], *, available: bool,
                  job_id: str = JOB_ID, filename: str = "follow-schedule.json",
                  default: FollowScheduleConfig | None = None,
+                 tick_minutes: int | None = None,
                  unavailable_message: str =
                  "automatic follow updates are available only on the ledger writer"):
         self.job_id = job_id
+        #: 多久跑一次。不给就等于设置里的间隔；订阅源给的是 `feeds.TICK_MINUTES`：
+        #: 那边设置里的间隔是每个源的周期，到期由源自己判（ADR-0134）。
+        self.tick_minutes = tick_minutes
         self.unavailable_message = unavailable_message
         self.store = FollowScheduleStore(state_root, filename, default)
         self.run_check = run_check
@@ -107,6 +114,45 @@ class FollowUpdateScheduler:
         self._last_checked = 0
         self._last_added = 0
         self._consecutive_failures = 0
+        #: 这一串连续失败里第一轮的开始时刻；成功一轮就清空。
+        self._failing_since: str | None = None
+        self._next_run_at: str | None = None
+        self._runtime_path = self.store.path.with_suffix('.runtime.json')
+        self._restore_runtime()
+
+    def _restore_runtime(self) -> None:
+        try:
+            state = json.loads(self._runtime_path.read_text(encoding='utf-8'))
+            if not isinstance(state, dict):
+                raise ValueError('运行状态应为对象')
+            for key in RUNTIME_COUNTS:
+                value = state.get(key, 0)
+                if type(value) is not int or value < 0:
+                    raise ValueError('运行计数无效')
+            for key in RUNTIME_TIMES:
+                value = state.get(key)
+                if value is not None and (not isinstance(value, str)
+                        or datetime.fromisoformat(value.replace('Z', '+00:00')).tzinfo is None):
+                    raise ValueError('运行时间无效')
+            if state.get('last_error') is not None and not isinstance(state['last_error'], str):
+                raise ValueError('运行错误无效')
+            for key in (*RUNTIME_COUNTS, *RUNTIME_TIMES, 'last_error'):
+                setattr(self, '_' + key, state.get(key, 0 if key in RUNTIME_COUNTS else None))
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, TypeError):
+            LOGGER.warning('automatic follow runtime state unavailable at %s', self._runtime_path,
+                           exc_info=True)
+            self._last_error = '上次自动检查的运行状态未取得'
+
+    def _save_runtime(self) -> None:
+        job = self.scheduler.get_job(self.job_id) if self._started else None
+        with self._state_lock:
+            if self._started:
+                self._next_run_at = _stamp(job.next_run_time) if job is not None else None
+            state = {key: getattr(self, '_' + key)
+                     for key in (*RUNTIME_COUNTS, *RUNTIME_TIMES, 'last_error')}
+            atomic_write_text(self._runtime_path, json.dumps(state, ensure_ascii=False) + '\n')
 
     def start(self) -> None:
         if self._started or not self.available:
@@ -127,26 +173,65 @@ class FollowUpdateScheduler:
         self.config = self.store.validate(enabled, interval_minutes)
         self.store.save(self.config)
         if self._started:
-            self._apply_job()
+            self._apply_job(reset=True)
         return self.status()
 
-    def _apply_job(self) -> None:
+    def run_now(self) -> dict:
+        """把下一轮提前到此刻，由调度线程照常跑完并结算失败计数。
+
+        手动检查走的是另一条路，不碰这里的 `last_error`；重试自动检查的失败只能让
+        这个任务自己再跑一轮。之后的轮次从这一轮起按原间隔排。
+        """
+        if not self.available:
+            raise ValueError(self.unavailable_message)
+        if not self._started or not self.config.enabled:
+            raise ValueError("自动运行没有开启")
+        with self._state_lock:
+            already = self._running
+            # 提前标成运行中：调度线程领走这一轮之前，读状态的人不该再看到旧的失败。
+            self._running = True
+        if already:
+            return self.status()
+        accepted = self.status()
+        scheduled_at = datetime.now(timezone.utc)
+        try:
+            self.scheduler.modify_job(self.job_id, next_run_time=scheduled_at)
+        except JobLookupError:
+            with self._state_lock:
+                self._running = False
+            raise ValueError("自动运行没有开启") from None
+        self._save_runtime()
+        accepted['next_run_at'] = _stamp(scheduled_at)
+        return accepted
+
+    @property
+    def tick(self) -> int:
+        """调度任务的实际间隔（分钟）。"""
+        return self.tick_minutes or self.config.interval_minutes
+
+    def _apply_job(self, *, reset: bool = False) -> None:
         if not self.config.enabled:
             if self.scheduler.get_job(self.job_id) is not None:
                 self.scheduler.remove_job(self.job_id)
+            self._next_run_at = None
+            self._save_runtime()
             return
-        interval = self.config.interval_minutes
+        interval = self.tick
+        now = datetime.now(timezone.utc)
+        next_run = (max(now, datetime.fromisoformat(self._next_run_at.replace('Z', '+00:00')))
+                    if self._next_run_at and not reset else now + timedelta(minutes=interval))
         self.scheduler.add_job(
             self._run,
             "interval",
             id=self.job_id,
             minutes=interval,
-            next_run_time=datetime.now(timezone.utc) + timedelta(minutes=interval),
+            next_run_time=next_run,
             replace_existing=True,
             coalesce=True,
             max_instances=1,
             misfire_grace_time=min(interval * 60, 300),
         )
+        self._save_runtime()
 
     def backoff_minutes(self, failures: int) -> int:
         """连续失败 `failures` 次之后，下一次应当推到多少分钟以后。
@@ -155,13 +240,14 @@ class FollowUpdateScheduler:
         到 `MAX_BACKOFF_FACTOR` 倍为止，且不超过允许的最大间隔。
         """
         if failures <= 1:
-            return self.config.interval_minutes
+            return self.tick
         factor = min(2 ** (failures - 1), MAX_BACKOFF_FACTOR)
-        return min(self.config.interval_minutes * factor, MAX_INTERVAL_MINUTES)
+        return min(self.tick * factor, MAX_INTERVAL_MINUTES)
 
     def _run(self) -> None:
         with self._state_lock:
             started_before = self._last_started_at
+            error_before = self._last_error
             self._running = True
             self._last_started_at = _stamp()
             self._last_error = None
@@ -186,6 +272,15 @@ class FollowUpdateScheduler:
                     self._last_skipped_at = _stamp()
                     self._last_started_at = started_before
                 return
+            if result.get("idle"):
+                # 这一跳没有到期的来源（订阅源每半小时一跳，ADR-0134）：什么也没做，
+                # 上一轮的结论原样留着。按成功结算的话，一次真实失败半小时后就从界面上消失，
+                # 而失败的那几个源还要等到下一次到期才重拉。
+                skipped = True
+                with self._state_lock:
+                    self._last_started_at = started_before
+                    self._last_error = error_before
+                return
             rows = result.get("results") or []
             failures = [row for row in rows if not row.get("ok")]
             with self._state_lock:
@@ -204,6 +299,7 @@ class FollowUpdateScheduler:
                 self._running = False
                 if not skipped:
                     self._last_finished_at = _stamp()
+            self._save_runtime()
 
     def _settle(self, *, failed: bool) -> None:
         """结算这一轮的连续失败计数，必要时把下一次推后。
@@ -215,10 +311,16 @@ class FollowUpdateScheduler:
             self._consecutive_failures = (
                 self._consecutive_failures + 1 if failed else 0)
             failures = self._consecutive_failures
+            if not failed:
+                self._failing_since = None
+            elif failures == 1:
+                self._failing_since = self._last_started_at
+            self._next_run_at = _stamp(datetime.now(timezone.utc)
+                                       + timedelta(minutes=self.backoff_minutes(failures)))
         if not failed or not self._started:
             return
         delay = self.backoff_minutes(failures)
-        if delay <= self.config.interval_minutes:
+        if delay <= self.tick:
             return
         try:
             self.scheduler.modify_job(
@@ -250,4 +352,5 @@ class FollowUpdateScheduler:
                 "last_checked": self._last_checked,
                 "last_added": self._last_added,
                 "consecutive_failures": self._consecutive_failures,
+                "failing_since": self._failing_since,
             }

@@ -3,6 +3,7 @@ import json
 import io
 from pathlib import Path
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -74,6 +75,65 @@ class ScrapingAccessTests(unittest.TestCase):
             self.assertEqual(factory.call_count, 2)
             self.assertEqual(fake.close.call_count, 2)
 
+    def test_javbus_language_preference_reaches_checks_and_work_pages(self):
+        from peach.sources import JavBusSource, Session
+
+        save(self.root, "javbus", {"network": "direct", "cookie": "PHPSESSID=test-session"})
+        seen = []
+
+        def respond(request):
+            seen.append(request.url.path)
+            if request.headers.get("Accept-Language") != "zh-CN,zh;q=0.9":
+                return httpx.Response(200, text="<title>Age Verification JavBus</title>")
+            self.assertIn("PHPSESSID=test-session", request.headers.get("cookie", ""))
+            return httpx.Response(200, text=(
+                '<h3>ABW-123 测试作品</h3>'
+                '<p><span class="header">識別碼:</span> ABW-123</p>'
+                '<a class="bigImage" href="/imgs/cover/test.jpg"></a>'))
+
+        def client(root, source, **kwargs):
+            return client_for(root, source, transport=httpx.MockTransport(respond), **kwargs)
+
+        with patch("peach.scraping_access.client_for", side_effect=client):
+            check = w_scraping_check(SimpleNamespace(follow_secrets_root=self.root), {"source": "javbus"})
+            self.assertTrue(check["results"][0]["ok"])
+            transport = SourceTransport(self.root)
+            self.addCleanup(transport.close)
+            record = JavBusSource().query("ABW-123", session=Session(transport))
+        self.assertEqual(record.code, "ABW-123")
+        self.assertEqual(record.cover_urls, ("https://www.javbus.com/imgs/cover/test.jpg",))
+        self.assertEqual(seen, ["/", "/ABW-123"])
+
+    def test_javbus_cover_language_overrides_caller_headers_without_changing_other_sources(self):
+        from peach.jav_cover_fetch import _fetch
+
+        for source in ("javbus", "javdb"):
+            save(self.root, source, {"network": "direct"})
+        seen = []
+
+        def respond(request):
+            seen.append(request)
+            return httpx.Response(200, content=b"cover")
+
+        def client(root, source, **kwargs):
+            return client_for(root, source, transport=httpx.MockTransport(respond), **kwargs)
+
+        transport = SourceTransport(self.root)
+        self.addCleanup(transport.close)
+        with patch("peach.scraping_access.client_for", side_effect=client):
+            self.assertEqual(_fetch(transport, "https://www.javbus.com/imgs/cover/test.jpg",
+                referer="https://www.javbus.com/ABW-123", limit=1024, ranged=True), b"cover")
+            transport(HttpRequest("GET", "https://www.javbus.com/ABW-123",
+                {"accept-language": "en-US", "X-Test": "preserved"}), 1, 1024)
+            self.assertEqual(_fetch(transport, "https://javdb.com/test.jpg",
+                referer="https://javdb.com/", limit=1024), b"cover")
+        self.assertEqual([request.headers["Accept-Language"] for request in seen],
+                         ["zh-CN,zh;q=0.9", "zh-CN,zh;q=0.9", "ja,en;q=0.9"])
+        self.assertEqual(seen[0].headers["Range"], "bytes=0-65535")
+        self.assertEqual(seen[0].headers["Referer"], "https://www.javbus.com/ABW-123")
+        self.assertEqual(seen[1].headers.get_list("Accept-Language"), ["zh-CN,zh;q=0.9"])
+        self.assertEqual(seen[1].headers["X-Test"], "preserved")
+
     def test_browser_obeys_global_direct_proxy_and_environment_modes(self):
         transport = SourceTransport(self.root)
         self.addCleanup(transport.close)
@@ -108,7 +168,7 @@ class ScrapingAccessTests(unittest.TestCase):
 
     def test_connections_do_not_claim_session_validity_or_echo_exception_urls(self):
         contract = SimpleNamespace(follow_secrets_root=self.root)
-        with patch("peach.web_scraping.SourceTransport") as factory:
+        with patch("peach.source_checks.SourceTransport") as factory:
             factory.return_value.side_effect = httpx.ConnectError("https://secret:password@example.org/")
             result = w_scraping_check(contract, {"source": "fc2cmadb"})
         self.assertFalse(result["session_verified"])
@@ -133,7 +193,7 @@ class ScrapingAccessTests(unittest.TestCase):
                  (HttpResponse(200, {}, b"<html>ok</html>", login), "ok", True, "", "登录"))
         for response, kind, ok, says, avoids in cases:
             with self.subTest(status=response.status, url=response.url), \
-                    patch("peach.web_scraping.SourceTransport") as factory:
+                    patch("peach.source_checks.SourceTransport") as factory:
                 factory.return_value.return_value = response
                 result = w_scraping_check(contract, {"source": "fc2cmadb"})["results"][0]
             self.assertEqual((result["kind"], result["ok"]), (kind, ok))
@@ -158,7 +218,7 @@ class ScrapingAccessTests(unittest.TestCase):
             (HttpResponse(200, {}, b"<title>Just a moment</title>", "https://airav.io/"), "cloudflare_challenge"),
         ]
         for outcome, reason in cases:
-            with self.subTest(reason=reason), patch("peach.web_scraping.SourceTransport") as factory:
+            with self.subTest(reason=reason), patch("peach.source_checks.SourceTransport") as factory:
                 if isinstance(outcome, Exception):
                     factory.return_value.side_effect = outcome
                 else:
@@ -271,6 +331,81 @@ class ScrapingAccessTests(unittest.TestCase):
             refused(request, 1, 100)
         self.assertEqual(round(json.loads(cooldown.read_text(encoding="utf-8"))["until"] - time.time()),
                          FIRST_BLOCKED_PAUSE)
+
+    def test_a_region_page_pauses_the_source_briefly_and_says_to_change_the_exit(self):
+        """地区限制页多半回 200，交给调用方只会被读成「解不出条目」或「站上没有」。
+
+        JavDB 对日本出口回 1.8 KB 的版权说明（2026-11-08 实测），DMM 系与日本站回英文或日文的
+        地区说明。三种都整站停下，而且只停最短的一档、连撞也不翻倍：要换出口才会变，用户改完
+        代理不该再等一整天。
+        """
+        from peach.scraping_access import FIRST_BLOCKED_PAUSE, SourcePaused, SourceRefused
+        pages = {
+            "javdb": ("https://javdb.com/actors/RJM8",
+                      "<html><body>\nDue to copyright restrictions, access to this site is prohibited in "
+                      "the country where your internet is located.\n<br /><br />\n"
+                      "由於版權限制，本站禁止了你的網路所在國家的訪問。\n</body></html>"),
+            "dmm": ("https://www.dmm.co.jp/digital/videoa/-/detail/=/cid=abw00358/",
+                    "<html><body><h1>Sorry! This content is not available in your region.</h1></body></html>"),
+            "mgstage": ("https://www.mgstage.com/product/product_detail/SIRO-5000/",
+                        "<html><body><p>申し訳ございません。お住まいの地域からはご利用になれません。</p></body></html>"),
+        }
+        for source, (url, page) in pages.items():
+            with self.subTest(source=source):
+                cooldown = self.root / f"scraping-{source}.cooldown.json"
+                waits = []
+                for _ in range(2):
+                    transport = SourceTransport(self.root)
+                    transport.transports[source] = lambda *args, page=page: HttpResponse(
+                        200, {}, page.encode("utf-8"))
+                    with self.assertRaises(SourceRefused) as refused:
+                        transport(HttpRequest("GET", url, {}), 1, 100000)
+                    self.assertEqual(refused.exception.reason, "geo_restricted")
+                    self.assertIn("换一个它接受的地区的出口", str(refused.exception))
+                    record = json.loads(cooldown.read_text(encoding="utf-8"))
+                    waits.append(round(record["until"] - time.time()))
+                    cooldown.write_text(json.dumps({"until": 0, "blocks": record["blocks"]}), encoding="utf-8")
+                self.assertEqual(waits, [FIRST_BLOCKED_PAUSE, FIRST_BLOCKED_PAUSE])
+                with self.assertRaises(SourcePaused):
+                    cooldown.write_text(json.dumps({"until": time.time() + 60, "blocks": 0}),
+                                        encoding="utf-8")
+                    SourceTransport(self.root)(HttpRequest("GET", url, {}), 1, 100)
+
+    def test_a_ban_page_doubles_like_a_refusal_and_ordinary_pages_pass(self):
+        """封禁说明页按 403 那一档翻倍；正文里没有这几句话的正常页原样交回。"""
+        from peach.scraping_access import FIRST_BLOCKED_PAUSE, SourceRefused
+        cooldown = self.root / "scraping-javbus.cooldown.json"
+        request = HttpRequest("GET", "https://www.javbus.com/ABW-358", {})
+        waits = []
+        for _ in range(2):
+            transport = SourceTransport(self.root)
+            transport.transports["javbus"] = lambda *args: HttpResponse(
+                200, {}, b"<html><body>The owner of this website has banned your access.</body></html>")
+            with self.assertRaises(SourceRefused) as refused:
+                transport(request, 1, 100000)
+            self.assertEqual(refused.exception.reason, "ip_banned")
+            record = json.loads(cooldown.read_text(encoding="utf-8"))
+            waits.append(round(record["until"] - time.time()))
+            cooldown.write_text(json.dumps({"until": 0, "blocks": record["blocks"]}), encoding="utf-8")
+        self.assertEqual(waits, [FIRST_BLOCKED_PAUSE, FIRST_BLOCKED_PAUSE * 2])
+        opened = SourceTransport(self.root)
+        opened.transports["javbus"] = lambda *args: HttpResponse(200, {}, b"<html>ABW-358 page</html>")
+        self.assertEqual(opened(request, 1, 100000).status, 200)
+        self.assertFalse(cooldown.exists())
+
+    def test_a_connection_check_names_the_region_refusal(self):
+        """来源检查撞上地区限制页：细档报 `geo_restricted`，话说到「换出口」，不是「稍后重试」。"""
+        from peach.scraping_access import source_checks
+        transport = SourceTransport(self.root)
+        transport.transports["javdb"] = lambda *args: HttpResponse(
+            200, {}, "由於版權限制，本站禁止了你的網路所在國家的訪問。".encode("utf-8"))
+        with patch("peach.source_checks.SourceTransport", return_value=transport):
+            result = w_scraping_check(SimpleNamespace(follow_secrets_root=self.root),
+                                      {"source": "javdb"})["results"][0]
+        self.assertFalse(result["ok"])
+        self.assertEqual((result["kind"], result["reason"]), ("auth", "geo_restricted"))
+        self.assertIn("换一个它接受的地区的出口", result["message"])
+        self.assertEqual(source_checks(self.root, "javdb")["connection"]["reason"], "geo_restricted")
 
     def test_community_sources_carry_the_pasted_cookie_on_public_requests(self):
         """JavBus 的年龄门和 javdb 的登录墙靠用户贴的 Cookie 过；别的来源公开采集不带会话。"""
@@ -542,7 +677,7 @@ class ScrapingAccessTests(unittest.TestCase):
             result = _fetch_cover(contract, "ABW-232")
         self.assertEqual(result["reason"], "network")
         self.assertIn(MOBILE_BROADBAND_HINT, result["error"])
-        with patch("peach.web_scraping.SourceTransport") as factory:
+        with patch("peach.source_checks.SourceTransport") as factory:
             factory.return_value.side_effect = httpx.ConnectError("EOF occurred in violation of protocol")
             checks = {item["label"]: item for item in
                       w_scraping_check(SimpleNamespace(follow_secrets_root=self.root), {"source": "dmm"})["results"]}
@@ -616,6 +751,67 @@ class BrowserFallbackTests(unittest.TestCase):
         save(self.root, "minnano-av", {"network": "direct"})
         self.assertTrue(fixed_to_browser(self.root, "minnano-av"), "改连接方式不丢固定")
 
+    def test_user_pause_between_http_and_browser_waits_before_opening_the_browser(self):
+        from peach.processing_control import ProcessingControl
+
+        control = ProcessingControl(self.root / 'control.json')
+        paused = threading.Event()
+        finished = threading.Event()
+        errors = []
+        browser = self.browser(lambda request: HttpResponse(200, {}, b'<title>actress</title>'))
+        transport = SourceTransport(self.root)
+        self.addCleanup(transport.close)
+
+        def http(*args):
+            control.request('pause', 'job')
+            return HttpResponse(403, {}, b'')
+
+        transport.transports['minnano-av'] = http
+
+        def run():
+            try:
+                with control.bind('job', publish=lambda **values: paused.set() if values.get('status') == 'paused' else None,
+                                  active=lambda: True, db_path=self.root / 'database/ledger.db', mode='high'):
+                    transport(self.request, 1, 100)
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                finished.set()
+
+        with patch('peach.browser_transport.shared', return_value=browser):
+            thread = threading.Thread(target=run)
+            thread.start()
+            try:
+                self.assertTrue(paused.wait(2))
+                self.assertEqual(browser.calls, [])
+                self.assertFalse(finished.is_set())
+            finally:
+                control.request('resume', 'job')
+                thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(browser.calls, [self.SEARCH])
+
+    def test_user_cancel_between_http_and_browser_does_not_open_the_browser(self):
+        from peach.jobs import JobCancelled
+        from peach.processing_control import ProcessingControl
+
+        control = ProcessingControl(self.root / 'control.json')
+        transport = SourceTransport(self.root)
+        self.addCleanup(transport.close)
+
+        def http(*args):
+            control.request('cancel', 'job')
+            return HttpResponse(403, {}, b'')
+
+        transport.transports['minnano-av'] = http
+        with patch('peach.browser_transport.shared') as browser, \
+                control.bind('job', publish=lambda **values: None, active=lambda: True,
+                             db_path=self.root / 'database/ledger.db', mode='high'):
+            with self.assertRaises(JobCancelled):
+                transport(self.request, 1, 100)
+        browser.assert_not_called()
+
     def test_a_challenge_page_over_http_also_gets_the_browser_check(self):
         challenge = HttpResponse(200, {}, b"<html><head><title>Just a moment...</title></head></html>")
         page = HttpResponse(200, {}, b"<title>actress</title>")
@@ -674,3 +870,93 @@ class BrowserFallbackTests(unittest.TestCase):
         with patch("peach.browser_transport.shared", side_effect=AssertionError("avwikidb 不走浏览器")), \
                 self.assertRaises(SourcePaused):
             transport(HttpRequest("GET", "https://avwikidb.com/actor/x/", {}), 1, 100)
+
+
+class SourcePreflightTests(unittest.TestCase):
+    def test_batch_deduplicates_and_preserves_target_failures(self):
+        from peach.source_preflight import check_sources
+        def check(root, source, **options):
+            self.assertTrue(options['preflight'])
+            return {'results': [{'label': '来源页面', 'ok': source == 'dmm'},
+                                {'label': '高清图片 CDN', 'ok': False, 'reason': 'network'}]}
+        with patch('peach.source_preflight.check_source', side_effect=check) as checked:
+            result = check_sources(Path('/unused'), ['dmm', 'javdb', 'dmm'])
+        self.assertEqual(checked.call_count, 2)
+        self.assertEqual([row['source'] for row in result['sources']], ['dmm', 'javdb'])
+        self.assertFalse(result['ok'])
+        self.assertTrue(all(not row['session_verified'] for row in result['sources']))
+        with patch('peach.source_preflight.check_source') as checked:
+            for selected in ([], ['unknown'], ['dmm', 'unknown']):
+                with self.assertRaises(ValueError):
+                    check_sources(Path('/unused'), selected)
+            checked.assert_not_called()
+
+    def test_preflight_bounds_requests_and_uses_no_browser(self):
+        from peach.source_checks import check_source
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch('peach.source_checks.SourceTransport') as factory:
+                factory.return_value.return_value = HttpResponse(200, {}, b'<html></html>')
+                result = check_source(root, 'javdb', preflight=True)
+            self.assertTrue(result['results'][0]['ok'])
+            factory.assert_called_once_with(root, max_requests=12, max_bytes=12 * 65536,
+                                            max_seconds=15, allow_browser=False)
+            factory.return_value.close.assert_called_once()
+
+    def test_each_source_reaches_caller_thread_with_report_outcome(self):
+        from peach.source_preflight import check_sources
+        reasons = {'dmm': 'cloudflare_challenge', 'javdb': 'cooldown', 'javbus': 'server_error'}
+        def check(root, source, **options):
+            return {'results': [{'label': '来源页面', 'ok': False, 'reason': reasons[source]}]}
+        seen = []
+        with patch('peach.source_preflight.check_source', side_effect=check):
+            result = check_sources(Path('/unused'), list(reasons), on_result=lambda row: seen.append(
+                (row['source'], threading.current_thread())))
+        self.assertEqual({source for source, _ in seen}, set(reasons))
+        self.assertTrue(all(thread is threading.current_thread() for _, thread in seen))
+        self.assertEqual([row['results'][0]['outcome_label'] for row in result['sources']],
+                         ['登录或人机验证', '冷却', 'HTTP 错误'])
+
+    def test_cooling_source_reports_cooldown_without_request(self):
+        from peach.scraping_access import _pause, cooldown_path
+        from peach.source_preflight import check_sources
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _pause(cooldown_path(root, 'javdb'), time.time() + 600)
+            with patch.object(SourceTransport, '_transport_for', side_effect=AssertionError('冷却中不应发请求')):
+                row = check_sources(root, ['javdb'])['sources'][0]['results'][0]
+        self.assertEqual((row['outcome'], row['outcome_label']), ('cooldown', '冷却'))
+
+    def test_check_all_job_counts_progress_and_keeps_result(self):
+        from peach.jobs import BackgroundJob
+        from peach.source_preflight import default_sources
+        from peach.web_scraping import w_scraping_check_all
+        job =BackgroundJob('test-source-check', task_key='source-check')
+        contract = SimpleNamespace(follow_secrets_root=Path('/unused'), source_check_job=job)
+        def check(root, source, **options):
+            return {'results': [{'label': '来源页面', 'ok': source == 'dmm',
+                                 'reason': 'ok' if source == 'dmm' else 'timeout'}]}
+        with patch('peach.source_preflight.check_source', side_effect=check):
+            started = w_scraping_check_all(contract, {})
+            job.thread.join(10)
+        state = job.snapshot()
+        self.assertEqual((started['status'], started['checked']), ('running', 0))
+        self.assertEqual(state['status'], 'complete')
+        self.assertEqual(state['checked'], state['total'])
+        self.assertEqual([row['source'] for row in state['results']], default_sources())
+        self.assertEqual(state['failed'], state['total'] - 1)
+
+    def test_http_only_transport_does_not_launch_or_fix_browser_route(self):
+        from peach.scraping_access import SourcePaused, fix_to_browser, fixed_to_browser
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fix_to_browser(root, 'minnano-av')
+            transport = SourceTransport(root, allow_browser=False)
+            with patch.object(transport, '_browser_for', side_effect=AssertionError('不能启动浏览器')), \
+                    patch('peach.scraping_access.client_for') as client:
+                client.return_value = httpx.Client(transport=httpx.MockTransport(
+                    lambda request: httpx.Response(403, content=b'blocked')))
+                with self.assertRaises(SourcePaused):
+                    transport(HttpRequest('GET', 'https://www.minnano-av.com/', {}), 1, 1024)
+            transport.close()
+            self.assertTrue(fixed_to_browser(root, 'minnano-av'))

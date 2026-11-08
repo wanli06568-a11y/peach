@@ -3,6 +3,9 @@ main{position:relative;z-index:1;padding:14px 16px 90px}
 #catalogPageHeading,#javLibraryHeader,#listTitle{padding:20px 16px 0;margin:0 0 20px}
 #catalogPageHeading[hidden],#javLibraryHeader[hidden]{display:none}
 #catalogPageHeading h2{margin:0;font:var(--board-title)}
+/* 搜索结果的标题带着搜索词，长词只占一行：词那一段由 `fitTitleWords` 截到放得下，收尾的「」」
+   留在末尾；全文在悬停与搜索框里。 */
+#catalogPageHeading h2{overflow:hidden;white-space:nowrap}
 h2[data-page-title]{margin:0;font:var(--board-title);letter-spacing:0}
 @media(max-width:760px){#catalogPageHeading h2,h2[data-page-title]{font:var(--board-figure)}}
 .count{position:sticky;top:calc(var(--topH) + var(--filterH));z-index:60;
@@ -13,7 +16,7 @@ h2[data-page-title]{margin:0;font:var(--board-title);letter-spacing:0}
    回收站这类页面直接贴着顶栏吸。manage-static（垃圾复核）不吸顶，要压过这条。 */
 .count.no-tagbar{top:var(--topH)}
 .count.manage-static{position:relative;top:auto;z-index:1}
-.resourcesyncbox{overflow:clip;border:1px solid var(--field-ring);border-radius:var(--floating-radius);background:var(--ground)}.resourcesyncbody{padding:20px}.resourcesyncbody p{max-width:760px;margin:0;color:var(--muted);font-size:var(--fs-sm);line-height:1.55}.resourcesyncfooter{box-sizing:border-box;min-height:var(--fieldset-bar-h);display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:12px 20px;border-top:1px solid var(--line-soft);background:var(--overlay-5)}.resourcesyncfooter p{margin:0;color:var(--muted);font-size:var(--fs-xs);line-height:1.5}.resourceaction{box-sizing:border-box;height:36px;padding:0 12px;border:0;border-radius:var(--control-radius);box-shadow:0 0 0 1px var(--line-soft);background:var(--ground);color:var(--ink-2);display:inline-flex;align-items:center;justify-content:center;gap:8px;flex:none;font:inherit;font-size:var(--fs-sm);font-weight:500;cursor:pointer;transition:background-color .12s,color .12s}.resourceaction:hover:not(:disabled){background:color-mix(in srgb,var(--ink) 8%,var(--ground));color:var(--ink)}.resourceaction:focus-visible{outline:2px solid var(--tungsten);outline-offset:2px}.resourceaction:disabled{background:var(--sunk);color:var(--muted);cursor:not-allowed}.resourceaction svg{width:16px;height:16px;stroke:currentColor;fill:none}
+.resourcesyncbox{overflow:clip;border:1px solid var(--field-ring);border-radius:var(--floating-radius);background:var(--ground)}
 .tagbar,.count{transition:background-color .16s ease,border-color .16s ease}
 /* 吸顶那条是底色的半透明版，配方跟着 --ground 走：写死深色底会在浅色主题下
    变成一条黑带压在白底内容上。 */
@@ -67,7 +70,7 @@ h2[data-page-title]{margin:0;font:var(--board-title);letter-spacing:0}
 .gridstack{display:flex;flex-direction:column;gap:16px}
 /* 列距 16px 是给悬停面留的：卡片悬停时底色往盒外多铺 8px（见下方 `:hover`），列距再窄，
    两张卡的悬停面就顶到邻卡上。 */
-.grid{gap:24px 16px}
+.grid{gap:24px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,var(--tile)),1fr))}
 .card{cursor:pointer;display:flex;flex-direction:column;gap:8px;min-width:0;border-radius:var(--surface-radius);
   position:relative;transition:transform .18s ease,filter .18s ease,background-color .15s ease,box-shadow .15s ease;transform-origin:center}
@@ -105,21 +108,11 @@ h2[data-page-title]{margin:0;font:var(--board-title);letter-spacing:0}
    整张卡压低 7px 并加高 7px，同一行里 Mix 卡的封面和下面的文字就比邻居矮一截；
    往上堆之后卡片盒和普通卡完全同高，下沿自然平齐。
    纸边与封面是同一种表面，圆角同一档：容器取封面那一档，纸边继承容器。 */
-.mixstack{position:relative;isolation:isolate;border-radius:var(--badge-radius)}
-.mixstack::before,.mixstack::after{content:"";position:absolute;border-radius:inherit;
-  border:1px solid var(--border-15);background:color-mix(in srgb,var(--surface) 84%,var(--video-glow,#15202a));z-index:0}
-.mixstack::before{inset:0 12px 8px;transform:translateY(-7px);opacity:.54}
-.mixstack::after{inset:0 6px 4px;transform:translateY(-4px);opacity:.78}
-.mixstack .pic{z-index:1}
-.playlistcard .mixmeta{display:flex;min-width:0;gap:9px;align-items:flex-start}
-.playlistcard .mixcopy{flex:1}
-.mixcopy{min-width:0}.mixcopy b,.mixcopy span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.mixcopy b{font-size:var(--fs-md);line-height:1.45}.mixcopy span{font-size:var(--fs-xs);color:var(--muted);margin-top:2px}
-/* 圆角只在最外面裁一次：`clip-path` 配一层满格的矩形蒙版，格子里的黑底、封面、悬停层与模糊衬底
+/* 圆角只在最外面裁一次：`clip-path` 配一层满格的矩形蒙版，格子里的底色、封面、悬停层与模糊衬底
    先合成一张再按 `--pic-radius` 切。格子本身不写 `border-radius`，`overflow` 就只是矩形裁切：按圆角
    裁的话每一层各切一次，抗锯齿那一圈里底下的黑会透上来，浅色封面四角就是一圈灰黑边。光有
    `clip-path` 不够，没有蒙版时 Chrome 照样逐层切。 */
-.pic{--pic-radius:var(--badge-radius);position:relative;aspect-ratio:var(--card-ratio,16/9);background:#000;
+.pic{--pic-radius:var(--badge-radius);position:relative;aspect-ratio:var(--card-ratio,16/9);background:var(--color-background-quaternary-default);
   clip-path:inset(0 round var(--pic-radius));mask-image:linear-gradient(#000 0 0);
   overflow:hidden;display:flex;align-items:center;justify-content:center}
 /* 传统正封的比例留白使用同图补底，圆角由最外层统一裁切。 */
@@ -150,7 +143,7 @@ body .card:focus-within{background:var(--hover);box-shadow:0 0 0 8px var(--hover
 .hovertools button svg{width:25px;height:25px;stroke:currentColor;fill:none;stroke-width:2;
   stroke-linecap:round;stroke-linejoin:round}
 .hovertools button:hover{transform:scale(1.12);background:rgba(0,0,0,.34)}
-.nopic{font-size:var(--fs-xs);letter-spacing:.12em;color:var(--muted);text-transform:uppercase}
+.nopic{font-size:var(--fs-xs);letter-spacing:.12em;color:var(--ink-2);text-transform:uppercase}
 .junkcount{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:48px}
 /* 复核那条分类切换在 10 个互不相同的候选数据集之间切（真 tablist）。
    几何取 Geist Tabs 的 secondary 变体（vercel.com/geist/tabs 实测 2026-09-03）：高 32px、
@@ -207,29 +200,23 @@ body .card:focus-within{background:var(--hover);box-shadow:0 0 0 8px var(--hover
    子元素就不截，iOS 上长标题会整段摊开，把「接着看」那一排撑得老高。 */
 .meta .t{font-size:var(--fs-md);line-height:1.35;min-height:2.7em;max-height:2.7em;overflow:hidden;display:-webkit-box;
   -webkit-line-clamp:2;-webkit-box-orient:vertical;word-break:break-all}
+/* 徽章字样永远一行：放进挤窄的 flex 行里时不收缩、不折字，宁可整枚换到下一行。 */
 .javedition{display:inline-flex;align-items:center;min-height:18px;padding:0 5px;border:1px solid currentColor;
-  border-radius:var(--badge-radius);font-size:var(--fs-xs);line-height:16px;font-weight:600;letter-spacing:0;vertical-align:1px}
+  border-radius:var(--badge-radius);font-size:var(--fs-xs);line-height:16px;font-weight:600;letter-spacing:0;vertical-align:1px;
+  white-space:nowrap;flex-shrink:0}
 .javedition.subtitle{color:var(--ink-2)}
 .javedition.uncensored{color:var(--meter)}
-.javedition.cracked{color:var(--drop)}
+.javedition.leaked{color:var(--loupe)}
+/* 破解不用 `--drop`：那是删除与出错的颜色，放在版次上像是文件坏了。紫色取 Board UI 状态色，明暗各一套。 */
+.javedition.cracked{color:var(--color-status-purple-text)}
 .javedition.censored{color:var(--muted)}
-/* 卷号说的是「这是第几份文件」，不是版次，用中性灰和三种版次色区分开。 */
+/* 卷号说的是「这是第几份文件」，不是版次，用中性灰和各版次色区分开。 */
 .javedition.partlabel{color:var(--muted);margin-left:6px}
 .meta .s{display:flex;gap:8px;color:var(--muted);align-items:center;flex-wrap:wrap}
 .meta .who{color:var(--ink-2);min-width:0;max-width:100%;display:inline-block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
 /* 归属渲染成 `<span>` 就是不可点的那一种（队列行整行本身是按钮，里面嵌不了按钮）。
    染成强调色会让人以为能点，点下去却落到卡片本身、打开的是视频详情。 */
 .meta span.who{color:var(--ink-2);cursor:default}
-/* 标签语义分级 */
-/* 卡片上那一行标签归 React 卡片（`media-card.css` 的 `[data-media-tags]`）。
-   .tg 只留 max-width:100% 这一层兜底：一颗标签自己就比整张卡还宽时，横着溢出会
-   压到卡片外面，这时候省略号是唯一的出路。 */
-.tg{padding:var(--tag-pad-y) var(--tag-pad-x);border-radius:var(--tag-radius);font:inherit;font-size:var(--fs-xs);border:1px solid var(--line);
-  line-height:1.45;white-space:nowrap;cursor:pointer;color:var(--ink-2);overflow:hidden;text-overflow:ellipsis;max-width:100%;
-  background:var(--tag-fill)}
-.tg.meta,.tg.position{color:var(--ink-2);border-color:var(--line)}
-.tg:hover{color:var(--ink);background:var(--hover)}
-.tg:disabled{cursor:not-allowed}
 /* 顶栏的密集模式固定为标题、身份、标签三行。缺少标签时第三行仍保留，
    同一网格不会再被大小、观看次数或长身份撑成四行。分卷卡已有 7px 叠层空间，
    密集网格的普通卡也保留同一高度，避免每行是否出现分卷卡决定整行高度。
@@ -237,15 +224,15 @@ body .card:focus-within{background:var(--hover);box-shadow:0 0 0 8px var(--hover
    焦点环不被这一层裁掉。子元素把指针接回来；资料页新作那一行
    的卡整块放行指针（见 `.feednewcard`），不接回来。 */
 body[data-density="dense"] .grid>.card{padding-top:7px}
-body[data-density="dense"] .card .meta{--card-meta-block:calc(2.7em + 36px)}
-body[data-density="dense"] .card .mtext{display:grid;grid-template-rows:1.35em 1.35em 30px;
+body[data-density="dense"] .card:not(.feednewcard) .meta{--card-meta-block:calc(2.7em + 36px)}
+body[data-density="dense"] .card:not(.feednewcard) .mtext{display:grid;grid-template-rows:1.35em 1.35em 30px;
   gap:3px;margin:-4px;padding:4px;height:calc(var(--card-meta-block) + 8px);overflow:hidden;pointer-events:none}
 body[data-density="dense"] .card:not(.feednewcard) .mtext>*{pointer-events:auto}
-body[data-density="dense"] .card .meta .t{display:block;max-width:100%;min-height:1.35em;overflow:hidden;
+body[data-density="dense"] .card:not(.feednewcard) .meta .t{display:block;max-width:100%;min-height:1.35em;overflow:hidden;
   -webkit-line-clamp:unset;white-space:nowrap;text-overflow:ellipsis}
-body[data-density="dense"] .card .meta .s{height:1.35em;min-height:0;flex-wrap:nowrap;overflow:hidden;white-space:nowrap}
-body[data-density="dense"] .card .meta .who{flex:0 1 auto}
-body[data-density="dense"] .card .meta .size{flex:none;white-space:nowrap}
+body[data-density="dense"] .card:not(.feednewcard) .meta .s{height:1.35em;min-height:0;flex-wrap:nowrap;overflow:hidden;white-space:nowrap}
+body[data-density="dense"] .card:not(.feednewcard) .meta .who{flex:0 1 auto}
+body[data-density="dense"] .card:not(.feednewcard) .meta .size{flex:none;white-space:nowrap}
 
 .srow{display:flex;gap:13px;overflow-x:auto;padding-bottom:7px}
 
@@ -268,7 +255,25 @@ body[data-density="dense"] .card .meta .size{flex:none;white-space:nowrap}
 }
 /* 连不上图片主机那条 Note 与下面一行隔 12px：横排自己往上收了 8px，这里先垫回来。 */
 .feednetwork{margin-bottom:20px}
+/* 这一行的一键插队（提示条或进度条）同理；没有排队的就整块不占位。 */
+[data-feed-cover-queue]:not(:empty){margin-bottom:20px}
 .feednewcard{flex:none;width:168px}
+/* 横排新作固定为窄卡，头像占位与 React 窄卡使用同一紧叠尺寸。 */
+.feednewcard .mavstack{--media-avatar-gaps:max(1,calc(var(--media-avatar-count) - 1));
+  position:relative;display:block;width:calc(var(--media-avatar-tight) + 7px + var(--media-avatar-tight-step) * (var(--media-avatar-count) - 1));
+  max-width:min(var(--media-avatar-tight-max),max(45px,24%));height:38px;margin:-4px -2px -2px;padding:0}
+.feednewcard .mavstack .mav{position:absolute;top:6px;width:var(--media-avatar-tight);height:var(--media-avatar-tight);margin:0;
+  left:calc(5px + (100% - var(--media-avatar-tight) - 7px) / var(--media-avatar-gaps) * var(--media-avatar-index))}
+.feednewcard .mavstack .mav+.mav{margin-left:0}
+/* 首页那一行行尾的「查看全部新作」：和卡同宽、只占封面那一格的高，底色与圆角同旁边新作卡的封面格，
+   一排看下来是同一种格子；字和箭头排成一行，与分页「下一页」那颗键同一个写法。悬停换到同一组令牌的
+   悬停档。 */
+.feednewall{flex:none;align-self:flex-start;width:168px;aspect-ratio:var(--card-ratio);display:flex;
+  align-items:center;justify-content:center;gap:4px;border-radius:var(--surface-radius);background:var(--color-background-tertiary-default);
+  color:var(--ink-2);font-size:var(--fs-sm);font-weight:500;text-decoration:none;transition:background-color .2s ease-out,color .2s ease-out}
+.feednewall:hover{background:var(--color-background-tertiary-hover);color:var(--ink)}
+.feednewall:focus-visible{outline:2px solid var(--tungsten);outline-offset:2px}
+.feednewall svg{width:var(--icon-inline);height:var(--icon-inline);stroke:currentColor;fill:none;stroke-width:2}
 /* 已看过的不移走，只退到背景里：已读是标记，不是关掉。 */
 .feednewcard.isread{opacity:.55}
 /* 通向作品页的点击区，铺满整张卡，是一条外链。
@@ -276,8 +281,18 @@ body[data-density="dense"] .card .meta .size{flex:none;white-space:nowrap}
    接；这张卡只有这条外链，所以两块放行指针，落到下面的链接上，悬浮键自己再收回来。 */
 .feednewopen{position:absolute;inset:0;z-index:1;border-radius:inherit}
 .feednewcard>.pic,.feednewcard>.meta{pointer-events:none}
-.feednewcard .meta a.mav{pointer-events:auto}
+/* 头像不论认没认出都收回指针：叠放头像的抬起与让位靠 `:hover`，没认出的那枚放行了指针就抬不起来，
+   整组的动画在它那里断掉。没认出的不是链接，点它不打开作品，名字在悬停说明里。 */
+.feednewcard .meta .mav{pointer-events:auto}
 .feednewcard .meta span.mav{cursor:default}
+/* 还没有封面的那一格（`coverStateHtml`）：状态字、一两行原因、一颗当场取的键。原因多了截在三行，
+   全文在悬停说明里。封面格放行了指针，这颗键自己收回来。 */
+.feedcoverstate{display:flex;flex-direction:column;align-items:center;gap:6px;max-width:100%;padding:0 12px;text-align:center}
+.feedcoverreason{font-size:var(--fs-xs);line-height:1.45;color:var(--muted);display:-webkit-box;-webkit-box-orient:vertical;
+  -webkit-line-clamp:3;overflow:hidden;overflow-wrap:anywhere}
+.feedcoverstate button{pointer-events:auto;margin-top:4px}
+/* 正在取那一枚不定进度圆环摆在状态字上面，不带横幅里那份右侧间距。 */
+.feedcoverstate>[role="progressbar"]{margin:0}
 .feednewopen:focus-visible{outline:2px solid var(--tungsten);outline-offset:2px}
 /* 三颗动作键沿用 `.hovertools` 的磨砂圆底，只换尺寸和落点。`.hovertools` 默认
    `pointer-events:none`——那是为了让指针落到底下的预览上，而这三颗是这张卡唯一能按的
@@ -287,18 +302,25 @@ body[data-density="dense"] .card .meta .size{flex:none;white-space:nowrap}
 .feednewcard:hover .feednewtools button,.feednewcard:focus-within .feednewtools button{pointer-events:auto}
 .feednewtools button{width:32px;height:32px}
 .feednewtools button svg{width:17px;height:17px}
+@media(hover:none),(pointer:coarse){
+  .feednewcard .feednewtools{opacity:1}
+  .feednewcard .feednewtools button{pointer-events:auto}
+}
 /* 「想要」按下时星形填实：同一颗键既是开关也是读数。 */
 .feednewtools button[aria-pressed="true"] svg{fill:currentColor}
 .feednewcard .meta .t{font-size:var(--fs-sm)}
 /* 番号整段不折行；比卡还宽的长串在卡边收成省略号，不被标题块的溢出裁成半个字。 */
 /* 出演名单与完整日期分行，窄卡中的姓名仍有自己的宽度。 */
-.feednewcard .meta .s{display:grid;gap:0;white-space:nowrap;min-height:2lh}
+.feednewcard .meta .s{display:grid;grid-auto-rows:minmax(1.35em,auto);gap:2px;
+  line-height:1.35;white-space:nowrap;min-height:calc(2lh + 2px)}
 .feednewcard .meta .s>span{min-width:0}
 .feednewcard .meta .s>.feednewperformers{overflow:hidden;text-overflow:ellipsis}
 /* 占位卡直接套真卡的 `.t` 与 `.s`：标题块是两行 2.7em，下面那行放一个零宽字符，行高
    跟真卡那行字同一套规则，到货那一下整行不跳。 */
 .feednewskeleton{pointer-events:none}
-.feednewcard:not(.feednewskeleton) .pic{background-color:var(--surface);color:var(--muted)}
+/* 没有图的封面格用 BoardUI 的三级底：浅色主题里 `--hover`、`--surface` 都只比页面白一点点，
+   「抓取中」「排队中」「无封面」那几格看不出格子。 */
+.feednewcard:not(.feednewskeleton) .pic{background-color:var(--color-background-tertiary-default);color:var(--muted)}
 .feednewskeleton .pic{background:var(--hover)}
 .feednewskeleton .t>.skeleton{height:2.7em}
 .feednewskeleton .s>.skeleton{width:72%;height:auto}

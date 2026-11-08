@@ -22,15 +22,16 @@ import { cx } from '@/utils/cx';
 
 import { errorMessage } from '../../api';
 import type { PlaylistsProps } from '../bundle';
-import { EmptyState } from '../components/empty-state';
+import { EmptyState, EmptyFocusButton } from '../components/empty-state';
 import { RetryNote } from '../components/grid-reveal';
 import { MixCard } from '../components/mix-card';
 import { ModalFrame } from '../components/modal-frame';
+import { ObjectOrderDialog } from '../components/object-order-dialog';
 import { spriteGlyph } from '../components/sprite-glyph';
 import { busyProps } from '../settings/use-action';
 import {
   createPlaylist, deletePlaylist, fetchPlaylists, keepPlaylist, PLAYLISTS_KEY, posterUrl, recreatePlaylist,
-  refreshPlaylists, renamePlaylist, resumeAssetId, type PlaylistRow,
+  refreshPlaylists, renamePlaylist, resumeAssetId, fetchPlaylist, reorderPlaylist, type PlaylistRow,
 } from './playlists';
 
 const ELLIPSIS = spriteGlyph('ellipsis');
@@ -135,7 +136,7 @@ function RenameDialog({ target, close, toast }: { target: PlaylistRow | null; cl
  *  触发键静止时是透明的一枚字形，指上或展开才铺一块面，和裁剪封面那枚同一副
  *  （`../cover-crop/cover-crop-page.tsx`）。BoardUI 的图标钮静止态都有面：`ghost` 是一块
  *  浅蓝，`IconButton` 是白底描边，每张卡都顶着一块，署名行就不再只是头像与标题。 */
-function PlaylistMenu({ name, onRename, onDelete }: { name: string; onRename(): void; onDelete(): void }) {
+function PlaylistMenu({ name, onRename, onDelete, onSort }: { name: string; onRename(): void; onDelete(): void; onSort(): void }) {
   const trigger = useRef<HTMLButtonElement>(null);
   const [open, setOpen] = useState(false);
   const run = (action: () => void) => { setOpen(false); action() };
@@ -151,10 +152,13 @@ function PlaylistMenu({ name, onRename, onDelete }: { name: string; onRename(): 
         {/* 面板外宽 172px，同旧卡片菜单：外框再加 10px 内边距与 1px 描边。 */}
         <Dialog aria-label={`播放列表操作：${name}`} className="flex w-37.5 flex-col gap-0.5 outline-none">
           <button type="button" className={MENU_ROW} onClick={() => run(onRename)}>
-            <PENCIL aria-hidden className="size-4 shrink-0" />编辑名称
+            <PENCIL aria-hidden className="size-(--icon-inline) shrink-0" />编辑名称
+          </button>
+          <button type="button" className={MENU_ROW} onClick={() => run(onSort)}>
+            <PLAYLIST aria-hidden className="size-(--icon-inline) shrink-0" />调整播放顺序
           </button>
           <button type="button" className={MENU_ROW} onClick={() => run(onDelete)}>
-            <TRASH aria-hidden className="size-4 shrink-0" />删除播放列表
+            <TRASH aria-hidden className="size-(--icon-inline) shrink-0" />删除播放列表
           </button>
         </Dialog>
       </Popover>
@@ -165,6 +169,7 @@ function PlaylistMenu({ name, onRename, onDelete }: { name: string; onRename(): 
 export function PlaylistsPage({ openPlaylist, openEntity, canFlip, toast, revision }: PlaylistsProps) {
   const playlists = useQuery({ queryKey: PLAYLISTS_KEY, queryFn: ({ signal }) => fetchPlaylists(signal) });
   const [renaming, setRenaming] = useState<PlaylistRow | null>(null);
+  const [sorting, setSorting] = useState<PlaylistRow | null>(null);
   /* 壳要求重读：首帧那一代已经由 `prefetch` 取过，之后每加一次重取一次。 */
   const seen = useRef(revision);
   useEffect(() => {
@@ -220,18 +225,37 @@ export function PlaylistsPage({ openPlaylist, openEntity, canFlip, toast, revisi
                   canFlip={canFlip} faces={row.faces || []} onOpenEntity={openEntity}
                   {...(resume ? { onOpen: () => openPlaylist(row.id, resume) } : {})}
                   openLabel={`打开播放列表 ${name}`}
-                  menu={<PlaylistMenu name={name} onRename={() => setRenaming(row)} onDelete={() => remove(row)} />} />
+                  menu={<PlaylistMenu name={name} onRename={() => setRenaming(row)} onDelete={() => remove(row)} onSort={() => setSorting(row)} />} />
               );
             })}
           </div>
         )
         : (
-          <EmptyState icon={PLAYLIST} title="还没有播放列表">
+          <EmptyState icon={PLAYLIST} title="还没有播放列表"
+            actions={<EmptyFocusButton target='[data-playlist-create] input'>新建播放列表</EmptyFocusButton>}>
             保存 Mix 或新建列表后，会在这里按自己的顺序继续播放。
           </EmptyState>
         )}
       </div>
       <RenameDialog target={renaming} close={() => setRenaming(null)} toast={toast} />
+      {sorting ? <PlaylistOrder key={sorting.id} row={sorting} close={() => setSorting(null)} toast={toast} /> : null}
     </div>
   );
+}
+
+function PlaylistOrder({ row, close, toast }: { row: PlaylistRow; close(): void; toast: Toast }) {
+  const query = useQuery({ queryKey: ['playlist-order', row.id], queryFn: ({ signal }) => fetchPlaylist(row.id, signal),
+    staleTime: 0, refetchOnWindowFocus: false, refetchOnReconnect: false });
+  const data = query.data;
+  if (!data || query.isFetching) return <ModalFrame isOpen onOpenChange={open => { if (!open) close() }} width="form" label="调整播放顺序">
+    <div className="p-5">{query.isError ? <RetryNote message={errorMessage(query.error)} onRetry={() => void query.refetch()} /> : <p role="status">正在读取播放列表</p>}
+      <Button variant="secondary" onClick={close}>取消</Button></div>
+  </ModalFrame>;
+  return <ObjectOrderDialog title={`调整播放顺序 · ${row.name}`} close={close}
+    items={data.items.map(item => ({ id: String(item.id), name: item.title || item.name || `影片 ${item.id}` }))}
+    save={async keys => {
+      await reorderPlaylist(row.id, keys.map(Number));
+      void refreshPlaylists();
+      toast('播放顺序已保存', { undo: undoing(() => reorderPlaylist(row.id, data.items.map(item => item.id))) });
+    }} />;
 }

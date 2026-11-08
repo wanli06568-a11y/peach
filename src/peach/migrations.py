@@ -61,25 +61,29 @@ def plan(db_path: Path, directory: Path) -> tuple[list[Migration], list[Migratio
     all_migrations = discover(directory)
     # status 对既有数据库使用 SQLite 只读 URI，保证不会创建 journal/WAL 或触发隐式写入。
     connection = (sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)
-                  if db_path.exists() else sqlite3.connect(db_path))
+                  if db_path.exists() else sqlite3.connect(':memory:'))
     try:
         done = applied(connection)
     finally:
         connection.close()
+    unknown = set(done) - {migration.version for migration in all_migrations}
+    if unknown:
+        raise RuntimeError('数据库包含当前程序不支持的迁移，请使用匹配版本或升级前备份')
     for migration in all_migrations:
         if migration.version in done and done[migration.version] != migration.checksum:
             raise RuntimeError(f"已应用 migration {migration.version} 的 checksum 已变化")
     return all_migrations, [m for m in all_migrations if m.version not in done]
 
 
-def sqlite_backup(source: Path, destination: Path) -> None:
+def sqlite_backup(source: Path, destination: Path, *, pages: int = -1, progress=None) -> None:
+    """`pages` 与 `progress` 原样交给 `Connection.backup`：分页复制时每页之间放开源库的读锁，并报进度。"""
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
         raise FileExistsError(destination)
     src = sqlite3.connect(source)
     dst = sqlite3.connect(destination)
     try:
-        src.backup(dst)
+        src.backup(dst, pages=pages, progress=progress)
     finally:
         dst.close()
         src.close()
@@ -136,24 +140,23 @@ def upgrade(db_path: Path, directory: Path, backup_path: Path | None = None) -> 
                 + reconcile
                 + "\nINSERT INTO schema_migration(version,name,checksum,applied_at) VALUES("
                 + ",".join(_quote(x) for x in (migration.version, migration.name, migration.checksum, stamp))
-                + ");\nCOMMIT;"
+                + ");\n"
             )
             try:
                 connection.executescript(script)
-            except Exception:
+                if keys_off:
+                    broken = connection.execute("PRAGMA foreign_key_check").fetchall()
+                    if broken:
+                        raise RuntimeError(
+                            f"migration {migration.version} 关闭外键后留下 {len(broken)} 条"
+                            f"违约行：{broken[:5]}")
+                connection.commit()
+            except BaseException:
                 if connection.in_transaction:
                     connection.rollback()
                 raise
             finally:
                 connection.execute("PRAGMA foreign_keys=ON")
-            if keys_off:
-                # 外键关着跑完，正确性就得自己交代。留下孤儿行的迁移在这里失败，
-                # 而不是等某个运维脚本半年后撞上 `foreign_key_check`。
-                broken = connection.execute("PRAGMA foreign_key_check").fetchall()
-                if broken:
-                    raise RuntimeError(
-                        f"migration {migration.version} 关闭外键后留下 {len(broken)} 条"
-                        f"违约行：{broken[:5]}")
         connection.execute("PRAGMA optimize")
     finally:
         connection.close()

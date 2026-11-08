@@ -11,11 +11,16 @@ from __future__ import annotations
 
 import hashlib
 import random
+import re
 import time
+from collections.abc import Callable
+from functools import lru_cache
+
 from . import entities, media_libraries, sample_images, settings_file
 
 from .catalog_rules import (
     LENGTH_TAGS,
+    canonical_tag_name,
     current_tags,
     fc2_collection_label,
     is_jav_asset,
@@ -41,6 +46,43 @@ from .western_artwork import artwork_key
 
 GROUP_TABLES = ('asset', 'asset_entity', 'entity')
 
+
+def _download_source_names(contract: WebContract) -> tuple[tuple[int, tuple[str, ...]], ...]:
+    """入库资产对应的云下载种子名与网盘任务名，给版次判据当来源证据。
+
+    一个资产绑过几次下载时取最后一次，文件是那一次落地的。整表读一次只要几毫秒，
+    按 `download_task` 的代次缓存；下载在跑时每次轮询都会改这张表，所以结果做成可比较的
+    元组，由分组快照当输入核对内容——只有绑定或名字真的变了，2 秒多的全库快照才重算。
+    """
+    def read():
+        names: dict[int, tuple[str, ...]] = {}
+        with contract.read_connection() as connection:
+            for row in connection.execute(
+                    "SELECT asset_id,display_name,remote_name FROM download_task "
+                    "WHERE asset_id IS NOT NULL ORDER BY id DESC"):
+                values = tuple(dict.fromkeys(
+                    str(value).strip() for value in (row['display_name'], row['remote_name'])
+                    if str(value or '').strip()))
+                if values:
+                    names.setdefault(int(row['asset_id']), values)
+        return tuple(sorted(names.items()))
+    return contract.cached_until_changed('catalog-download-source-names', read,
+                                        tables=('download_task',))
+
+
+def group_inputs(contract: WebContract) -> tuple:
+    """分组快照在 `GROUP_TABLES` 之外的输入：版次还看种子名。
+
+    缓存里用到 `video_work_key` 的计算也要带上它，否则下载绑定改了版次分组，
+    按作品计的数不会跟着变。
+    """
+    return (_download_source_names(contract),)
+
+
+def _group_cached(contract: WebContract, key: str, fn):
+    """分组快照及其派生缓存。"""
+    return contract.cached_until_changed(key, fn, *group_inputs(contract), tables=GROUP_TABLES)
+
 #: 卡片随每条记录返回的女优上限。共演作品必须带上全部出镜者，而不是只留第一位；
 #: 但 BEST 合集实测有 41 位，全量下发会把列表响应撑大，所以截断并同时给出总数，
 #: 由界面显示「等 N 人」。详情页走 q_item，不受这个上限影响。
@@ -50,6 +92,8 @@ CARD_PERFORMERS = 6
 def attach_artwork_fields(contract: WebContract, item: dict) -> None:
     """列表、详情与推荐共用本地官方封面和版本投影。"""
     from .strm import is_pointer
+    from .media_identity import ownership
+    item.update(ownership(settings_file.active(), item.get('path') or ''))
     if is_pointer(item.get('path') or item.get('name') or ''):
         item['size'] = None
         item['is_strm'] = True
@@ -81,7 +125,7 @@ SORT_COLUMNS = {
 #: `a.id DESC`——那不报错，只是给出一屏顺序看起来合理、其实没按要求排的结果。
 
 
-def attach_jav_display_fields(row: dict, tags=(), entity_kinds=()) -> None:
+def attach_jav_display_fields(row: dict, tags=(), entity_kinds=(), source_names=()) -> None:
     """Add one canonical display projection while retaining raw file identity fields."""
     # 产地取查询算好的那一列。取不到时退到番号推断——比直接读 `a.region` 强：那一列
     # 绝大多数行是空的，读它等于说「全都没判过」，韩国片又会原样回到 JAV 版式上。
@@ -100,10 +144,12 @@ def attach_jav_display_fields(row: dict, tags=(), entity_kinds=()) -> None:
         region,
     )
     if row["is_jav"]:
-        row.update(jav_display_metadata(row.get("name"), code, tags))
+        row.update(jav_display_metadata(row.get("name"), code, tags, source_names))
 
 
+@lru_cache(maxsize=65536)
 def _filename_fc2_code(name) -> str:
+    # 分组快照每次重算都要对全部文件名解析一遍；只看文件名，按它记住。
     code = release_code_from_filename(name) or ''
     return code if code.startswith('FC2-PPV-') else ''
 
@@ -130,9 +176,14 @@ def tag_not_hidden(asset: str, tag: str) -> str:
     `tag` 传比较用的表达式。列一侧要用 `peach_normalize()`——SQLite 的 lower() 只认
     ASCII，拿它去比 Python casefold 写进去的值，非 ASCII 标签永远匹配不上。
     """
-    return ("NOT EXISTS(SELECT 1 FROM asset_tag_preference p "
+    return (f"NOT EXISTS(SELECT 1 FROM (SELECT {tag} AS name) tag_visibility WHERE "
+            "EXISTS(SELECT 1 FROM asset_tag_preference p "
             f"WHERE p.asset_id={asset} AND p.profile_id='{DEFAULT_PROFILE_ID}' "
-            f"AND p.hidden=1 AND p.normalized_tag={tag})")
+            "AND p.hidden=1 AND p.normalized_tag=tag_visibility.name) OR "
+            "EXISTS(SELECT 1 FROM entity hidden_tag WHERE json_extract(hidden_tag.metadata_json,'$.user_tag_hidden')=1 "
+            "AND hidden_tag.id IN (SELECT id FROM entity WHERE kind='tag' AND normalized_name=tag_visibility.name "
+            "UNION SELECT al.entity_id FROM entity_alias al JOIN entity owner ON owner.id=al.entity_id "
+            "WHERE owner.kind='tag' AND al.normalized_alias=tag_visibility.name)))")
 
 
 #: 「未归属」是一个真实的集合，不是详情页上的一句说明文字：22509 部视频里 4566 部
@@ -158,11 +209,13 @@ AGENCY_SEARCH_CLAUSE = (
 )
 
 
-#: 「这条资源在普通馆藏里看得见」的判据：是视频，且在库——不在回收站，也没有标「已消失」
+#: 普通馆藏展示在库正片，排除附属媒体、回收站和标「已消失」的资源。
 #: （`disposal` 为空，ADR-0087）。列表、搜索和补全
 #: 共用这一份。各写各的后果是补全会补出回收站里的作品——那一条点开是已经删掉的片，
 #: 而列表本身从来不显示它，所以只会在补全这一个表面上露出来。
-VISIBLE_CATALOG_ASSET = "a.medium='video' AND a.disposal IS NULL"
+VISIBLE_CATALOG_ASSET = (
+    "a.medium='video' AND a.disposal IS NULL AND NOT peach_is_local_extra(a.name,a.path)"
+)
 
 
 def region_filter(value, trash: bool) -> tuple[list[str], list[str]]:
@@ -203,6 +256,33 @@ def _entity_asset_filter(connection, kind: str, name: str) -> tuple[str, list[in
     return f"a.id IN (SELECT scoped.asset_id FROM asset_entity scoped WHERE {predicate})", [entity["id"]]
 
 
+def _canonical_tag_names(contract, names):
+    """筛选使用当前规范名，重复别名只生成一份条件。"""
+    with contract.read_connection() as connection:
+        canonical = []
+        for name in names:
+            tag_id = entities._ingest_name_id(connection, 'tag', canonical_tag_name(name))
+            canonical.append(connection.execute('SELECT canonical_name FROM entity WHERE id=?', (tag_id,)).fetchone()[0]
+                             if tag_id is not None else canonical_tag_name(name))
+        return list(dict.fromkeys(canonical))
+
+
+RELEASE_YEAR_SQL = ("CASE WHEN substr(trim(a.release_date),1,4) GLOB '[0-9][0-9][0-9][0-9]' "
+                    "AND substr(trim(a.release_date),1,4) BETWEEN '1000' AND '9999' "
+                    "AND (length(trim(a.release_date))=4 OR substr(trim(a.release_date),5,1)='-') "
+                    "THEN substr(trim(a.release_date),1,4) ELSE '' END")
+
+
+def release_year_filter(value, *, trash=False):
+    if not value or trash:
+        return [], []
+    years = sorted(set(str(value).split(',')))
+    if any(year != 'none' and (not re.fullmatch(r'[1-9][0-9]{3}', year)) for year in years):
+        raise ValueError('发行年份须为四位年份或未知年份')
+    return [RELEASE_YEAR_SQL + ' IN (' + ','.join('?' for _ in years) + ')'], [
+        '' if year == 'none' else year for year in years]
+
+
 def catalog_filter(contract: WebContract, args):
     """视频列表与侧栏使用同一组筛选条件。"""
     trash = args.get("state") == "trash"
@@ -235,6 +315,7 @@ def catalog_filter(contract: WebContract, args):
         where.append(UNOWNED_ASSET_CLAUSE)
     if args.get("tag"):
         tags = [x for x in args["tag"].split(",") if x]
+        tags = _canonical_tag_names(contract, tags)
         tag_clause = (
             "(a.id IN (SELECT ae.asset_id FROM asset_entity ae JOIN entity e ON e.id=ae.entity_id "
             "WHERE e.kind='tag' AND e.canonical_name=? UNION "
@@ -265,6 +346,9 @@ def catalog_filter(contract: WebContract, args):
     region_where, region_par = region_filter(args.get("region"), trash)
     where += region_where
     par += region_par
+    year_where, year_par = release_year_filter(args.get('year'), trash=trash)
+    where += year_where
+    par += year_par
     if not trash and args.get("jav") == "1":
         # 只有番号形态还不够：JI-103 这类 creator clip 没有任何发行证据。
         where.append(JAV_ASSET_PREDICATE)
@@ -314,6 +398,23 @@ def catalog_filter(contract: WebContract, args):
     return where, par
 
 
+def orientation_member(args) -> Callable[[dict], bool] | None:
+    """列表按画幅筛时，分卷、版本组里哪些成员算进这张卡。
+
+    条件与 `catalog_filter` 的画幅那两条逐字对应：显式 `orient` 只算同画幅，首页主网格的
+    `exclude_vertical` 只算非竖屏（未测出画幅的也算）。回收站不按画幅筛，也不收窄。
+    不按画幅筛时返回 None，组照整部作品算。
+    """
+    if args.get("state") == "trash":
+        return None
+    if args.get("orient"):
+        orient = args["orient"]
+        return lambda member: member.get("ctx_orient") == orient
+    if args.get("exclude_vertical") == "1":
+        return lambda member: member.get("ctx_orient") != "竖屏"
+    return None
+
+
 def seeded_order(seed) -> str:
     """按种子打散的 ORDER BY 片段，列名固定是 `a.id`。
 
@@ -323,8 +424,32 @@ def seeded_order(seed) -> str:
     return f"((a.id * {sd}) % 99991), a.id"
 
 
-def q_items(contract: WebContract, args):
-    where, par = catalog_filter(contract, args)
+CATALOG_TOTAL_TABLES = GROUP_TABLES + (
+    'asset_tag', 'asset_tag_preference', 'asset_preference', 'watch_queue',
+    'entity_classification', 'entity_external_ref', 'entity_identity_link', 'profile',
+)
+
+
+def _catalog_totals(contract: WebContract, where, parameters, args):
+    """同一集合的总数、体积与作品数不随排序、种子和分页改变。"""
+    def read():
+        with contract.read_connection() as connection:
+            return tuple(connection.execute(
+                "SELECT count(*),COALESCE(sum(a.size),0),count(DISTINCT "
+                + video_work_key(contract, connection) + ") FROM asset a WHERE "
+                + " AND ".join(where), parameters).fetchone())
+    common = {'sort', 'seed', 'dir', 'limit', 'offset', 'count', 'state', 'jav',
+              'loc', 'len', 'orient', 'region', 'exclude_vertical', 'thumb', 'library', 'year', 'summary_only'}
+    if any(value and key not in common for key, value in args.items()):
+        return read()
+    return contract.cached_until_changed(
+        repr(('catalog-totals', tuple(where), tuple(parameters))), read,
+        tuple(contract.database.media_roots), *group_inputs(contract),
+        tables=CATALOG_TOTAL_TABLES, allow_stale=False)
+
+
+def _catalog_order(args):
+    """排序列、固定种子与每日轮换共用确定的目录顺序。"""
     sort_key = str(args.get("sort") or "")
     direction = "ASC" if str(args.get("dir") or "").lower() == "asc" else "DESC"
     column = SORT_COLUMNS.get(sort_key)
@@ -339,6 +464,15 @@ def q_items(contract: WebContract, args):
             order = f"((a.id * {seed}) % 99991), a.id"
         else:
             order = "a.id DESC"
+    return order
+
+
+def q_items(contract: WebContract, args):
+    where, par = catalog_filter(contract, args)
+    if args.get('summary_only') == '1':
+        count, size, works = _catalog_totals(contract, where, par, args)
+        return {'total': count, 'bytes': size, 'work_total': works}
+    order = _catalog_order(args)
     lim = max(1, min(int(args.get("limit", 60)), 200))
     off = max(0, int(args.get("offset", 0)))
     include_total = args.get("count", "1") != "0"
@@ -346,7 +480,7 @@ def q_items(contract: WebContract, args):
     sql = ("SELECT a.id,a.location,a.path,a.name,a.catalog_title,a.original_title,a.medium,"
            "a.creator,a.studio,a.code,a.release_date,a.size,"
            "a.duration,a.width,a.height,a.ctx_length,a.ctx_orient,a.snapshot_path,"
-           "a.play_count,a.leave_ratio,a.feedback,a.disposal,a.disposal_reason,a.rating,a.o_count,"
+           "a.play_count,a.first_seen,a.last_played,a.leave_ratio,a.feedback,a.disposal,a.disposal_reason,a.rating,a.o_count,"
            "a.play_seconds,a.max_reached,a.seek_count,a.region,"
            f"{EFFECTIVE_REGION_SQL} AS effective_region,"
            "EXISTS(SELECT 1 FROM watch_queue w WHERE w.asset_id=a.id "
@@ -359,10 +493,7 @@ def q_items(contract: WebContract, args):
         # 条数和体积同一次聚合出来：回收站卡片要说的是「清空能腾出多少」，
         # 为它单独再发一次请求只是把同一条 WHERE 又跑一遍。
         cnt, total_bytes, work_total = (
-            c.execute("SELECT count(*),COALESCE(sum(a.size),0),count(DISTINCT "
-                      + video_work_key(contract, c) + ") FROM asset a WHERE "
-                      + " AND ".join(where), par).fetchone()
-            if include_total else (None, None, None))
+            _catalog_totals(contract, where, par, args) if include_total else (None, None, None))
     # 卡片要显示出镜者和高权重标签，不能只有番号 —— 一次批量取，别 N+1
     if rows:
         ids = [r["id"] for r in rows]
@@ -407,24 +538,28 @@ def q_items(contract: WebContract, args):
                 r["creator"] = r["creator_entity"]["name"]
             r["performer_total"] = len(refs) or len(all_performers)
             r["_entity_kinds"] = tuple(canonical)
+    sources = dict(_download_source_names(contract))
     for r in rows:
         r["cost"] = cost_for(r['location'], r.get('path'))
         r["has_thumb"] = contract.has_snapshot(r["snapshot_path"])
         r['has_local_poster'] = (contract.poster_root / f"{r['id']}_4.jpg").is_file()
         attach_artwork_fields(contract, r)
         # 卡片上的出镜者称谓、规范番号、版本徽章与详情页使用同一份投影。
-        attach_jav_display_fields(r, r.get("tags", ()), r.pop("_entity_kinds", ()))
+        attach_jav_display_fields(r, r.get("tags", ()), r.pop("_entity_kinds", ()),
+                                  sources.get(r["id"], ()))
         r.pop("snapshot_path", None)
         r.pop("path", None)                     # 路径不外发，串流走 id
     attach_saved_follow_cards(contract, rows)
-    attach_multipart_groups(contract, rows)
-    attach_edition_groups(contract, rows)
+    shown = orientation_member(args)
+    attach_multipart_groups(contract, rows, shown)
+    attach_edition_groups(contract, rows, shown)
     return {"total": cnt, "work_total": work_total, "bytes": total_bytes, "items": rows, "has_more": has_more}
 
 def con_tags(contract: WebContract, ids, qm):
     with contract.read_connection() as c:
         rows = c.execute(
-            f"SELECT asset_id, tag FROM asset_tag WHERE asset_id IN ({qm})", ids).fetchall()
+            f"SELECT t.asset_id,t.tag FROM asset_tag t WHERE t.asset_id IN ({qm}) AND "
+            + tag_not_hidden('t.asset_id', 'peach_normalize(t.tag)'), ids).fetchall()
         return visible_identity_data(c, [], rows, tag_column=1)[1]
 
 
@@ -451,8 +586,9 @@ def con_entities(contract: WebContract, ids, qm):
             f"SELECT DISTINCT ae.asset_id,e.id,e.kind,e.canonical_name "
             f"FROM asset_entity ae JOIN entity e ON e.id=ae.entity_id "
             f"WHERE ae.asset_id IN ({qm}) "
-            f"AND e.kind IN ('tag','performer','creator','studio','series') "
-            f"ORDER BY ae.asset_id,e.kind,e.canonical_name", ids,
+            "AND e.kind IN ('tag','performer','creator','studio','series') "
+            "AND (e.kind<>'tag' OR " + tag_not_hidden('ae.asset_id', 'e.normalized_name') + ') '
+            "ORDER BY ae.asset_id,e.kind,e.canonical_name", ids,
         ).fetchall()
         return [row for row in rows if row[1] not in excluded]
 
@@ -603,16 +739,22 @@ def attach_saved_follow_cards(contract: WebContract, rows):
 
 #: 版次的展示次序：正片在前，处理过的在后。这不是偏好排序，只是要一个稳定的
 #: 锚点——卡片标题取第一个，次序一变卡片就换名字。
-EDITION_ORDER = ("有码", "中字", "无码", "无码破解")
+EDITION_ORDER = ("有码", "中字", "无码", "无码流出", "无码破解")
 
 
-def _edition_label(row: dict, tags: tuple[str, ...] = ()) -> str:
+def _edition_label(row: dict, tags: tuple[str, ...] = (), source_names: tuple[str, ...] = ()) -> str:
     """这一份是哪个版次。
 
     判据只有 `jav_edition_badges` 一份。自己按文件名再写一套「像不像无码」的判断，
     会和卡片上已经显示的徽章各说各话——同一个文件，角标写着无码、分组却当它是正片。
     """
-    badges = jav_edition_badges(row.get('name'), row.get('code'), tags)
+    return _edition_badge(row.get('name'), row.get('code'), tuple(tags), tuple(source_names))
+
+
+@lru_cache(maxsize=16384)
+def _edition_badge(name, code, tags: tuple[str, ...], source_names: tuple[str, ...]) -> str:
+    # 分组快照每次重算都要判一遍；判据只看这四样，按它们记住。
+    badges = jav_edition_badges(name, code, tags, source_names)
     return str(badges[0]) if badges else "有码"
 
 
@@ -624,16 +766,16 @@ def _edition_rows(contract: WebContract, codes) -> list[dict]:
 
 def _catalog_group_rows(contract: WebContract) -> list[dict]:
     """规范番号、版次、探测规格共用一次全库只读快照。"""
-    return contract.cached_until_changed('catalog-group-rows', lambda: _read_group_rows(contract),
-                                        tables=GROUP_TABLES)
+    return _group_cached(contract, 'catalog-group-rows', lambda: _read_group_rows(contract))
 
 
 def _read_group_rows(contract: WebContract) -> list[dict]:
     with contract.read_connection() as connection:
         rows = [dict(row) for row in connection.execute(
-            "SELECT id,name,path,code,size,duration,width,height,disposal,catalog_title,field_owners FROM asset "
+            "SELECT id,name,path,code,size,duration,width,height,ctx_orient,disposal,catalog_title,field_owners "
+            "FROM asset "
             "WHERE medium='video' "
-            "AND COALESCE(disposal,'')<>'vanished' ORDER BY id",
+            "AND COALESCE(disposal,'')<>'vanished' AND NOT peach_is_local_extra(name,path) ORDER BY id",
         )]
         if not rows:
             return []
@@ -644,13 +786,15 @@ def _read_group_rows(contract: WebContract) -> list[dict]:
                 "JOIN entity e ON e.id=ae.entity_id "
                 "WHERE e.kind='tag'"):
             tags.setdefault(int(row["aid"]), []).append(str(row["name"]))
+    sources = dict(_download_source_names(contract))
     coded = []
     for row in rows:
         row['raw_code'] = row['code']
         row['code'] = row['code'] or _filename_fc2_code(row['name'])
         if not row['code']:
             continue
-        row["edition"] = _edition_label(row, tuple(tags.get(int(row["id"]), ())))
+        row["edition"] = _edition_label(row, tuple(tags.get(int(row["id"]), ())),
+                                        sources.get(int(row["id"]), ()))
         coded.append(row)
     return coded
 
@@ -658,9 +802,9 @@ def _read_group_rows(contract: WebContract) -> list[dict]:
 def _edition_groups(contract: WebContract, codes) -> dict[str, list[dict]]:
     """播放版本按规范番号归组，分卷属于各自的版本。"""
     keys = {normalise_code_key(code) for code in codes}
-    return {code: group for code, group in contract.cached_until_changed(
-        'catalog-edition-groups', lambda: _derive_edition_groups(contract),
-        tables=GROUP_TABLES).items() if code in keys}
+    return {code: group for code, group in _group_cached(
+        contract, 'catalog-edition-groups', lambda: _derive_edition_groups(contract),
+    ).items() if code in keys}
 
 
 def _derive_edition_groups(contract: WebContract) -> dict[str, list[dict]]:
@@ -685,11 +829,14 @@ def _derive_edition_groups(contract: WebContract) -> dict[str, list[dict]]:
     return groups
 
 
-def attach_edition_groups(contract: WebContract, rows) -> None:
+def attach_edition_groups(contract: WebContract, rows,
+                          shown: Callable[[dict], bool] | None = None) -> None:
     """给列表卡挂上同番号的版次组，不写账本。
 
     用户实测：`ABF-234` 与 `ABF-234 UN` 是两张并排的卡，`ABF-216` 也是。它们是同一部
     片的两个版次，占两个格子只是让人多滚一屏，还得自己认哪个是无码。
+    按画幅筛的列表里版本数与版本名只算同画幅的文件，口径同 `attach_multipart_groups`；
+    只剩一个版本时 `count` 为 1，卡片不标版本数。`key` 与 `seed_id` 仍是整组的。
     """
     if not rows:
         return
@@ -699,13 +846,15 @@ def attach_edition_groups(contract: WebContract, rows) -> None:
         group = groups.get(code)
         if not group or not any(item["id"] == row["id"] for item in group):
             continue
+        members = [item for item in group if shown(item)] if shown else group
+        members = members or group
         row["edition_group"] = {
             "key": code,
             "title": code or str(row.get("code") or "多版本作品"),
-            "count": len({item['version_id'] for item in group}),
+            "count": len({item['version_id'] for item in members}),
             "seed_id": group[0]["id"],
-            "item_ids": [item["id"] for item in group],
-            "editions": list(dict.fromkeys(item['version_label'] for item in group)),
+            "item_ids": [item["id"] for item in members],
+            "editions": list(dict.fromkeys(item['version_label'] for item in members)),
         }
 
 
@@ -761,7 +910,7 @@ def multipart_groups(contract: WebContract) -> dict[str, list[dict]]:
                     key = code if len(versions) == 1 else f"{code}:{version['id']}"
                     groups[key] = version['items']
         return groups
-    return contract.cached_until_changed("catalog-multipart-groups", derive, tables=GROUP_TABLES)
+    return _group_cached(contract, "catalog-multipart-groups", derive)
 
 
 def _live_parts(group) -> list[dict]:
@@ -780,15 +929,22 @@ def video_work_key(contract: WebContract, connection) -> str:
             for item in group:
                 keys.setdefault(int(item['id']), f"multipart:{int(group[0]['id'])}")
         return keys
-    keys = contract.cached_until_changed('catalog-video-work-key', derive, tables=GROUP_TABLES)
+    keys = _group_cached(contract, 'catalog-video-work-key', derive)
     connection.create_function('peach_video_work_key', 1,
                                lambda asset_id: keys.get(asset_id, f'asset:{asset_id}'),
                                deterministic=True)
     return 'peach_video_work_key(a.id)'
 
 
-def attach_multipart_groups(contract: WebContract, rows) -> None:
-    """Annotate list cards with one derived multipart release, without ledger writes."""
+def attach_multipart_groups(contract: WebContract, rows,
+                            shown: Callable[[dict], bool] | None = None) -> None:
+    """Annotate list cards with one derived multipart release, without ledger writes.
+
+    按画幅筛的列表（`shown` 见 `orientation_member`）里，卷数、成员与合计只算同画幅的
+    那几卷：FC2-PPV-3189161 前三卷横屏、后两卷竖屏，竖屏带里的卡写「2 卷」和两卷的合计，
+    首页主网格（排除竖屏）写「3 卷」和三卷的合计。只剩一卷时 `count` 为 1，卡片按单卷画。
+    `key` 与 `seed_id` 仍是整部作品的，折叠去重与分卷队列认同一部作品。
+    """
     if not rows:
         return
     groups = _parts_by_asset(contract)
@@ -798,14 +954,16 @@ def attach_multipart_groups(contract: WebContract, rows) -> None:
         group = _live_parts(all_parts)
         if not any(item["id"] == row["id"] for item in group):
             continue
+        members = [item for item in group if shown(item)] if shown else group
+        members = members or group
         row["part_group"] = {
             "key": key,
             "title": code or str(row.get("code") or "分卷作品"),
-            "count": len(group),
+            "count": len(members),
             "seed_id": group[0]["id"],
-            "item_ids": [item["id"] for item in group],
-            "total_duration": sum(float(item.get("duration") or 0) for item in group),
-            "total_size": sum(int(item.get("size") or 0) for item in group),
+            "item_ids": [item["id"] for item in members],
+            "total_duration": sum(float(item.get("duration") or 0) for item in members),
+            "total_size": sum(int(item.get("size") or 0) for item in members),
         }
 
 
@@ -837,9 +995,8 @@ def q_parts(contract: WebContract, args):
 
 
 def _parts_by_asset(contract: WebContract) -> dict[int, tuple[str, list[dict]]]:
-    return contract.cached_until_changed('catalog-parts-by-asset', lambda: {
-        int(row['id']): (key, group) for key, group in multipart_groups(contract).items() for row in group},
-        tables=GROUP_TABLES)
+    return _group_cached(contract, 'catalog-parts-by-asset', lambda: {
+        int(row['id']): (key, group) for key, group in multipart_groups(contract).items() for row in group})
 
 
 def _part_labels(group: list[dict]) -> dict[int, str]:
@@ -888,7 +1045,7 @@ def q_item(contract: WebContract, aid):
        既显示错条目，又反复拉计费流量。按 id 取就按 id 取。"""
     with contract.read_connection() as c:
         r = c.execute(
-            "SELECT id,location,path,name,catalog_title,original_title,creator,studio,code,"
+            "SELECT id,location,path,name,medium,catalog_title,original_title,creator,studio,code,"
             "release_date,size,duration,width,height,field_owners,mutation_revision,"
             "ctx_length,ctx_orient,snapshot_path,play_count,leave_ratio,feedback,disposal,disposal_reason,"
             "rating,o_count,play_seconds,max_reached,seek_count,region,"
@@ -998,6 +1155,7 @@ def q_item(contract: WebContract, aid):
     attach_jav_display_fields(
         d, [tag["k"] for tag in d["tags"]],
         [kind for kind, values in d["entities"].items() if values],
+        dict(_download_source_names(contract)).get(d["id"], ()),
     )
     d.pop("snapshot_path", None); d.pop("path", None)
     attach_multipart_groups(contract, [d])
@@ -1030,6 +1188,30 @@ def _one_card_per_release(contract: WebContract, source_code, rows: list[dict]) 
         kept.append(row)
     return kept
 
+def _name_shared_tags(contract: WebContract, aid, picked, related_tags) -> None:
+    """「标签接近」换成共同标签本身（`why_tags`，稀有的在前）。
+
+    只留两边都看得见的标签：排序用的是实体关联，被用户隐藏的标签也在里面。一个都不剩时
+    照旧写「标签接近」。"""
+    from peach.related import TAG_REASON
+
+    ids = sorted({tag for row in picked for tag in row.get("shared_tags", ())})
+    names: dict[int, str] = {}
+    if ids:
+        with contract.read_connection() as c:
+            names = dict(c.execute(
+                f"SELECT id,canonical_name FROM entity WHERE id IN ({','.join('?' * len(ids))})",
+                ids,
+            ))
+    source_tags = {tag for _asset_id, tag in con_tags(contract, [aid], "?")}
+    for row in picked:
+        visible = source_tags & set(related_tags.get(row["id"], ()))
+        shared = [names[tag] for tag in row.pop("shared_tags", ()) if names.get(tag) in visible]
+        if shared:
+            row["why_tags"] = shared[:6]
+            row["why"] = " · ".join(reason for reason in row["why"].split(" · ") if reason != TAG_REASON)
+
+
 def q_related(contract: WebContract, aid, limit=24):
     """接着看：IDF 抑制泛标签，MMR 避免近重复连续占满列表。"""
     from peach.related import rank_related
@@ -1057,6 +1239,7 @@ def q_related(contract: WebContract, aid, limit=24):
             "FROM asset a JOIN asset_entity shared "
             "ON shared.asset_id=a.id WHERE a.medium='video' AND a.id<>? "
             "AND (a.feedback IS NULL OR a.feedback<>'dislike') AND a.disposal IS NULL "
+            "AND NOT peach_is_local_extra(a.name,a.path) "
             f"AND shared.entity_id IN ({source_marks}) GROUP BY a.id "
             "ORDER BY count(DISTINCT shared.entity_id) DESC,a.id LIMIT 4000",
             (aid, *source_entity_ids),
@@ -1099,6 +1282,8 @@ def q_related(contract: WebContract, aid, limit=24):
         marks = ",".join("?" * len(related_ids))
         for asset_id, tag in con_tags(contract, related_ids, marks):
             related_tags.setdefault(asset_id, []).append(tag)
+        _name_shared_tags(contract, aid, picked, related_tags)
+    sources = dict(_download_source_names(contract))
     for d in picked:
         d["cost"] = cost_for(d['location'], d.get('path'))
         d["has_thumb"] = contract.has_snapshot(d["snapshot_path"])
@@ -1106,6 +1291,7 @@ def q_related(contract: WebContract, aid, limit=24):
         attach_artwork_fields(contract, d)
         attach_jav_display_fields(
             d, related_tags.get(d["id"], ()), d.pop("_entity_kinds", ()),
+            sources.get(d["id"], ()),
         )
         d.pop("release_date", None)
         d.pop("snapshot_path", None)
@@ -1152,7 +1338,9 @@ JAV_ASSET_PREDICATE = (
 )
 JAV_ASSET_CLAUSE = "AND " + JAV_ASSET_PREDICATE + " "
 #: 筛选项、侧栏读数与顶部三层排掉标「已消失」的行；回收站里的照旧算（`q_facets`、`q_tops`）。
-PRESENT_ASSET_CLAUSE = "AND COALESCE(a.disposal,'')<>'vanished' "
+PRESENT_ASSET_CLAUSE = (
+    "AND COALESCE(a.disposal,'')<>'vanished' AND NOT peach_is_local_extra(a.name,a.path) "
+)
 
 
 #: 首页的状态筛选（新鲜 / 看过 / 已标记 / 稍后看）。作品列表、顶部三层和筛选面板
@@ -1183,6 +1371,9 @@ def state_clause(state: str) -> str:
 #: 又能真的换一批。倍数太大就会开始出现只有一两部作品的冷门项。
 TOPS_POOL_FACTOR = 4
 
+#: 顶部两排候选池读到的账本表：作品与实体三张、「已标记」读的偏好、「稍后看」读的队列。
+TOPS_TABLES = GROUP_TABLES + ("asset_preference", "watch_queue")
+
 
 def q_tops(contract: WebContract, n=28, jav=False, seed="", state="", page=0, filters=None):
     """顶部三层用的数据：女优圆头像 / 厂牌 / 内容标签。
@@ -1194,48 +1385,58 @@ def q_tops(contract: WebContract, n=28, jav=False, seed="", state="", page=0, fi
 
     `page` 给横滚续接用。第一页那 n 个是从数量前 `n * TOPS_POOL_FACTOR` 里抽的，
     续页要是再回到那一段就会把同一个人给两次，所以那一段归第一页独占，续页从它的
-    末尾往后按数量数下去。库里六百多位女优，一排给到头才是「滚到底还能接着滚」。"""
-    with contract.read_connection() as c:
-        scope = PRESENT_ASSET_CLAUSE + (JAV_ASSET_CLAUSE if jav else "") + state_clause(state)
-        folder_params = []
-        if filters and filters.get('folder'):
-            conditions, folder_params = catalog_filter(contract, filters)
-            scope += ' AND ' + ' AND '.join(conditions)
-        base = (
-            "SELECT e.id,e.canonical_name,count(DISTINCT ae.asset_id) n,"
-            "(SELECT a2.id FROM asset_entity ae2 JOIN asset a2 ON a2.id=ae2.asset_id "
-            " WHERE ae2.entity_id=e.id AND a2.medium='video' AND a2.snapshot_path IS NOT NULL "
-            " AND (e.kind<>'performer' OR " + solo_performer_clause("a2.id", "e.id") + ") "
-            " ORDER BY (a2.play_count IS NULL),a2.size DESC LIMIT 1) rep "
-            "FROM asset_entity ae JOIN entity e ON e.id=ae.entity_id "
-            "JOIN asset a ON a.id=ae.asset_id "
-            "WHERE a.medium='video' AND e.kind=? " + scope +
-            "GROUP BY e.id,e.canonical_name ORDER BY n DESC LIMIT ? OFFSET ?"
-        )
-        first_page_span = n * TOPS_POOL_FACTOR if seed else n
+    末尾往后按数量数下去。库里六百多位女优，一排给到头才是「滚到底还能接着滚」。
 
-        def read(kind, limit, skip):
-            return [{"id": entity_id, "k": k, "n": cnt, "rep": representative}
-                    for entity_id, k, cnt, representative
-                    in c.execute(base, (kind, *folder_params, limit, skip))]
+    两条分组 SQL 的结果只取决于账本与口径，与种子无关：候选池按
+    `TOPS_TABLES` 的版本缓存，种子抽样和读目录索引的那几个标志都在缓存之外现做。"""
+    state = state if state_predicate(state) else ""
+    scope = PRESENT_ASSET_CLAUSE + (JAV_ASSET_CLAUSE if jav else "") + state_clause(state)
+    folder_params = []
+    if filters and filters.get('folder'):
+        conditions, folder_params = catalog_filter(contract, filters)
+        scope += ' AND ' + ' AND '.join(conditions)
+    tops_assets = "SELECT a.id FROM asset a WHERE a.medium='video' " + scope
+    base = (
+        "SELECT e.id,e.canonical_name,count(DISTINCT ae.asset_id) n,"
+        "(SELECT a2.id FROM asset_entity ae2 JOIN asset a2 ON a2.id=ae2.asset_id "
+        " WHERE ae2.entity_id=e.id AND a2.medium='video' AND a2.snapshot_path IS NOT NULL "
+        " AND (e.kind<>'performer' OR " + solo_performer_clause("a2.id", "e.id") + ") "
+        " ORDER BY (a2.play_count IS NULL),a2.size DESC LIMIT 1) rep "
+        "FROM asset_entity ae JOIN entity e ON e.id=ae.entity_id "
+        "WHERE e.kind=? AND ae.asset_id IN (" + tops_assets + ") " +
+        "GROUP BY e.id,e.canonical_name ORDER BY n DESC LIMIT ? OFFSET ?"
+    )
+    first_page_span = n * TOPS_POOL_FACTOR if seed else n
 
-        def pick(kind):
-            """按数量取候选池，再按种子确定性抽样。种子为空时退回严格前 N。"""
-            if page:
-                return read(kind, n, first_page_span + (page - 1) * n)
-            pool = read(kind, first_page_span, 0)
-            if not seed or len(pool) <= n:
-                return pool[:n]
-            # 同一个种子必须给出同一批人：翻页和重绘之间不能抖动。
-            digest = hashlib.blake2b(f"{seed}:{kind}".encode(), digest_size=8).digest()
-            rng = random.Random(int.from_bytes(digest, "big"))
-            chosen = rng.sample(pool, n)
-            # 抽完仍按数量排序，免得常见身份被排到末尾。
-            return sorted(chosen, key=lambda row: -row["n"])
+    def read(kind, limit, skip):
+        def compute():
+            with contract.read_connection() as c:
+                return [{"id": entity_id, "k": k, "n": cnt, "rep": representative}
+                        for entity_id, k, cnt, representative
+                        in c.execute(base, (kind, *folder_params, limit, skip))]
+        # 目录筛选的条件已在上面按目录索引展开成 SQL，键里带上它，口径就完整了。
+        key = repr(("tops-pool", kind, jav, state, scope, tuple(folder_params), limit, skip))
+        rows = contract.cached_until_changed(key, compute, tables=TOPS_TABLES)
+        # 下面还要往每行补目录索引的标志，不能写进缓存里那一份。
+        return [dict(row) for row in rows]
 
-        out = {}
-        out["performers"] = pick("performer")
-        out["studios"] = pick("studio")
+    def pick(kind):
+        """按数量取候选池，再按种子确定性抽样。种子为空时退回严格前 N。"""
+        if page:
+            return read(kind, n, first_page_span + (page - 1) * n)
+        pool = read(kind, first_page_span, 0)
+        if not seed or len(pool) <= n:
+            return pool[:n]
+        # 同一个种子必须给出同一批人：翻页和重绘之间不能抖动。
+        digest = hashlib.blake2b(f"{seed}:{kind}".encode(), digest_size=8).digest()
+        rng = random.Random(int.from_bytes(digest, "big"))
+        chosen = rng.sample(pool, n)
+        # 抽完仍按数量排序，免得常见身份被排到末尾。
+        return sorted(chosen, key=lambda row: -row["n"])
+
+    out = {}
+    out["performers"] = pick("performer")
+    out["studios"] = pick("studio")
     # 顶栏那排厂牌小圆片据此决定要不要输出 `<img>`：没装标识就直接首字母垫底。
     # 判定在库连接之外做，它读的是目录索引而不是账本。
     for studio in out["studios"]:
@@ -1255,6 +1456,24 @@ def q_tops(contract: WebContract, n=28, jav=False, seed="", state="", page=0, fi
     return out
 
 
+
+
+#: 筛选项读到的账本表（不含实体范围与搜索词那几条分支，它们不走按版本的缓存）：
+#: 作品与实体、标签隐藏偏好与标签实体的别名（`tag_not_hidden`）、「已标记」「稍后看」两种
+#: 状态，以及在线卡片的关注标签。
+FACETS_TABLES = GROUP_TABLES + ("entity_alias", "asset_tag_preference", "asset_preference",
+                                "watch_queue", "follow_item", "follow_source")
+
+
+def _release_year_facets(contract, connection, scope, values, state, filters, asset_id):
+    """年份选项遵循其它筛选，但不被已选年份收窄。"""
+    if filters is not None and asset_id is None:
+        conditions, parameters = catalog_filter(contract, {**filters, 'state':state, 'year':''})
+        scope += 'AND ' + ' AND '.join(conditions) + ' '
+        values = [*values, *parameters]
+    return [dict(k=row['k'] or 'none', label=row['k'] or '未知年份', n=row['n'])
+            for row in connection.execute('SELECT '+RELEASE_YEAR_SQL+' AS k,count(*) AS n FROM asset a '
+                "WHERE a.medium='video' "+scope+' GROUP BY k ORDER BY k DESC', values)]
 
 
 def q_facets(
@@ -1296,6 +1515,7 @@ def q_facets(
             "SUM(CASE WHEN a.play_count>0 THEN 1 ELSE 0 END) AS played "
             "FROM asset a WHERE a.medium='video' " + scope +
             "GROUP BY a.location ORDER BY n DESC", scope_params)]
+        out['years'] = _release_year_facets(contract, c, scope, scope_params, state, filters, asset_id)
         if filters is not None and asset_id is None:
             conditions, parameters = catalog_filter(contract, {**filters, "state": state})
             scope += "AND " + " AND ".join(conditions) + " "
@@ -1308,18 +1528,20 @@ def q_facets(
             f"SELECT {EFFECTIVE_REGION_SQL} AS k,count(*) AS n FROM asset a "
             "WHERE a.medium='video' " + scope + "GROUP BY k ORDER BY n DESC",
             scope_params))
+        # 先独立筛选资产，避免错误统计让每对实体与视频都执行资产谓词。
+        facet_assets = "SELECT a.id FROM asset a WHERE a.medium='video' " + scope
         out["creators"] = [dict(r) for r in c.execute(
             "SELECT e.canonical_name AS k,count(DISTINCT ae.asset_id) AS n "
             "FROM asset_entity ae JOIN entity e ON e.id=ae.entity_id "
-            "JOIN asset a ON a.id=ae.asset_id WHERE a.medium='video' AND e.kind='creator' " + scope +
-        
+            "WHERE e.kind='creator' AND ae.asset_id IN (" + facet_assets + ") "
             "GROUP BY e.id,e.canonical_name ORDER BY n DESC LIMIT 60", scope_params)]
         # 标签要分层 —— 一锅端会让「演员:一个ren」和「1080P」「足交」混在一起。
         # 三类分开：技术规格（画质/时长/画幅，筛选价值低）、内容维度（真正有用的）、演员（另立一栏）。
         rows = [dict(r) for r in c.execute(
             "SELECT e.canonical_name AS k, count(DISTINCT ae.asset_id) AS n "
             "FROM asset_entity ae JOIN entity e ON e.id=ae.entity_id "
-            "JOIN asset a ON a.id=ae.asset_id WHERE a.medium='video' AND e.kind='tag' " + scope +
+            "WHERE e.kind='tag' AND ae.asset_id IN (" + facet_assets + ") "
+            "AND " + tag_not_hidden('ae.asset_id', 'e.normalized_name') + ' ' +
             "AND " + tag_is_not_a_performer_name("e.normalized_name") + " "
             "GROUP BY e.id,e.canonical_name ORDER BY n DESC LIMIT 400", scope_params)]
         classified = [
@@ -1334,8 +1556,7 @@ def q_facets(
         out["tagperformers"] = [dict(r) for r in c.execute(
             "SELECT e.canonical_name AS k,count(DISTINCT ae.asset_id) AS n "
             "FROM asset_entity ae JOIN entity e ON e.id=ae.entity_id "
-            "JOIN asset a ON a.id=ae.asset_id WHERE a.medium='video' AND e.kind='performer' " + scope +
-        
+            "WHERE e.kind='performer' AND ae.asset_id IN (" + facet_assets + ") "
             "GROUP BY e.id,e.canonical_name ORDER BY n DESC LIMIT 20", scope_params)]
         st = c.execute(
             "SELECT count(*) total, COALESCE(sum(size),0) bytes, "
@@ -1386,6 +1607,11 @@ def w_item_tag(contract: WebContract, body):
     with contract.write_transaction() as c:
         if not c.execute("SELECT 1 FROM asset WHERE id=?", (aid,)).fetchone():
             raise ValueError("asset not found")
+        from .entities import _ingest_name_id
+        identity = _ingest_name_id(c, 'tag', canonical_tag_name(tag))
+        if identity is not None:
+            tag = c.execute('SELECT canonical_name FROM entity WHERE id=?', (identity,)).fetchone()[0]
+            normalized = normalize_entity_name(tag)
         if operation == "remove":
             c.execute(
                 "INSERT INTO asset_tag_preference(profile_id,asset_id,normalized_tag,hidden,updated_at) "

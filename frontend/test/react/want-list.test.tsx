@@ -8,7 +8,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { queryClient } from '../../src/react/query';
 import { WANT_PAGE_SIZE, WantList } from '../../src/react/wants/want-list';
 import type { Want, WantsData } from '../../src/react/wants/wants';
-import { buttonNamed, click, mount, settle, type } from './render';
+import { actionOrder, buttonNamed, choose, click, mount, settle, type } from './render';
 
 afterEach(() => { queryClient.clear(); localStorage.clear() });
 notifyManager.setScheduler((notify) => notify());
@@ -74,6 +74,8 @@ it('按待找、未发售、暂时放弃、已入库分段，段名带条数；�
   ]);
   expect(buttonNamed('重新查找', host.querySelector('[data-want-id="3"]')!)).not.toBeNull();
   expect(buttonNamed('重新查找', host.querySelector('[data-want-id="2"]')!)).toBeNull();
+  expect(actionOrder(buttonNamed('重新查找', host.querySelector('[data-want-id="3"]')!)!.parentElement))
+    .toEqual(['来源页', '移除', '重新查找', '查找资源']);
 });
 
 it('待找与暂时放弃两段每行有查找资源，原地打开带番号与标题的云下载弹层；未发售与已入库没有', async () => {
@@ -180,5 +182,23 @@ it(`一段多于 ${WANT_PAGE_SIZE} 条时分页，页码各段各记各的；报
   expect([...unreleased.querySelectorAll<HTMLElement>('li[data-want-id]')].map((row) => row.dataset.wantId)).toEqual(['41', '42']);
   const acquired = host.querySelector('[data-want-phase="acquired"]')!;
   expect(acquired.querySelectorAll('li[data-want-id]')).toHaveLength(3);
-  expect(acquired.querySelector('[data-want-pager]')).toBeNull();
+  expect(acquired.querySelector('[data-want-pager]')?.textContent).toContain('1–3 / 3 条');
+  await choose(unreleased.querySelector('button[aria-label="每页显示数量"]'), '每页 10 条');
+  expect(unreleased.querySelectorAll('li[data-want-id]')).toHaveLength(10);
+  expect(unreleased.querySelector('li[data-want-id]')?.getAttribute('data-want-id')).toBe('1');
+  expect(acquired.querySelector('button[aria-label="每页显示数量"]')?.textContent).toContain('每页 20 条');
+});
+
+it('想要筛选为空时仍可选择每页数量，清除筛选后使用所选数量', async () => {
+  vi.stubGlobal('IntersectionObserver', class { observe() {} disconnect() {} });
+  serve(listed(Array.from({ length: 25 }, (_, index) => want(index + 1, { has_magnets: false }))));
+  const { host } = await open();
+  await click(host.querySelector('input[value="available"]'));
+  await settle();
+  expect(host.querySelectorAll('[data-want-id]')).toHaveLength(0);
+  expect(host.querySelector('[data-want-pager]')?.textContent).toContain('0–0 / 0 条');
+  await choose(host.querySelector('button[aria-label="每页显示数量"]'), '每页 10 条');
+  await click(buttonNamed('查看全部', host));
+  await settle();
+  expect(host.querySelectorAll('[data-want-id]')).toHaveLength(10);
 });

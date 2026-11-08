@@ -23,6 +23,8 @@ export interface OnlineAuthor {
   /** 归档站的头像，主页那张失败时换它。 */
   avatar_fallback: string;
   providers: string[];
+  /** 最近一条的发布时间，来源没给就是入库时间。 */
+  latest?: string;
 }
 
 export interface OnlineAuthorsPage {
@@ -33,6 +35,10 @@ export interface OnlineAuthorsPage {
 
 /** 上游 booru 的一枚标签。`cat` 是上游的 tag_type（general／artist／character／copyright／metadata）。 */
 export interface OnlineTag {
+  favorite?: boolean;
+  id?: string;
+  aliases?: string[];
+  hidden?: boolean;
   k: string;
   n: number;
   cat: string;
@@ -41,6 +47,7 @@ export interface OnlineTag {
 export interface OnlineTagsPage {
   items: OnlineTag[];
   has_more: boolean;
+  total?: number;
   categories?: Record<string, number>;
 }
 

@@ -8,6 +8,7 @@
 import type { HomeGlow } from '@peach/appearance';
 
 import type { SettingsStore } from '../../settings-store';
+import type { Shortcut } from '../../keyboard-shortcut';
 import type { SyncedSettings } from './settings-data';
 
 /** 面板读写的那几项；对象本身还有别的字段，面板不碰。 */
@@ -23,7 +24,9 @@ export interface PanelSettings {
   defaultSortDirection: string;
   groupCollapse: boolean;
   javImage: string;
+  performerNameLanguage: 'zh-CN' | 'ja';
   feedAutoScroll: boolean;
+  feedLimit: number;
   feedHideGroupCompilations: boolean;
   feedHideSoloCompilations: boolean;
   feedHideExcerpts: boolean;
@@ -46,8 +49,8 @@ export type SettingsEffect =
   /** 光晕的开关、颜色、恢复默认与松手：侧栏那一层、其余玻璃面和侧栏配色钮一起对齐。 */
   | 'glow'
   | 'batchSize' | 'defaultSort' | 'sortDirection' | 'hoverDelay' | 'seekSeconds'
-  | 'groupCollapse' | 'feedAutoScroll' | 'feedCompilations' | 'miniplayer' | 'javImage'
-  | 'searchHistoryLimit';
+  | 'groupCollapse' | 'feedAutoScroll' | 'feedLimit' | 'feedCompilations' | 'miniplayer' | 'javImage'
+  | 'searchHistoryLimit' | 'performerNameLanguage';
 
 /** `[值, 显示名, 字形]`，与壳里各张选项表同形。 */
 export type Choice = readonly [value: string, label: string, icon?: string];
@@ -69,6 +72,9 @@ export interface SettingsPanelHost {
   /** SFW 与增加对比度各有自己的键，不在 `appSettings` 里；改完壳调 `store.notify()`。 */
   censored(): boolean;
   setCensored(on: boolean): void;
+  /** SFW 开关键，存本机不同步；传 null 恢复默认。改完壳调 `store.notify()`。 */
+  sfwShortcut(): Shortcut;
+  setSfwShortcut(shortcut: Shortcut | null): void;
   highContrast(): boolean;
   setHighContrast(on: boolean): void;
   receipt(message: string): void;

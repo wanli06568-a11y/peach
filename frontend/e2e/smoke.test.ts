@@ -5,7 +5,8 @@
  *
  * 每条路由先等它自己的主体出现，再 settle、再量几何。报错、失败请求、横向溢出和等待态
  * 这几条在页面完全没渲染时全都成立，不写主体的话白屏也是绿的。主体按 `tests/test_web_e2e.py`
- * 生成的演示库写：12 条视频，没有播放列表、关注来源和任务记录，这几页等到的是各自的空态。
+ * 生成的演示库写：12 条视频，没有播放列表和关注来源，这两页等到的是各自的空态。
+ * 任务中心可能已有自动修复记录，主体认明确的任务空态或任务卡。
  * 女优、厂牌与标签的索引在一轮里会从空变成有：前面的路由打开过作品之后条目就出现了，
  * 所以索引页的主体是「条目或空态」二选一，不绑死其中一种。标题只能拿来认页面，不能单独
  * 当主体：管理页的 `[data-manage-title]` 由外壳先写好，内容区失败时它照样在。
@@ -17,8 +18,9 @@ import { after, before, describe, it } from 'node:test';
 
 import type { Browser, Locator, Page } from 'playwright-core';
 
-import { configurationBody, expectBody, layout, launch, requiredEnv, settle, visit, VIEWPORTS } from './harness.ts';
+import { configurationBody, expectBody, layout, launch, requiredEnv, settle, unmanagedScrollers, visit, VIEWPORTS } from './harness.ts';
 import { mockJavDetail } from './jav-detail-fixture.ts';
+import { CLEANUP_HASH_REDIRECTS } from '../src/cleanup-tools.ts';
 
 interface Route {
   path: string;
@@ -28,6 +30,9 @@ interface Route {
 
 const heading = (page: Page, scope: string, name: string): Locator =>
   page.locator(scope).getByRole('heading', { name, exact: true });
+/* 数据管理二级页的卡片标题与页头同名；只认页头那一层 h2，React 卡片何时挂载都只匹配一个。 */
+const pageTitle = (page: Page, name: string): Locator =>
+  page.locator('#main').getByRole('heading', { name, exact: true, level: 2 });
 
 const DESKTOP = VIEWPORTS.find((viewport) => !viewport.mobile)!;
 
@@ -36,6 +41,14 @@ const DESKTOP = VIEWPORTS.find((viewport) => !viewport.mobile)!;
  * 匹配上，等它可见等到超时，主体其实早画好了。 */
 const indexEntries = (page: Page): Locator =>
   page.locator('#index [data-k]:visible, #index [data-empty-state]:visible').first();
+
+/** 任务数据已渲染：明确空态或真实任务卡都属于任务页的 React 根。 */
+const tasksBody = (page: Page): Locator[] => [
+  heading(page, '#main', '任务中心'),
+  page.locator('#stats .peach-react'),
+  heading(page, '#stats .peach-react [data-empty-state]', '还没有任务记录')
+    .or(page.locator('#stats .peach-react [data-run-id]:visible')).first(),
+];
 
 /** 统计页画完的标志：四张读数卡兼页签，第一张是馆藏。名字里还带读数和体积，按前缀匹配。 */
 const statsInventoryTab = (page: Page): Locator =>
@@ -54,6 +67,7 @@ const ROUTES: readonly Route[] = [
   { path: '/performers?category=animation', body: (page) => [heading(page, '#index', '艺人'), indexEntries(page)] },
   { path: '/studios', body: (page) => [heading(page, '#index', '厂牌'), indexEntries(page)] },
   { path: '/agencies', body: (page) => [heading(page, '#index', '事务所'), indexEntries(page)] },
+  { path: '/series', body: (page) => [heading(page, '#index', '系列'), indexEntries(page)] },
   { path: '/tags', body: (page) => [heading(page, '#index', '标签'), indexEntries(page)] },
   {
     path: '/playlists',
@@ -70,10 +84,15 @@ const ROUTES: readonly Route[] = [
       page.locator('#stats').getByRole('tab', { name: '添加关注', exact: true })],
   },
   {
-    // 订阅源页签由地址参数直达；演示库没有订阅源，等到的是那一节的页脚按钮。
+    // 订阅管理链接进入统一关注列表。
     path: '/subscriptions?tab=feeds',
-    body: (page) => [page.locator('#stats').getByRole('tab', { name: 'JAV 订阅源', exact: true, selected: true }),
+    body: (page) => [page.locator('#stats').getByRole('tab', { name: '关注列表', exact: true, selected: true }),
       page.locator('#stats').getByRole('button', { name: '立即拉取', exact: true })],
+  },
+  {
+    path: '/subscriptions?tab=add',
+    body: (page) => [page.locator('#stats').getByRole('region', { name: '添加创作者关注', exact: true }),
+      page.locator('#stats').getByRole('region', { name: '添加 JAV 订阅', exact: true })],
   },
   {
     // 骨架里那条指标带也写着「馆藏视频」，认不出画完没有；只有真页面把四张读数卡做成页签。
@@ -97,8 +116,14 @@ const ROUTES: readonly Route[] = [
     // 挂载前的遗留骨架用 heading，最终 React 卡片用带名字的 section；等最终语义才能证明挂载完成。
     body: (page) => [heading(page, '#main', '数据管理'),
       page.locator('#stats section[aria-label="扫描与采集"]'),
-      page.locator('#stats section[aria-label="媒体修复"]')],
+      page.locator('#cleanup-pending'), page.locator('#cleanup-maintenance'), page.locator('#cleanup-deletion')],
   },
+  { path: '/data-cleanup/organize', body: page => [pageTitle(page, '整理文件'), page.locator('#stats #organize')] },
+  { path: '/data-cleanup/media-repair', body: page => [pageTitle(page, '媒体修复'), page.locator('#stats section[aria-label="媒体修复"]')] },
+  { path: '/data-cleanup/resource-sync', body: page => [pageTitle(page, '资源同步'), page.locator('#stats #resource-sync')] },
+  { path: '/data-cleanup/orphan-records', body: page => [pageTitle(page, '文件已丢失的记录'), page.locator('#stats #orphan-records')] },
+  { path: '/data-cleanup/links', body: page => [pageTitle(page, '链接管理'), page.locator('#stats #link-manager')] },
+  { path: '/data-cleanup/batch-delete', body: page => [pageTitle(page, '批量删除'), page.locator('#stats #batch-delete')] },
   {
     // 演示库里没有垃圾候选，等到的是垃圾队列那一页的空态标题；壳铺的骨架只有卡片占位。
     path: '/junk-files',
@@ -110,9 +135,9 @@ const ROUTES: readonly Route[] = [
     body: (page) => [heading(page, '#main', '重复文件'), page.locator('#stats').getByText('重复内容', { exact: true })],
   },
   {
-    // 旧直达地址落到数据管理页的锚点上；骨架里那一段没有 `id`，带 `id` 的只有演示库配了根目录后的真卡片。
+    // 旧直达地址进入资源同步二级页。
     path: '/resource-sync',
-    body: (page) => [heading(page, '#main', '数据管理'), page.locator('#stats section#resource-sync')],
+    body: (page) => [pageTitle(page, '资源同步'), page.locator('#stats section#resource-sync')],
   },
   {
     path: '/quality-goals',
@@ -129,10 +154,12 @@ const ROUTES: readonly Route[] = [
   { path: '/settings/library', body: configurationBody },
   { path: '/diagnostics', body: page => [page.getByRole('tab', { name: '系统诊断', selected: true }), page.locator('#stats section[aria-label="库健康"]')] },
   { path: '/settings/diagnostics', body: page => [page.getByRole('tab', { name: '系统诊断', selected: true }), page.locator('#stats section[aria-label="库健康"]')] },
-  { path: '/tasks', body: (page) => [heading(page, '#main', '任务中心'), heading(page, '#stats', '还没有任务记录')] },
+  { path: '/tasks', body: tasksBody },
   ...['', '/appearance', '/playback', '/jav', '/search', '/content'].map(section => ({ path: '/settings' + section,
     body: (page: Page) => [page.getByRole('dialog', { name: /外观与导航|浏览与播放|JAV 与新作|搜索与推荐|内容显示/ })] })),
   ...['subscriptions', 'downloads', 'network', 'maintenance'].map(section => ({ path: `/settings/${section}`, body: configurationBody })),
+  { path: '/settings/maintenance/repairs', body: page => [pageTitle(page, '修复与迁移'), page.locator('#main [data-manage-crumb] a[href="/settings/maintenance"]'),
+    page.locator('#stats section[aria-labelledby="repair-items"]')] },
   {
     path: `/assets/${requiredEnv('PEACH_E2E_ITEM')}`,
     body: (page) => {
@@ -142,12 +169,21 @@ const ROUTES: readonly Route[] = [
   },
 ];
 
+const LEGACY_ROUTES: readonly Route[] = [
+  ...Object.entries(CLEANUP_HASH_REDIRECTS).map(([hash, path]) => ({
+    path: '/data-cleanup' + hash, body: ROUTES.find(route => route.path === path)!.body,
+  })),
+  { path: '/subscriptions?tab=wants', body: ROUTES.find(route => route.path === '/jav?tab=wants')!.body },
+  { path: '/subscriptions?tab=source', body: page => [page.locator('#stats form[aria-label="资源搜索"]')] },
+];
+
 async function assertHolds(page: Page, problems: string[], where: string): Promise<void> {
   assert.deepEqual(problems, [], `${where}：页面报错或有失败请求`);
   const box = await layout(page);
   assert.ok(box.scrollWidth <= box.viewportWidth,
     `${where}：横向溢出，scrollWidth ${box.scrollWidth} > 视口 ${box.viewportWidth}`);
   assert.deepEqual(box.offenders, [], `${where}：有元素越出视口右边缘`);
+  assert.deepEqual(await unmanagedScrollers(page), [], `${where}：存在未接入统一实现的滚动区`);
   if (where === '/') {
     const images = await page.locator('img[loading="lazy"]').evaluateAll(nodes => ({
       count: nodes.length,
@@ -170,8 +206,42 @@ describe('路由冒烟', () => {
     await browser.close();
   });
 
+  it('入库 toast 打开真实详情，标题使用番号或文件名，返回与前进恢复对应页面', { timeout: 60_000 }, async () => {
+    const id = Number(requiredEnv('PEACH_E2E_ITEM'));
+    let items: Array<{ id: number; kind: string; asset_id: number; label: string; at: number }> = [];
+    let reads = 0;
+    const opened = await visit(browser, '/stats', DESKTOP, async page => {
+      await page.route('**/api/result-updates', route => {
+        reads += 1;
+        return route.fulfill({ json: { ok: true, busy: true, result_versions: {}, ingest_notices: { epoch: 'toast-navigation', items } } });
+      });
+    });
+    try {
+      await expectBody(opened.page, '/stats', [statsInventoryTab(opened.page)]);
+      await opened.page.waitForFunction(() => document.title === '统计 · Peach');
+      assert.ok(reads > 0, '通知基线没有读取');
+      const response = await opened.page.request.get(`${requiredEnv('PEACH_E2E_ORIGIN')}/api/item?id=${id}`);
+      const item = await response.json();
+      const label = [item.display_code, item.code, item.name].map(value => String(value || '').trim()).find(Boolean);
+      assert.ok(label, '样本作品缺少番号与文件名');
+      items = [{ id: 1, kind: 'download', asset_id: id, label, at: 0 }];
+      const open = opened.page.locator('[data-sonner-toast]').filter({ hasText: '已入库并整理完成' }).getByRole('button', { name: '打开', exact: true });
+      await open.click({ timeout: 15_000 });
+      const stage = opened.page.getByRole('dialog', { name: '作品详情', exact: true });
+      await stage.locator('[data-item-detail] [data-item-title]').waitFor({ state: 'visible' });
+      assert.equal(new URL(opened.page.url()).pathname, `/assets/${id}`);
+      await opened.page.waitForFunction(expected => document.title === expected, `${label} · Peach`);
+      await opened.page.goBack();
+      await statsInventoryTab(opened.page).waitFor({ state: 'visible' });
+      await opened.page.waitForFunction(() => document.title === '统计 · Peach');
+      await opened.page.goForward();
+      await stage.locator('[data-item-detail] [data-item-title]').waitFor({ state: 'visible' });
+      await opened.page.waitForFunction(expected => document.title === expected, `${label} · Peach`);
+    } finally { await opened.close() }
+  });
+
   for (const viewport of VIEWPORTS) {
-    for (const route of ROUTES) {
+    for (const route of [...ROUTES, ...LEGACY_ROUTES]) {
       // 单条超时远小于 Python 侧的整轮超时：卡住的那一条自己报名字，不拖垮整轮输出。
       it(`${route.path} @ ${viewport.name}`, { timeout: 60_000 }, async () => {
         const opened = await visit(browser, route.path.startsWith('/works/') ? '/stats' : route.path, viewport);
@@ -203,16 +273,26 @@ describe('路由冒烟', () => {
     }
   }
 
-  /* React 档的页面自己管取数：轮询跟着那棵根活，而不是跟着遗留层的「代」。遗留层换页时
-     多数管理页直接 `innerHTML=`，根被挤出文档却照样活着——这一条盯的就是它有没有被卸掉。
+  /* 任务页读完整任务列表，常驻的结果更新只读轻量版本：离页卸掉任务页后不再读任务列表，
+     结果更新继续低频读取。固定空态让轮询保持十秒间隔；回到任务页前撤掉拦截，再读取服务端真实任务。
      换页走 pushState + popstate：侧栏按钮、抽屉和浏览器后退最后走的都是这一条路。 */
-  it('离开活动页之后轮询停下，回到这一页又接上', { timeout: 120_000 }, async () => {
-    const opened = await visit(browser, '/tasks', DESKTOP);
-    try {
-      const polls: string[] = [];
-      opened.page.on('request', (request) => {
-        if (request.url().includes('/api/tasks')) polls.push(request.url());
+  it('离开任务页卸载旧根，全局结果轮询持续，返回读取真实任务', { timeout: 120_000 }, async () => {
+    const polls: number[] = [];
+    const updates: number[] = [];
+    const opened = await visit(browser, '/tasks', DESKTOP, async (page) => {
+      await page.route('**/api/tasks', route => route.fulfill({ json: {
+        available: true, running: [], skipped: [], finished: [], finished_has_more: false,
+      } }));
+      await page.route('**/api/result-updates', route => route.fulfill({ json: {
+        ok: true, busy: false, result_versions: {}, ingest_notices: { epoch: 'smoke', items: [] },
+      } }));
+      page.on('request', (request) => {
+        const path = new URL(request.url()).pathname;
+        if (path === '/api/tasks') polls.push(performance.now());
+        if (path === '/api/result-updates') updates.push(performance.now());
       });
+    });
+    try {
       const waitForPolls = async (least: number, what: string) => {
         for (let step = 0; step < 80; step += 1) {
           if (polls.length >= least) return;
@@ -220,10 +300,11 @@ describe('路由冒烟', () => {
         }
         assert.ok(polls.length >= least, `${what}：只看到 ${polls.length} 次 /api/tasks，要 ${least} 次`);
       };
-      await expectBody(opened.page, '/tasks',
-        [heading(opened.page, '#stats', '还没有任务记录')]);
-      // 先确认轮询真的在跑，否则下面「停下来了」在它从没开始时也成立。
+      await expectBody(opened.page, '/tasks', tasksBody(opened.page));
+      // 先取得首屏与下一次轮询，离页后才能核对共享查询的节律。
       await waitForPolls(2, '活动页的轮询没有跑起来');
+      const taskRoot = await opened.page.locator('#stats .peach-react').elementHandle();
+      assert.ok(taskRoot, '任务页的 React 根没有挂载');
 
       await opened.page.evaluate(() => {
         history.pushState({}, '', '/stats');
@@ -231,27 +312,42 @@ describe('路由冒烟', () => {
       });
       await expectBody(opened.page, '/stats', [statsInventoryTab(opened.page)]);
       await settle(opened.page);
-      const stopped = polls.length;
-      // 统计页自己也是 React 档：管理区正文里应当只剩它那一棵根，活动页那一棵连同轮询一起撤掉。
+      const leftAt = polls.length;
+      const updatesAt = updates.length;
+      // 统计页自己也是 React 档：管理区正文里应当只剩它那一棵根。
       assert.equal(await opened.page.locator('#stats .peach-react').count(), 1,
         '管理区正文里不是只剩统计页那一棵 React 根');
-      assert.equal(
-        await opened.page.locator('#stats').getByRole('heading', { name: '还没有任务记录' }).count(), 0,
-        '换页之后活动页的 React 根还留在管理区正文里');
-      await opened.page.waitForTimeout(3_000);
-      assert.equal(polls.length, stopped, '离开活动页之后 /api/tasks 还在轮询');
+      assert.equal(await taskRoot.evaluate(root => root.isConnected), false,
+        '换页之后活动页的 React 根还留在文档里');
+      await taskRoot.dispose();
+      // 十二秒覆盖一次十秒轮询；允许观察窗口跨过两次，但每次必须至少相隔八秒。
+      // 两秒余量容纳导航与计时误差，也能拒绝活跃任务的两秒节律或并行的重复请求。
+      await opened.page.waitForTimeout(12_000);
+      // 离开任务页后，全局轮询只读轻量的结果版本，不再组装整张任务列表。
+      assert.equal(polls.length, leftAt, `离开任务页后仍在读取完整任务列表：${polls.length - leftAt} 次`);
+      const continued = updates.slice(updatesAt);
+      assert.ok(continued.length >= 1 && continued.length <= 2,
+        `离开任务页后全局结果轮询应持续单路低频读取，十二秒内看到 ${continued.length} 次请求`);
+      for (let index = Math.max(1, updatesAt); index < updates.length; index += 1) {
+        assert.ok(updates[index] - updates[index - 1] >= 8_000,
+          `全局结果轮询间隔过短：${Math.round(updates[index] - updates[index - 1])}ms`);
+      }
 
+      await opened.page.unroute('**/api/tasks');
+      const beforeReturn = polls.length;
+      const returningTasks = opened.page.waitForResponse(response =>
+        new URL(response.url()).pathname === '/api/tasks' && response.status() === 200);
       await opened.page.goBack();
-      await expectBody(opened.page, '/tasks',
-        [heading(opened.page, '#stats', '还没有任务记录')]);
-      await waitForPolls(stopped + 2, '回到活动页之后轮询没有接上');
-      await assertHolds(opened.page, opened.problems, '/activity 换页往返');
+      await returningTasks;
+      await expectBody(opened.page, '/tasks', tasksBody(opened.page));
+      await waitForPolls(beforeReturn + 2, '回到任务页之后真实任务轮询没有接上');
+      await assertHolds(opened.page, opened.problems, '/tasks 换页往返');
     } finally {
       await opened.close();
     }
   });
 
-  /* 首页那一行新作只属于目录页：从首页进统计页要收起清空，取数还没回来就离开的那一轮
+  /* 首页那一行新作只属于目录页：从首页进统计页要收起保留，取数还没回来就离开的那一轮
      也不许回头把它画到管理区上。演示库没有订阅，新作由拦截的接口给一条。 */
   it('离开首页之后新作那一行收起，晚到的取数也不画回来', { timeout: 60_000 }, async () => {
     const opened = await visit(browser, '/stats', DESKTOP);
@@ -280,16 +376,23 @@ describe('路由冒烟', () => {
       await go('/stats');
       await expectBody(opened.page, '/stats', [statsInventoryTab(opened.page)]);
       assert.equal(await opened.page.locator('#feedNew').isHidden(), true, '进统计页之后新作那一行还露着');
-      assert.equal(await feedCards.count(), 0, '进统计页之后新作那一行没有清空');
+      assert.equal(await feedCards.filter({ visible: true }).count(), 0, '进统计页之后新作卡片仍可见');
 
+      const beforeReturn = served;
       await go('/');
       await expectBody(opened.page, '/', [feedCards.first()]);
+      assert.equal(served, beforeReturn, '返回首页沿用新作缓存');
       await go('/junk-files');
       await opened.page.locator('#count [data-junk-filters]').waitFor();
       assert.equal(await opened.page.locator('#feedNew').isHidden(), true, '垃圾文件页不展示订阅新作');
-      assert.equal(await feedCards.count(), 0);
+      assert.equal(await feedCards.filter({ visible: true }).count(), 0);
 
       for (const target of ['/stats', '/junk-files']) {
+        hold = null;
+        const reloadPath = new URL(opened.page.url()).pathname;
+        await opened.page.reload({ waitUntil: 'load' });
+        await expectBody(opened.page, reloadPath, [reloadPath === '/stats'
+          ? statsInventoryTab(opened.page) : opened.page.locator('#count [data-junk-filters]')]);
         let release!: () => void;
         hold = new Promise((resolve) => { release = resolve; });
         const asked = opened.page.waitForRequest(/\/api\/feeds\/discoveries\?/);
@@ -304,7 +407,8 @@ describe('路由冒烟', () => {
         assert.ok(served > before, '压住的那一次新作取数没有放行');
         // 回包之后页面只剩一次同步重画；目录区的旧加载态不属于当前页面。
         await opened.page.waitForTimeout(500);
-        assert.equal(await feedCards.count(), 0, `晚到的新作取数画到了 ${target} 上`);
+        assert.equal(await opened.page.locator('#feedNew').isHidden(), true);
+        assert.equal(await feedCards.filter({ visible: true }).count(), 0, `晚到的新作取数画到了 ${target} 上`);
         await assertHolds(opened.page, opened.problems, `首页与 ${target} 往返`);
       }
     } finally {
@@ -317,8 +421,9 @@ describe('路由冒烟', () => {
   it('远程封套按正封先验比例切，不带进书脊', { timeout: 60_000 }, async () => {
     const opened = await visit(browser, '/stats', DESKTOP);
     try {
+      await expectBody(opened.page, '/stats', [statsInventoryTab(opened.page)]);
       const remote = 'https://covers.example.test/sleeve.svg';
-      await opened.page.route(remote, (route) => route.fulfill({
+      await opened.page.route('**/cover-image?code=ABF-348', (route) => route.fulfill({
         contentType: 'image/svg+xml',
         body: '<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1000">'
           + '<rect width="1500" height="1000" fill="#888"/></svg>',

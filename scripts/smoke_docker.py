@@ -1,4 +1,4 @@
-"""使用独立容器与临时卷验收镜像的初始化、鉴权、配置重载和持久化。"""
+"""使用独立容器与临时卷验收镜像的首次设置、鉴权、配置重载和持久化。"""
 from __future__ import annotations
 
 import argparse
@@ -18,9 +18,8 @@ def request(name: str, path: str, *, authenticated: bool = True, body: dict | No
             headers: dict | None = None):
     script = (
         "import json,urllib.request,urllib.error; from pathlib import Path; "
-        "token=Path('/data/secrets/auth-token').read_text().strip(); "
         "body=json.loads(__import__('sys').argv[1]); "
-        "headers={'X-Token':token} if body['auth'] else {}; "
+        "headers={'X-Token':Path('/data/secrets/auth-token').read_text().strip()} if body['auth'] else {}; "
         "headers=headers | (body['headers'] or {}); "
         "headers['Content-Type']='application/json'; "
         "req=urllib.request.Request('http://127.0.0.1:8900'+body['path'],"
@@ -37,13 +36,15 @@ def request(name: str, path: str, *, authenticated: bool = True, body: dict | No
                   json.dumps({"auth": authenticated, "path": path, "body": body, "headers": headers}))
 
 
-def ready(name: str) -> None:
+def ready(name: str, *, setup: bool = False) -> None:
+    """等到服务就绪；`setup` 为真时等的是全新数据卷上的首次设置服务（ADR-0149）。"""
     deadline = time.monotonic() + 90
     while time.monotonic() < deadline:
         try:
             response = json.loads(request(name, "/healthz?ready=1", authenticated=False))
-            if "status" not in response:
+            if "status" not in response and response.get("setup", False) == setup:
                 return
+            time.sleep(1)
         except subprocess.CalledProcessError:
             if docker("inspect", "-f", "{{.State.Running}}", name) != "true":
                 raise RuntimeError(docker("logs", name)) from None
@@ -83,6 +84,21 @@ def transcode_checks(name: str) -> None:
         assert report["streams"][0] == {"codec_name": "h264", "pix_fmt": "yuv420p"}, report
 
 
+def amane_checks(name: str) -> None:
+    """断网容器直接载入随镜像分发的独立环境与全部站点类。"""
+    runtime = "/app/amane-runtime"
+    manifest = json.loads(docker("exec", name, "python", "-c",
+        f"from pathlib import Path; print(Path('{runtime}/manifest.json').read_text())"))
+    executable = runtime + "/" + manifest["executable"]
+    report = json.loads(docker("exec", name, executable, "-X", "utf8",
+                              "/app/tools/amane-bridge/bridge.py", "--self-check"))
+    assert report["ok"] and report["amane"]["version"] == manifest["version"], report
+    assert len(report["sites"]) == 20, report
+    bridge = json.loads(request(name, "/api/scraping/amane-bridge"))
+    assert bridge["python"] == executable, bridge
+    assert bridge["installed"] is True and bridge["revision"] == manifest["revision"], bridge
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("image")
@@ -93,6 +109,15 @@ def main() -> None:
         docker("volume", "create", volume)
         docker("run", "-d", "--name", name, "--network", "none",
                "--mount", f"type=volume,source={volume},target=/data", args.image)
+        ready(name, setup=True)
+        # 全新数据卷不再自动初始化：先答首次设置，设访问密码，后面的未登录请求才是 401。
+        assert docker("exec", name, "python", "-c",
+                      "from pathlib import Path; print(Path('/data/config.toml').exists())") == "False"
+        done = json.loads(request(name, "/api/setup", authenticated=False, body={
+            "media_dir": [], "skip_media": True, "scan_now": False, "access_enabled": True,
+            "access_password": "smoke-password", "access_confirm": "smoke-password"}))
+        assert done.get("url") == "/?onboarding=1", done
+        time.sleep(2)
         ready(name)
         assert docker("exec", name, "id", "-u") == "1000"
         assert json.loads(request(name, "/api/items")) is not None
@@ -101,9 +126,10 @@ def main() -> None:
         docker("exec", name, "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=1",
                "-t", "2", "-c:v", "libx264", "/data/smoke-media/fixture.mp4")
         configuration = json.loads(request(name, "/api/configuration"))
+        assert configuration['media_sources'] == [], configuration['media_sources']
         saved = json.loads(request(name, "/api/configuration", body={
             "revision": configuration["revision"], "port": configuration["port"], "scan_now": True,
-            "media_sources": [{"location": "local", "root": "R:\\media", "path": "/data/smoke-media"}],
+            "media_sources": [{"location": "local", "path": "/data/smoke-media"}],
         }))
         assert saved.get("saved"), saved
         time.sleep(2)
@@ -122,6 +148,7 @@ def main() -> None:
         media = json.loads(request(name, f"/stream?id={asset}", headers={"Range": "bytes=0-63"}))
         assert media == {"status": 206, "size": 64}, media
         transcode_checks(name)
+        amane_checks(name)
         config_path = "/data/config.toml"
         original = docker("exec", name, "cat", config_path)
         docker("exec", name, "python", "-c",
@@ -138,9 +165,9 @@ def main() -> None:
         docker("restart", "--time", "75", name)
         ready(name)
         assert docker("exec", name, "cat", config_path) == original
-        print(json.dumps({"image": args.image, "checks": ["non-root", "ready", "auth", "configuration",
+        print(json.dumps({"image": args.image, "checks": ["first-setup", "non-root", "ready", "auth", "configuration",
                                                          "scan", "range", "vaapi-stack", "transcode-fallback",
-                                                         "reload", "restart", "persistence"]}))
+                                                         "amane-prerequisites", "reload", "restart", "persistence"]}))
     finally:
         docker("rm", "--force", name, check=False)
         docker("volume", "rm", volume, check=False)

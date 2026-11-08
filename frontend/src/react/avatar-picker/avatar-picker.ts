@@ -2,7 +2,7 @@
  *
  * 候选图走 `/avatar-choice?ref=`：页面只递服务端自己列出来的 ref，地址由服务端按索引拼。
  * 手填地址先交给 `/api/avatar-frame`，过了服务端的公网判据、取回来留在缓存里，才变成
- * 一个 `url:` ref；本机文件只在浏览器里预览，确认时按原字节发出去。 */
+ * 一个 `url:` ref；本机文件使用服务端转换后的候选预览，确认时按原字节发出去。 */
 import { ApiError, apiGet, apiSend } from '../../api';
 import {
   centeredBox, frameWithin, isUsableSize, type CropBox, type CropSize,
@@ -24,6 +24,7 @@ export interface AvatarChoice {
   /** 这一格是按哪个名字从图库里找到的。只有一个名字命中时是空串。 */
   found_by: string;
   current: boolean;
+  user_cropped?: boolean;
   /** 这一格必须先框一块再装。作品画面是横图，整张装进圆框只剩一块背景。 */
   crop: boolean;
   /** 框选时可以换的底图，按 ref 给：封面加九宫格那九格。 */
@@ -48,6 +49,8 @@ export interface AvatarChoices {
   choices: AvatarChoice[];
   index_age_hours: number | null;
   index_stale: boolean;
+  index_refreshing?: boolean;
+  index_error?: string;
 }
 
 /** 一个人一个键：换个人就是另一份候选，不该读到上一个人的。 */
@@ -81,7 +84,7 @@ export async function frameChoice(kind: string, id: number, choice: AvatarChoice
 export const frameAddress = (kind: string, id: number, url: string) =>
   apiSend<AvatarChoice>(AVATAR_FRAME_URL, { kind, id, url });
 
-/** 本机文件：按原字节发过去量尺寸、检脸，服务端不留。 */
+/** 本机文件：按原字节提交，服务端转换为静态预览并交回候选引用。 */
 export const frameFile = (kind: string, id: number, file: File) =>
   sendBytes<AvatarChoice>(`${AVATAR_FRAME_URL}${query(kind, id)}&name=${encodeURIComponent(file.name)}`, file);
 
@@ -153,6 +156,8 @@ const indexAge = (hours: number): string =>
 /** 图库索引没取过或已过期、这一次也一张图库图都没拿到时的那句提示；别的情形是空串。
  *  没取过和过期是两回事：过期的索引照样在查，只是新收的人像查不到。 */
 export function indexNote(data: AvatarChoices | undefined): string {
+  if (data?.index_refreshing) return '正在更新图库索引，候选图片会自动显示。';
+  if (data?.index_error && data.index_stale) return '图库索引未取得：' + data.index_error;
   if (!data || !data.index_stale || data.choices.some((one) => one.source === 'gfriends')) return '';
   return data.index_age_hours === null
     ? '图库索引还没取过，只能从用过的图里选。'
@@ -165,7 +170,7 @@ export const sharedCast = (choice: AvatarChoice): boolean => choice.cast > 1;
 export const cropNote = (choice: AvatarChoice): string =>
   sharedCast(choice)
     ? `${choice.label}：${choice.cast.toLocaleString()} 人合演，先找到她自己的脸，再拖动方框选一块。`
-    : `${choice.label}：拖动方框选一块，滚轮或角上那枚方块改大小。`;
+    : `${choice.label}${choice.source === 'social' && choice.detail ? ` · ${choice.detail}` : ''}：拖动方框选一块，滚轮或角上那枚方块改大小。`;
 
 const SOURCE_LABELS: Record<string, string> = {
   gfriends: '图库', history: '用过的', asset: '作品画面', code: '番号封面',
@@ -192,4 +197,4 @@ export const choiceDetail = (choice: AvatarChoice): string =>
   + (choice.width ? ` · ${choice.width}×${choice.height}` : '')
   + (sharedCast(choice) ? ` · ${choice.cast.toLocaleString()} 人合演` : '')
   + (choice.found_by ? ` · 按「${choice.found_by}」找到` : '')
-  + (choice.source === 'asset' && choice.detail && choice.detail !== choice.label ? ` · ${choice.detail}` : '');
+  + (['asset', 'social', 'history'].includes(choice.source) && choice.detail && choice.detail !== choice.label ? ` · ${choice.detail}` : '');

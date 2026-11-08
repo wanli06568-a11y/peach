@@ -107,6 +107,21 @@ class SourcePaused(RuntimeError):
     """来源冷却期内停止请求，保留已有图像。"""
 
 
+class SourceBudgetExhausted(SourcePaused):
+    """本趟采集预算耗尽，不能作为单个来源的冷却跳过。"""
+
+
+class SourceRefused(SourcePaused):
+    """站方回的是拒绝这个出口的说明页（`sources.base.refusal_page`），来源已经记下冷却。
+
+    `reason` 是 `FailureReason` 的取值（`geo_restricted`／`ip_banned`），来源检查按它报细档。
+    """
+
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 def cooldown_path(root: Path, source: str) -> Path:
     """这个来源的冷却记录。键是来源名；没有来源名的请求按主机名散列，见 `SourceTransport`。"""
     return Path(root) / ("scraping-" + source + ".cooldown.json")
@@ -400,8 +415,9 @@ class SourceTransport:
     """公开采集按来源复用连接池；登录会话由特定来源消费者显式建立。"""
 
     def __init__(self, secrets_root: Path, *, max_requests: int = 0,
-                 max_bytes: int = 0, max_seconds: float = 0):
+                 max_bytes: int = 0, max_seconds: float = 0, allow_browser: bool = True):
         self.root = secrets_root
+        self.allow_browser = allow_browser
         self.transports: dict[str | None, HttpxTransport] = {}
         self.max_requests, self.max_bytes = max_requests, max_bytes
         from .processing_control import deadline_after
@@ -409,10 +425,23 @@ class SourceTransport:
         self.requests = self.bytes = 0
 
     def __call__(self, request: HttpRequest, timeout: float, max_bytes: int):
+        from .task_control import operation
+        with operation():
+            return self._controlled_request(request, timeout, max_bytes)
+
+    def _controlled_request(self, request: HttpRequest, timeout: float, max_bytes: int):
         for _ in range(6):
             from .processing_control import checkpoint
             checkpoint('network')
-            response = self._request(request, timeout, max_bytes)
+            from .processing_traffic import CURRENT, download_route
+            if CURRENT.get() is None:
+                response = self._request(request, timeout, max_bytes)
+            else:
+                source = source_for(request.url)
+                direct = bool(source and values_for(self.root, source).get('network') == 'direct')
+                options = {'trust_env': False} if direct else peach_proxy.client_options(self.root)
+                with download_route(bool(options.get('proxy') or options.get('trust_env', True))):
+                    response = self._request(request, timeout, max_bytes)
             if response.status not in {301, 302, 303, 307, 308} or not response.headers.get("location"):
                 return response
             target = urljoin(request.url, response.headers["location"])
@@ -429,16 +458,21 @@ class SourceTransport:
         """闸门到顶的三句话都写「本趟」和「再跑一次接着采」：这三条按任务重新计数，
         读的人要据以决定的是「现在重跑一遍」，不是去查哪里还有配额。"""
         source = source_for(request.url)
+        if source == "javbus":
+            # 中文作品解析与连接检查共用语言偏好，封面请求也遵循来源策略。
+            headers = {key: value for key, value in request.headers.items() if key.lower() != "accept-language"}
+            request = HttpRequest(request.method, request.url,
+                                  {**headers, "Accept-Language": "zh-CN,zh;q=0.9"}, request.body)
         if self.max_requests and self.requests >= self.max_requests:
-            raise SourcePaused("本趟采集次数已用完，再跑一次接着采；已有图片保留")
+            raise SourceBudgetExhausted("本趟采集次数已用完，再跑一次接着采；已有图片保留")
         if self.deadline:
             timeout = min(timeout, self.deadline - time.monotonic())
             if timeout <= 0:
-                raise SourcePaused("本趟采集时间已用完，再跑一次接着采；已有图片保留")
+                raise SourceBudgetExhausted("本趟采集时间已用完，再跑一次接着采；已有图片保留")
         if self.max_bytes:
             remaining = self.max_bytes - self.bytes
             if remaining <= 0:
-                raise SourcePaused("本趟下载量已用完，再跑一次接着采；已有图片保留")
+                raise SourceBudgetExhausted("本趟下载量已用完，再跑一次接着采；已有图片保留")
             max_bytes = min(max_bytes, remaining - 1)
         key = source or hashlib.sha256(hostname_of(request.url).encode()).hexdigest()
         cooldown = cooldown_path(self.root, key)
@@ -478,6 +512,7 @@ class SourceTransport:
                     until = time.time() + 900
             _pause(cooldown, until, blocks, via)
             raise SourcePaused("来源限流，已记录冷却时间；已有图片保留")
+        self._refuse(source, request.url, response, cooldown, blocks, via)
         blocked_pause = SOURCES.get(source or "", {}).get("blocked_pause")
         if response.status == 403 and blocked_pause:
             blocks += 1
@@ -492,6 +527,31 @@ class SourceTransport:
             cooldown.unlink(missing_ok=True)
         return response
 
+    @staticmethod
+    def _refuse(source: str | None, url: str, response, cooldown: Path, blocks: int, via: str) -> None:
+        """回的是拒绝这个出口的说明页（地区限制、出口封禁）就记冷却并抛 `SourceRefused`。
+
+        状态码多半是 200，交给调用方只会被读成「这一页解不出东西」或「站上没有」。两种都是换一部片
+        问结果不变，整站停下。地区限制要换出口才会变，用户改完代理不该再等一整天，所以固定停
+        `FIRST_BLOCKED_PAUSE`、不往上翻倍；封禁和 403 一样按次翻倍到 `blocked_pause`。
+        """
+        from .sources.base import FailureReason, refusal_page
+
+        reason = refusal_page(response.body)
+        if reason is None:
+            return
+        label = SOURCES.get(source or "", {}).get("label") or hostname_of(url)
+        if reason is FailureReason.GEO_RESTRICTED:
+            _pause(cooldown, time.time() + FIRST_BLOCKED_PAUSE, blocks, via)
+            raise SourceRefused(
+                f"{label} 不对当前出口所在的地区开放，请在代理里给它换一个它接受的地区的出口；"
+                f"暂停向它请求 {FIRST_BLOCKED_PAUSE // 60} 分钟", reason.value)
+        blocks += 1
+        limit = SOURCES.get(source or "", {}).get("blocked_pause") or 24 * 3600
+        _pause(cooldown, time.time() + min(FIRST_BLOCKED_PAUSE * 2 ** (blocks - 1), limit), blocks, via)
+        raise SourceRefused(f"{label} 封禁了当前出口 IP，暂停向它请求一段时间，"
+                            "也可以在代理里给它换一个出口", reason.value)
+
     def hold(self, source: str, action: str) -> None:
         """契约报的冷却细档（`SourceFailure.cooldown_action`）写回这个来源的冷却记录。
 
@@ -505,7 +565,7 @@ class SourceTransport:
 
     def _via(self, source: str | None) -> str:
         """这个来源这次走哪条路。该走浏览器的来源要先选出传输才知道（不发请求、不起进程）。"""
-        if source and source not in self.transports and wants_browser(self.root, source):
+        if self.allow_browser and source and source not in self.transports and wants_browser(self.root, source):
             self.transports[source] = self._transport_for(source)
         transport = self.transports.get(source)
         return VIA_BROWSER if isinstance(transport, browser_transport.BrowserTransport) else VIA_HTTP
@@ -516,6 +576,10 @@ class SourceTransport:
         取到 200 且不是验证页：这个来源固定到浏览器（`fix_to_browser`），本趟之后的请求也走浏览器，返回这一页。
         本机没有浏览器、浏览器没取到或同样被拦：返回 None，调用方照 HTTP 客户端被拦那样冷却。
         """
+        if not self.allow_browser:
+            return None
+        from .processing_control import checkpoint
+        checkpoint('network')
         browser = self._browser_for(source)
         if browser is None:
             return None
@@ -548,7 +612,7 @@ class SourceTransport:
 
     def _transport_for(self, source: str | None):
         """这个来源的请求走哪条路：该走浏览器（`wants_browser`）且本机有浏览器就走浏览器页面，否则 httpx。"""
-        if source and wants_browser(self.root, source):
+        if self.allow_browser and source and wants_browser(self.root, source):
             browser = self._browser_for(source)
             if browser is not None:
                 return browser

@@ -1,12 +1,14 @@
 /* feed 域控制器：本域状态与动作，启动由 Application 的生命周期统一安装。 */
-import { coverImage } from './../card-art/markup';
+import { coverImage, remoteCoverUrl } from './../card-art/markup';
 import { feedIdentity } from './../card-art/feed-identity';
+import { coverStateHtml } from './../card-art/cover-state';
 import { $, api, esc, foldName, icon, isCatalogPath } from '../core';
 import { javTitleHtml } from '../core/jav-title';
 import { COVER_FRONT_RATIO } from './../appearance/layout';
 import { catalogState } from './catalog.js';
-import { managedTaken, openManagedRoute, releaseManagedRoute, updateManagedRoute } from './../history/managed';
-import { loadingDotsHtml, noteHtml, stopAutoScroll, wireAutoScroll } from '../ui-kit';
+import { feedNewSkeletonHtml } from '../feed-new-skeleton';
+import { managedTaken, openManagedRoute, updateManagedRoute } from './../history/managed';
+import { noteHtml, stopAutoScroll, wireAutoScroll } from '../ui-kit';
 import { preferencesState, wireDrag } from './preferences.js';
 import { pushEntityPage } from './entity.js';
 import { applicationEffects } from './effects';
@@ -14,18 +16,18 @@ export const feedState = { FEED_SKELETON_CARDS: undefined, feedNewSkeletonHtml: 
 
 export function feedNewCoverHtml(item){
   if(item.has_cover)return coverImage(item,'big');
-  if(!item.cover_url)return item.cover_fetching
-    ?`<span class="nopic" data-feed-cover-state="fetching">${loadingDotsHtml('抓取中')}</span>`
-    :'<span class="nopic" data-feed-cover-state="missing">无封面</span>';
+  // 还没有封面：说清在等什么、为什么没有，排队的可以当场先取（后台那条队可能被存量补修占着几个小时）。
+  if(!item.cover_url||!item.code)return coverStateHtml(item);
+  // 官方图经 Peach 代理取，断网或上游失败时换成「封面未取得」占位。
   return coverImage(item,'big').replace(/ src="[^"]*"/,
-    ` src="${esc(item.cover_url)}" referrerpolicy="no-referrer" data-panel-prior="1"`)
-    .replace('data-drop="self"', 'data-drop="initial" data-initial="无封面" data-drop-class="nopic"');
+    ` src="${esc(remoteCoverUrl(item))}" data-panel-prior="1"`)
+    .replace('data-drop="self"', 'data-drop="initial" data-initial="封面未取得" data-drop-class="nopic"');
 }
 
 export function feedNewCardHtml(item){
   // 署名与日期各占一行，长出演名单可从悬停说明查看。
   const label=[item.performers&&`<span class="feednewperformers" title="${esc(item.performers)}">${esc(item.performers)}</span>`,
-    item.release_date&&`<span>${esc(item.release_date)}</span>`].filter(Boolean)
+    item.release_date&&`<time class="feednewdate" datetime="${esc(item.release_date)}">${esc(item.release_date)}</time>`].filter(Boolean)
     .join('');
   const cover=feedNewCoverHtml(item);
   // 番号与标题排在同一个两行的标题块里，和资产卡一样：番号加粗打头，标题接在后面截断。
@@ -64,10 +66,21 @@ export async function loadEntityShapes(){
     feedState.entityShapesComplete=true;
     feedState.entityShapes=new Map((data.entities||[])
       .flatMap(entity=>[String(entity.id),...entity.names].map(name=>[`${entity.kind}/${foldName(name)}`,entity.parts])));
-    if(typeof data.home?.feed==='boolean')catalogState.homeHasFeed=data.home.feed;
+    if(typeof data.home?.feed==='boolean')rememberHomeFeed(data.home.feed);
     if(isFeedNewPath(location.pathname))prepareHomeFeed($('#feedNew'));
   }
   return feedState.entityShapes;
+}
+
+/* 首页有没有「未入库的新作」记在本机：首屏骨架就按上次的结论铺这一行，不等形状接口回来再插进来，
+   把下面的目录往下推一跳。接口或那一行画完后改记新的结论。 */
+const HOME_FEED_KEY='peach.home-feed.v1';
+export function rememberHomeFeed(has){
+  catalogState.homeHasFeed=has;
+  try{localStorage.setItem(HOME_FEED_KEY,has?'1':'0')}catch{/* 下次照旧等接口。 */}
+}
+export function recalledHomeFeed(){
+  try{const value=localStorage.getItem(HOME_FEED_KEY);return value==='1'?true:value==='0'?false:null}catch{return null}
 }
 
 export function prepareHomeFeed(host){
@@ -85,10 +98,13 @@ export function feedNetworkNote(unreachable,items){
     {variant:'warning',className:'feednetwork',actionLabel:'配置连接方式',actionHref:'/sources'});
 }
 
-export function feedRowHtml(data){
+/* `allHref` 给了就在行尾多一张「查看全部新作」卡，跳到 JAV 页的新作分区；首页那一行给，资料页那一行不给。 */
+export function feedRowHtml(data,allHref=''){
   const items=data&&!data.error?(data.items||[]):[];
+  const all=allHref&&items.length
+    ?`<a class="feednewall" href="${esc(allHref)}" style="--card-ratio:${COVER_FRONT_RATIO}"><span>查看全部新作</span>${icon('chevron-right')}</a>`:'';
   return feedNetworkNote(data?.cover_network,items)
-    +`<div class="feednewrow srow">${items.map(feedNewCardHtml).join('')}</div>`;
+    +`<div class="feednewrow srow">${items.map(feedNewCardHtml).join('')}${all}</div>`;
 }
 
 export function wireFeedNewRow(row){
@@ -102,7 +118,7 @@ export function isFeedNewPath(path){return isCatalogPath(path)&&path!=='/junk-fi
 
 export function renderHomeFeed(){
   const host=$('#feedNew');
-  if(managedTaken(host)){updateManagedRoute(host,{revision:++feedState.feedRevision});return}
+  if(managedTaken(host)){host.hidden=catalogState.homeHasFeed!==true;return}
   prepareHomeFeed(host);
   /* 这一行不随筛选变，判在不在场只看路径：换筛选换掉的是目录的代次，不该把它这一趟作废。 */
   void openManagedRoute('feed-new',{host,revision:feedState.feedRevision,helpers:feedState.feedNewHelpers,actions:feedState.feedNewActions},
@@ -112,8 +128,7 @@ export function renderHomeFeed(){
 export function clearHomeFeed(){
   const host=$('#feedNew');
   host.querySelectorAll('.feednewrow').forEach(stopAutoScroll);
-  releaseManagedRoute(host);
-  host.hidden=true;host.innerHTML='';host.removeAttribute('aria-busy');
+  host.hidden=true;
 }
 
 export function refreshFeedRows(){
@@ -128,17 +143,19 @@ export function syncFeedAutoScroll(){
     preferencesState.appSettings.feedAutoScroll?wireAutoScroll(row):stopAutoScroll(row));
 }
 
+/* 开关挪到下一帧写：它一翻，资料卡换栏、页面变高，而整页那条覆盖滚动条正观察着 `<body>`。在尺寸观察
+   回调里当场写，`<body>` 这一层浅的变化本轮送不出去，浏览器就报一次 ResizeObserver 循环错误，
+   每开一次资料页都进错误上报。 */
+let heroWideFrame=0;
 export function syncHeroWide([entry]){
-  $('#index').toggleAttribute('data-hero-wide',entry.contentRect.width>=feedState.HERO_WIDE_PX);
+  const wide=entry.contentRect.width>=feedState.HERO_WIDE_PX;
+  cancelAnimationFrame(heroWideFrame);
+  heroWideFrame=requestAnimationFrame(()=>{heroWideFrame=0;$('#index')?.toggleAttribute('data-hero-wide',wide)});
 }
 
 export function installFeed13() {
 feedState.FEED_SKELETON_CARDS = 8;
-feedState.feedNewSkeletonHtml = ()=>`<div class="feednewrow srow" aria-hidden="true">${
-  `<article class="card feednewcard feednewskeleton"><div class="pic imgwait" style="--card-ratio:${COVER_FRONT_RATIO}"></div>
-    <div class="meta"><div class="mtext"><span class="t"><span class="skeleton"></span></span>
-      <div class="s mono"><span class="skeleton">&#8203;</span></div></div></div></article>`
-    .repeat(feedState.FEED_SKELETON_CARDS)}</div>`;
+feedState.feedNewSkeletonHtml = ()=>feedNewSkeletonHtml(feedState.FEED_SKELETON_CARDS);
 feedState.entityShapes = null;
 feedState.entityShapesComplete = false;
 feedState.hasEntityShape = (kind,name)=>feedState.entityShapesComplete||!!feedState.entityShapes?.has(`${kind}/${foldName(name)}`);
@@ -152,7 +169,7 @@ feedState.factsSkeleton = ()=>`<dl class="entityfacts" data-entity-facts>${
   '<dt><span class="skeleton"></span></dt><dd><span class="skeleton"></span></dd>'.repeat(5)}</dl>`;
 feedState.feedRevision = 0;
 feedState.feedNewHelpers = {feedRowHtml,wireFeedRow:row=>wireFeedNewRow(row)};
-feedState.feedNewActions = {settled:hasItems=>{catalogState.homeHasFeed=hasItems}};
+feedState.feedNewActions = {settled:hasItems=>rememberHomeFeed(hasItems)};
 feedState.HERO_WIDE_PX = 900;
 applicationEffects.resize(syncHeroWide).observe($('#index'));
 }

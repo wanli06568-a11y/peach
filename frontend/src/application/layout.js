@@ -1,9 +1,11 @@
 /* layout 域控制器：本域状态与动作，启动由 Application 的生命周期统一安装。 */
+import { javCardPage } from '../jav-controls';
 import { DIRECT_MANAGE_NAV, MANAGE_MENU_SECTIONS, MANAGE_SECTIONS, NAV_CATALOG, OPTIONAL_SIDEBAR_ITEMS, SIDEBAR_ITEMS, getManageMenuSections } from './navigation-items';
 import { FOLLOW_INITIAL_RANGE_OPTIONS } from './initial-follow-ranges';
 import { noteHtml, revealTexts } from '../ui-kit';
 import { $, ROUTE_ENTITIES, STATE_LABELS, STATE_ROUTES, api, isCatalogPath } from '../core';
 import { buildBars, catalogLayoutProp, catalogState, clearCatalogGrid, commitContextFilter, emptyTrash, goHome, homePath, loadCatalog, paintCatalogFilter, repaintCatalogGrid, syncCatalogFilterScreen } from './catalog.js';
+import { rememberedSidebarPath, requestPageTop } from '../history/page-navigation';
 import { navigationState, openRoutedPage, paintSidebar, syncNavigation } from './navigation.js';
 import { paintManagementPlaceholder } from './../management-placeholder';
 import { hideDiscoveryBars } from './loading.js';
@@ -13,7 +15,7 @@ import { tagLabel } from '../core/tags';
 import { followFeedLive, followState, followView, followViewPath, routeFollowFeed } from './follow.js';
 import { applicationEffects } from './effects';
 import { entityJavLayout, notifyShell, pageOpens, runtimeConfigurable, selectMode, selectSurface, state, writeShell } from './../shell/index';
-import { censorOn, preferencesState, setCensored, setHighContrast } from './preferences.js';
+import { censorOn, preferencesState, setCensored, setHighContrast, setSfwShortcut, sfwShortcut } from './preferences.js';
 import { playUiSound } from '../ui-kit/sounds';
 import { THEME_OPTIONS } from './../appearance/theme';
 import { JAV_LAYOUTS, cardLayoutFor, storeHomeLayout, storeJavLayout, storeVideoLayout } from './../appearance/layout';
@@ -48,12 +50,14 @@ export function showManagementBody({manage=true,placeholder=''}={}){
 }
 
 export function enterManagementSurface(){
+  $('#javLibraryHeader').hidden=true;
   catalogState.hideCatalogCombo();
   hideDiscoveryBars();
   document.body.classList.remove('entity-open','index-open');
 }
 
 export function showHomeSurfaces(){
+  $('#javLibraryHeader').hidden=!isCatalogPath(location.pathname)||!javActive();
   // 两个类都要清：只清 entity-open 会让从索引页回首页时顶栏一直空着，
   // 而且下面那一行 style.display='' 恢复不了被 class 隐藏的元素。
   document.body.classList.remove('entity-open','index-open');
@@ -122,7 +126,7 @@ export function closeSettingsRoute(){
 export function sidebarHost(){
   return {
     scroll:$('#drawerScroll'),store:preferencesState.settingsStore,navCatalog:layoutState.NAV_CATALOG,
-    navOn,navTo,
+    navOn,navTo,navToTop:()=>{closeDrawerAfterNav();requestPageTop()},
     toggleChip:(key,value,multi)=>commitContextFilter(filters=>{
       if(multi){const cur=String(filters[key]||'').split(',').filter(Boolean);
         const i=cur.indexOf(value);if(i>=0)cur.splice(i,1);else cur.push(value);filters[key]=cur.join(',')}
@@ -142,7 +146,9 @@ export function sidebarHost(){
 
 export function mountSidebar(){
   const scroll=$('#drawerScroll');
+  const anchors=[...(scroll.querySelector('[data-sidebar-head]')?.children||[])];
   scroll.innerHTML=sidebarSkeletonHtml(preferencesState.appSettings.sidebarOrder,layoutState.NAV_CATALOG,navOn);
+  scroll.querySelector('[data-sidebar-head]').append(...anchors);
   applicationEffects.listen(scroll, 'click', event=>{
     if(sidebarApi())return;
     const button=event.target.closest?.('[data-nav]');
@@ -212,7 +218,7 @@ export function mountManageHeader(){
     }
     if(event.target.closest?.('[data-empty-trash]'))emptyTrash();
   });
-  loadManageHeader({root,openManage,openDataCleanup:()=>navigationState.navigatePath('/data-cleanup'),emptyTrash})
+  loadManageHeader({root,store:preferencesState.settingsStore,openManage,openPath:path=>navigationState.navigatePath(path),emptyTrash})
     .then(()=>paintManageHeader()).catch(()=>{});
 }
 
@@ -221,7 +227,45 @@ export function paintListTitle(){
   const path=decodeURIComponent(location.pathname);
   const label=!manageSection()&&isCatalogPath(path)?STATE_LABELS[state.state]||'':'';
   el.hidden=!label;if(label)el.textContent=label;
-  $('#catalogPageHeading').hidden=!!manageSection()||!isCatalogPath(path)||!!label||state.jav==='1';
+  const heading=$('#catalogPageHeading');
+  heading.hidden=!!manageSection()||!isCatalogPath(path)||!!label||state.jav==='1';
+  paintCatalogPageTitle(heading,state.q);
+}
+
+/* 首页标题跟着搜索词走：搜出来的这一屏是这个词的结果，不再是首页。清掉搜索词回到「首页」。 */
+export function paintCatalogPageTitle(heading,query){
+  const title=heading?.querySelector('[data-page-title]');if(!title)return;
+  const words=String(query||'').trim();
+  const next=words?`搜索结果：「${words}」`:'首页';
+  if(title.title===next||(!words&&title.textContent===next))return;
+  if(!words){title.textContent=next;title.removeAttribute('title');return}
+  const part=(text,full)=>{const span=document.createElement('span');span.textContent=text;if(full!==undefined)span.dataset.titleWords=full;return span};
+  title.replaceChildren(part('搜索结果：「'),part(words,words),part('」'));
+  title.title=next;
+  fitTitleWords(title);
+  // 框宽变了由观察者重截；字体晚到时框不变、字变宽，等字体就绪再截一次。
+  titleWidth??=new ResizeObserver(entries=>entries.forEach(entry=>fitTitleWords(entry.target)));
+  titleWidth.observe(title);
+  void document.fonts?.ready.then(()=>fitTitleWords(title));
+}
+
+/* 长词只截搜索词那一段的末尾，省略号紧贴收尾的「」」。CSS 的末尾省略做不到：引号要在词外头，
+   词那一格截断后剩下的空白会留在省略号和引号之间。按标题此刻的宽度二分出放得下的最长前缀。 */
+let titleWidth=null;
+function fitTitleWords(title){
+  const span=title.querySelector('[data-title-words]');if(!span||!title.clientWidth)return;
+  const full=span.dataset.titleWords;
+  span.textContent=full;
+  if(title.scrollWidth<=title.clientWidth)return;
+  const parts=typeof Intl.Segmenter==='function'
+    ?[...new Intl.Segmenter(undefined,{granularity:'grapheme'}).segment(full)].map(part=>part.segment):Array.from(full);
+  let low=0,high=parts.length-1,best=0;
+  while(low<=high){
+    const kept=(low+high)>>1;
+    span.textContent=parts.slice(0,kept).join('')+'…';
+    if(title.scrollWidth<=title.clientWidth){best=kept;low=kept+1}else high=kept-1;
+  }
+  span.textContent=parts.slice(0,best).join('')+'…';
 }
 
 export function openManage(section='stats'){
@@ -324,7 +368,14 @@ export function navOn(k){
 }
 
 export function navTo(k){
-  closeDrawerAfterNav();                 // 点了就收起抽屉，且短暂禁止悬停把它立刻弹回
+  const remembered=rememberedSidebarPath(k);
+  if(remembered===location.pathname+location.search+location.hash)return;
+  // 当前项留在原位接收双击，换栏目才收起抽屉并短暂禁止悬停弹回。
+  closeDrawerAfterNav();
+  if(remembered){
+    navigationState.navigatePath(remembered);
+    return;
+  }
   if(layoutState.DIRECT_MANAGE_NAV[k]){openManage(layoutState.DIRECT_MANAGE_NAV[k]);return}
   if(k==='manage'){openManage();return}
   if(k==='jav'){navigationState.navigatePath('/jav');return}
@@ -335,7 +386,6 @@ export function navTo(k){
   if(k==='shorts'){state.orient='竖屏';state.state=''}else{state.orient='';state.state=k}
   notifyShell();
   navigationState.route(homePath());
-  showHomeSurfaces();
   syncNavigation();buildBars();
 }
 
@@ -345,8 +395,10 @@ export function syncHeaderActions(){
     setSelectMode(false,true);
   const entity=parts.length>1&&Object.prototype.hasOwnProperty.call(ROUTE_ENTITIES,parts[0]);
   const catalog=isCatalogPath(path)||path==='/trash';
-  const canSelect=catalog||entity||path==='/tags'||path==='/follow';
-  const canDensity=catalog||entity||path==='/follow';
+  const javCards=javCardPage(path,location.search);
+  if(path==='/jav'&&selectMode)setSelectMode(false,true);
+  const canSelect=catalog||entity||path==='/tags'||path==='/follow'||javCards;
+  const canDensity=catalog||entity||path==='/follow'||javCards;
   $('#selectMode').hidden=!canSelect;$('#density').hidden=!canDensity;
   syncPhotoWalls();
   if(!canSelect&&selectMode)setSelectMode(false,true);
@@ -400,7 +452,7 @@ applicationEffects.handler($('#filterBtn'), 'onclick', ()=>openDrawer(!$('#drawe
 layoutState.SIDEBAR_ITEMS = SIDEBAR_ITEMS;
 layoutState.MANAGE_SECTIONS = MANAGE_SECTIONS;
 layoutState.MANAGE_MENU_SECTIONS = MANAGE_MENU_SECTIONS;
-layoutState.manageMenuSections = ()=>getManageMenuSections(runtimeConfigurable===true);
+layoutState.manageMenuSections = ()=>getManageMenuSections(runtimeConfigurable===true,preferencesState.appSettings.manageOrder);
 layoutState.OPTIONAL_SIDEBAR_ITEMS = OPTIONAL_SIDEBAR_ITEMS;
 layoutState.NAV_CATALOG = NAV_CATALOG;
 layoutState.DIRECT_MANAGE_NAV = DIRECT_MANAGE_NAV;
@@ -413,7 +465,7 @@ layoutState.settingsHost = ()=>({
   navCatalog:layoutState.NAV_CATALOG,themeOptions:THEME_OPTIONS,videoLayouts:JAV_LAYOUTS,
   followInitialRanges:FOLLOW_INITIAL_RANGE_OPTIONS,
   videoLayout:()=>cardLayout(),setVideoLayout,
-  censored:censorOn,setCensored,
+  censored:censorOn,setCensored,sfwShortcut,setSfwShortcut,
   highContrast:()=>document.documentElement.classList.contains('board-high-contrast'),setHighContrast,
   receipt:message=>receiptsState.actionReceipt(message),
   failure:receiptsState.actionFailure,

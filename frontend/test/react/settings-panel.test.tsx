@@ -16,9 +16,10 @@ import type {
   PanelSettings, SettingsEffect, SettingsPanelApi, SettingsPanelHost,
 } from '../../src/react/settings-panel/settings-panel-api';
 import { createSettingsStore } from '../../src/settings-store';
+import { DEFAULT_SFW_SHORTCUT, parseShortcut, type Shortcut } from '../../src/keyboard-shortcut';
 import { FOLLOW_INITIAL_RANGE_OPTIONS } from '../../src/application/initial-follow-ranges';
 
-import { click, settle } from './render';
+import { click, pending, settle } from './render';
 
 notifyManager.setScheduler((notify) => notify());
 
@@ -85,7 +86,7 @@ function shellActions(): ShellActions {
     openItem: vi.fn(), openEntity: vi.fn(), openTag: vi.fn(), openTasteSignal: vi.fn(), navigate: vi.fn(),
     openManage: vi.fn(), managePath: vi.fn(() => ''), openFollow: vi.fn(), receipt: vi.fn(), toast: vi.fn(),
     failure: vi.fn(), revealSource: vi.fn(async () => ''), reopenTutorial: vi.fn(async () => {}),
-    requestConfigurationSection: vi.fn(), routeReview: vi.fn(),
+    routeReview: vi.fn(),
     routeFollowManage: vi.fn(), saveFollowPreference: vi.fn(), srcBadge: () => '', routeIndex: vi.fn(),
     savePeopleLayout: vi.fn(), exitSelectMode: vi.fn(), personAvatar: vi.fn(() => ({ html: '', face: '' })),
     authorAvatar: vi.fn(() => ''), showIndexTags: vi.fn(), openFollowAuthor: vi.fn(), openFollowTag: vi.fn(),
@@ -109,7 +110,7 @@ async function connect(r: Loaded) {
 const settings = (): PanelSettings => ({
   theme: 'system', uiSounds: true, homeGlow: { ...normalizeHomeGlow(null), on: true, preset: 'ash' }, accent: 'blue',
   sidebarOrder: [''], batchSize: 60, defaultSort: 'seed', defaultSortDirection: '', groupCollapse: true,
-  javImage: 'cover', feedAutoScroll: true, feedHideGroupCompilations: true, feedHideSoloCompilations: false,
+  javImage: 'cover', performerNameLanguage: 'zh-CN', feedAutoScroll: true, feedLimit: 12, feedHideGroupCompilations: true, feedHideSoloCompilations: false,
   feedHideExcerpts: true, hoverDelaySeconds: 5, detailAutoplay: false, miniplayer: true, seekSeconds: 10,
   relatedLimit: 24, searchHistoryLimit: 10, followInitialDays: 30, avatarRefreshDays: 90, faviconRefreshDays: 365,
 });
@@ -121,6 +122,7 @@ function panelHost() {
   const save = vi.spyOn(store, 'save') as unknown as Mock<() => void>;
   const changed = vi.fn<(effect: SettingsEffect) => void>();
   const setHighContrast = vi.fn<(on: boolean) => void>();
+  const setSfwShortcut = vi.fn<(shortcut: Shortcut | null) => void>();
   const attached = vi.fn<(panel: HTMLElement) => void>();
   const host: SettingsPanelHost = {
     store, changed, sound: () => {},
@@ -130,10 +132,11 @@ function panelHost() {
     followInitialRanges: FOLLOW_INITIAL_RANGE_OPTIONS,
     videoLayout: () => 'small', setVideoLayout: () => {},
     censored: () => false, setCensored: () => {}, highContrast: () => false, setHighContrast,
+    sfwShortcut: () => parseShortcut(DEFAULT_SFW_SHORTCUT)!, setSfwShortcut,
     receipt: () => {}, failure: () => {}, syncRemote: () => {}, openConfiguration: () => {}, attached,
     configurable: async () => false,
   };
-  return { host, value, save, changed, setHighContrast, attached };
+  return { host, value, save, changed, setHighContrast, setSfwShortcut, attached };
 }
 
 /** 照壳的 `openSettings` 接上：路由树在启动时就画着，第一次按齿轮才装载。 */
@@ -171,6 +174,40 @@ function watchReports() {
 }
 
 describe('设置面板与壳的接缝', () => {
+  it.each([true, false])('名称偏好等待数据库回执，保存成功=%s 时才更新全局显示', async (success) => {
+    const answer = pending<{ ok: boolean; status: number; json(): Promise<unknown> }>();
+    const writes: unknown[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url, init) => {
+      if (init?.body) { writes.push(JSON.parse(init.body)); return answer.answer }
+      return { ok: true, status: 200, json: async () => ({ performerNameLanguage: 'zh-CN' }) };
+    }));
+    const current = await setup();
+    const names = await import('../../src/core/entity-names');
+    names.setNameLanguage('zh-CN');
+    const failure = vi.fn();
+    current.host.failure = failure;
+    current.host.syncRemote = (saved) => {
+      const language = saved.performerNameLanguage;
+      if (language === 'zh-CN' || language === 'ja') {
+        current.value.performerNameLanguage = language;
+        names.setNameLanguage(language);
+      }
+    };
+    const panel = await open(current, 'JAV 与新作');
+    const field = panel.querySelector<HTMLElement & { value: string }>('#performerNameLanguageSetting > div')!;
+    expect(field.value).toBe('zh-CN');
+    await act(async () => { field.value = 'ja'; field.dispatchEvent(new Event('change', { bubbles: true })) });
+    expect(writes).toEqual([{ performerNameLanguage: 'ja' }]);
+    expect(names.nameLanguage()).toBe('zh-CN');
+    expect(current.value.performerNameLanguage).toBe('zh-CN');
+    await answer.release({ ok: success, status: success ? 200 : 500,
+      json: async () => success ? { performerNameLanguage: 'ja' } : { error: '保存失败' } });
+    await settle();
+    expect(names.nameLanguage()).toBe(success ? 'ja' : 'zh-CN');
+    expect(current.value.performerNameLanguage).toBe(success ? 'ja' : 'zh-CN');
+    expect(field.value).toBe(success ? 'ja' : 'zh-CN');
+    expect(failure).toHaveBeenCalledTimes(success ? 0 : 1);
+  });
   it('五个分区按使用场景组织，Peach 配置入口遵守设备权限', async () => {
     const current = await setup();
     const openConfiguration = vi.fn();
@@ -182,6 +219,15 @@ describe('设置面板与壳的接缝', () => {
     expect(panel.querySelector('#detailAutoplaySetting')?.closest('section')?.hidden).toBe(true);
     expect(panel.querySelector('#videoThumbnailSetting')).toBeNull();
     expect(panel.querySelector('#followScheduleSetting')).toBeNull();
+    /* 分卷与版次折叠在首页和资料页网格上都生效，归「浏览与播放」；新作数量归「JAV 与新作」。 */
+    const group = (selector: string) => panel.querySelector(selector)?.closest('[data-setting-group]')?.id;
+    expect([group('#groupCollapseSetting'), group('#hoverDelaySetting'), group('#feedLimitSetting')])
+      .toEqual(['settings-group-1', 'settings-group-1', 'settings-group-2']);
+    const headings = (index: number) => [...panel.querySelectorAll(`#settings-group-${index} [data-settings-subheading]`)]
+      .map((node) => node.textContent);
+    expect([headings(1), headings(2)]).toEqual([['作品列表', '播放'], ['作品显示', '新作显示']]);
+    /* 转码方式是运行 Peach 那台电脑的服务配置，在 Peach 配置里，弹窗里没有这一行（ADR-0103）。 */
+    expect(panel.querySelector('#playbackAccelerationSetting')).toBeNull();
     const entry = panel.querySelector<HTMLButtonElement>('[data-settings-service] button')!;
     expect(entry.disabled).toBe(true);
     await click(entry);
@@ -190,6 +236,7 @@ describe('设置面板与壳的接缝', () => {
     current.host.configurable = async () => true;
     await open(current);
     await settle();
+    expect(panel.querySelector('#playbackAccelerationSetting')).toBeNull();
     expect(entry.disabled).toBe(false);
     await click(entry);
     await settle();
@@ -221,6 +268,24 @@ describe('设置面板与壳的接缝', () => {
     await close(current);
   });
 
+  it('新作显示数量：失焦提交后落盘一次、报 feedLimit，越界不提交', async () => {
+    const current = await setup();
+    const panel = await open(current, 'JAV 与新作');
+    const input = panel.querySelector<HTMLInputElement>('#feedLimitSetting input[type=number]')!;
+    const commit = (value: string) => act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, value);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    current.changed.mockClear();
+    current.save.mockClear();
+    await commit('101');
+    expect([current.value.feedLimit, current.save.mock.calls.length, effects(current.changed)]).toEqual([12, 0, []]);
+    await commit('30');
+    expect([current.value.feedLimit, current.save.mock.calls.length, effects(current.changed)]).toEqual([30, 1, ['feedLimit']]);
+    await close(current);
+  });
+
   it('「增加对比度」是一枚开关：按下交给壳切实色背景', async () => {
     const current = await setup();
     const panel = await open(current);
@@ -229,6 +294,50 @@ describe('设置面板与壳的接缝', () => {
       .toEqual(['switch', '增加对比度']);
     await click(contrast);
     expect(current.setHighContrast.mock.calls).toEqual([[true]]);
+    await close(current);
+  });
+
+  it('SFW 快捷键按物理键位录制：只按修饰键还在等，缺修饰键说原因，按键不落到页面上，Esc 取消', async () => {
+    const current = await setup();
+    const panel = await open(current, '内容显示');
+    const row = [...panel.querySelectorAll<HTMLElement>('[data-setting-row]')].find((node) => node.textContent?.includes('SFW 快捷键'))!;
+    // 平时是一枚胶囊；录制时换成一排键帽，每枚带着自己的状态。
+    const pill = () => row.querySelector('[data-shortcut-keys]')?.textContent;
+    const caps = () => [...row.querySelectorAll<HTMLElement>('[data-keycap]')]
+      .map((cap) => `${cap.textContent}:${cap.dataset.state}`);
+    expect(pill()).toBe('Shift+S');
+    expect(caps()).toEqual([]);
+    const reachedPage = vi.fn();
+    document.addEventListener('keydown', reachedPage);
+    const press = async (init: KeyboardEventInit, type = 'keydown') => {
+      await act(async () => { document.body.dispatchEvent(new KeyboardEvent(type, { bubbles: true, cancelable: true, ...init })) });
+    };
+    const change = [...row.querySelectorAll('button')].find((button) => button.textContent === '更改')!;
+    await click(change);
+    expect(caps()).toEqual(['修饰键:slot', '键:slot']);
+    // 按住修饰键时键帽实时下沉，松开就撤掉；主键还没按时留一个空位。
+    await press({ code: 'ControlLeft', key: 'Control', ctrlKey: true });
+    await press({ code: 'ShiftLeft', key: 'Shift', ctrlKey: true, shiftKey: true });
+    expect(caps()).toEqual(['Ctrl:down', 'Shift:down', '键:slot']);
+    expect(row.querySelector('small')?.textContent).toBe('按下新的组合键，Esc 取消');
+    await press({ code: 'ControlLeft', key: 'Control', shiftKey: true }, 'keyup');
+    expect(caps()).toEqual(['Shift:down', '键:slot']);
+    await press({ code: 'ShiftLeft', key: 'Shift' }, 'keyup');
+    expect(caps()).toEqual(['修饰键:slot', '键:slot']);
+    await press({ code: 'KeyS', key: 's' });
+    expect(caps()).toEqual(['S:invalid']);
+    expect(row.querySelector('small')?.textContent).toContain('至少要带一个修饰键');
+    // Mac 上 Option+S 打出来的是「ß」，记的仍是 KeyS；录好的那一组亮一下成功色。
+    await press({ code: 'KeyS', key: 'ß', altKey: true });
+    expect(current.setSfwShortcut.mock.calls).toEqual([[{ code: 'KeyS', ctrl: false, alt: true, shift: false, meta: false }]]);
+    expect(caps()).toEqual(['Alt:done', 'S:done']);
+    expect(row.querySelector('small')?.textContent).toBe('已改为 Alt+S');
+    expect(reachedPage).not.toHaveBeenCalled();
+    await click([...row.querySelectorAll('button')].find((button) => button.textContent === '更改')!);
+    await press({ code: 'Escape', key: 'Escape' });
+    expect(current.setSfwShortcut).toHaveBeenCalledTimes(1);
+    expect([...row.querySelectorAll('button')].map((button) => button.textContent)).toEqual(['更改']);
+    document.removeEventListener('keydown', reachedPage);
     await close(current);
   });
 

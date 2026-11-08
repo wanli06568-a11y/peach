@@ -66,7 +66,7 @@ describe('设计决定：关注详情、作品详情、播放器与侧栏', () =
     }
   });
 
-  it('关注详情：没有预览的那一格占 16:9；标签按来源记下的类型取 r34 色板，未知类型取中性灰', { timeout: 60_000 }, async () => {
+  it('关注详情：无预览媒体占 16:9；标签保留来源分类并复用详情标签外观', { timeout: 60_000 }, async () => {
     const opened = await openFollowFeed(browser, `/posts/${DETAIL.bare}`, DESKTOP,
       { ready: '#stage [data-follow-detail-tags]' });
     try {
@@ -77,6 +77,14 @@ describe('设计决定：关注详情、作品详情、播放器与侧栏', () =
           [tag.dataset.followTag, getComputedStyle(tag).getPropertyValue('--tag-color').trim()])),
       }));
       assert.equal(shown.placeholder, '16 / 9');
+      const chip = await page.locator('#stage [data-detail-tag]').first().evaluate(node => {
+        const style = getComputedStyle(node), probe = document.createElement('span');
+        probe.style.backgroundColor = 'color-mix(in srgb,var(--tag-color) 10%,var(--surface))'; node.append(probe);
+        const expected = getComputedStyle(probe).backgroundColor; probe.remove();
+        return { fill: style.backgroundColor, expected, height: node.getBoundingClientRect().height };
+      });
+      assert.equal(chip.fill, chip.expected);
+      assert.ok(chip.height >= 20 && chip.height <= 32);
       const muted = await tokenColor(page, '#stage [data-follow-detail]', '--muted');
       const unknown = await page.evaluate(() => {
         const tag = document.querySelector<HTMLElement>('#stage [data-follow-detail-tags] [data-follow-tag="odd"]')!;
@@ -169,7 +177,7 @@ describe('设计决定：关注详情、作品详情、播放器与侧栏', () =
     }
   });
 
-  it('作品详情身份区：各组按内容宽并排换行，名字行框容得下下伸部；系列是整行宽的图标链接，不是标签胶囊', { timeout: 60_000 }, async () => {
+  it('作品详情身份区：各组按内容宽并排换行，名字在头像下居中、行框容得下下伸部；系列是整行宽的图标链接，不是标签胶囊', { timeout: 60_000 }, async () => {
     const opened = await openItemPage(browser, `/assets/${ITEM.plain}`, DESKTOP);
     try {
       const page = opened.page;
@@ -195,7 +203,7 @@ describe('设计决定：关注详情、作品详情、播放器与侧栏', () =
       assert.deepEqual(shown.primary, ['flex', 'wrap']);
       assert.equal(shown.narrower, true, '组按内容宽，共演作品不会一组占满一行');
       assert.ok(shown.name.ratio >= 1.5, `名字行高 ${shown.name.ratio} 倍字号，拉丁字母的下伸部会被省略号那层 overflow 裁掉`);
-      assert.deepEqual([shown.name.overflow, shown.name.align], ['ellipsis', 'left']);
+      assert.deepEqual([shown.name.overflow, shown.name.align], ['ellipsis', 'center']);
       assert.equal(shown.cursor, 'pointer');
       assert.notEqual(shown.face, 'rgba(0, 0, 0, 0)', '没图的头像画首字盘');
       assert.deepEqual(shown.series, { display: 'flex', wrap: 'anywhere', border: '0px', full: true });
@@ -276,6 +284,29 @@ describe('设计决定：关注详情、作品详情、播放器与侧栏', () =
       });
       assert.deepEqual(shown, { performer: ['SPAN', 'default'], studio: 'pointer', fit: 'cover', filled: true },
         '标识文件自带边距，页面再补 inset 或换成 contain 就多围出一圈框');
+      assert.deepEqual(withoutPlayer(opened.problems), []);
+    } finally {
+      await opened.close();
+    }
+  });
+
+  it('作品详情标签多时先露 20 个，展开键报出剩下几个，展开后能收回', { timeout: 60_000 }, async () => {
+    const opened = await openItemPage(browser, `/assets/${ITEM.plain}`, DESKTOP);
+    try {
+      const page = opened.page;
+      const base = await page.evaluate(() => fetch('/api/item?id=14').then((response) => response.json()));
+      const tags = Array.from({ length: 30 }, (_, index) => ({ k: `折叠标签${String(index).padStart(2, '0')}`, cat: 'scene' }));
+      await page.route((url) => url.pathname === '/api/item', (route) => route.fulfill({ json: { ...base, tags } }));
+      await page.goto(new URL('/assets/14', page.url()).href, { waitUntil: 'load' });
+      const more = page.locator('#stage [data-tags-more]');
+      await more.waitFor({ timeout: 15_000 });
+      const chips = page.locator('#stage [data-detail-tags] [data-detail-tag]');
+      assert.deepEqual([await chips.count(), (await more.innerText()).trim()], [20, '还有 10 个']);
+      await more.click();
+      assert.deepEqual([await chips.count(), (await more.innerText()).trim()], [30, '收起']);
+      await more.click();
+      assert.equal(await chips.count(), 20);
+      assert.equal(await page.locator('#stage [data-detail-tags] [data-tag-plus]').isVisible(), true, '收起时加号照样在');
       assert.deepEqual(withoutPlayer(opened.problems), []);
     } finally {
       await opened.close();
@@ -426,6 +457,9 @@ describe('设计决定：关注详情、作品详情、播放器与侧栏', () =
       const cycle = async () => {
         await page.locator('#tagPlus').click();
         await page.locator('#tagPickSearch').waitFor();
+        if (await page.evaluate(() => !matchMedia('(prefers-reduced-motion: reduce)').matches)) {
+          await page.waitForFunction(() => (window as unknown as { pickerMotion: string[] }).pickerMotion.includes('board-menu-in'));
+        }
         await page.locator('#stage [data-rating-value]').click();
         await picker.waitFor({ state: 'hidden' });
         return played();
@@ -557,12 +591,14 @@ describe('设计决定：关注详情、作品详情、播放器与侧栏', () =
         ['background-color', 'color', 'padding-top', 'padding-left', 'backdrop-filter', 'white-space']),
       { 'background-color': PLAYER_BLACK, color: 'rgb(255, 255, 255)', 'padding-top': '5px', 'padding-left': '9px',
         'backdrop-filter': 'blur(16px)', 'white-space': 'nowrap' });
-      assert.deepEqual(await styleOf(page, '#stage #playerStatsBtn', ['left', 'top', 'width', 'height', 'border-top-left-radius', 'background-color']),
-        { left: '11px', top: '11px', width: '40px', height: '40px', 'border-top-left-radius': '50%', 'background-color': PLAYER_BLACK });
+      assert.deepEqual(await styleOf(page, '#stage #playerStatsBtn', ['width', 'height', 'border-top-left-radius', 'background-color']),
+        { width: '40px', height: '40px', 'border-top-left-radius': '50%', 'background-color': PLAYER_BLACK });
+      assert.deepEqual(await styleOf(page, '#stage [data-player-toolbar]', ['left', 'top', 'flex-wrap']),
+        { left: '11px', top: '11px', 'flex-wrap': 'wrap' });
       /* 音量胶囊和右边那枚同一排，毛玻璃同一档：只有一边磨砂，展开后它就比邻居更透。 */
       assert.equal((await styleOf(page, `${PLAYER_BAR} > .vjs-volume-panel`, ['backdrop-filter']))!['backdrop-filter'], 'blur(16px)');
-      assert.deepEqual(await styleOf(page, '#stage #playerNet', ['left', 'top', 'height', 'white-space']),
-        { left: '58px', top: '11px', height: '40px', 'white-space': 'nowrap' }, '速率断成两行会顶破 40px 的胶囊');
+      assert.deepEqual(await styleOf(page, '#stage #playerNet', ['height', 'white-space']),
+        { height: '40px', 'white-space': 'nowrap' }, '速率断成两行会顶破 40px 的胶囊');
       /* sprite 里的仪表盘是描边图形，容器不声明就按 SVG 默认填成黑块，压在黑底上等于没有图标。
          演示库的片子放不出来、角标没有速率可写，量的是临时塞进去的一枚 svg。 */
       const gauge = await page.evaluate(() => {
@@ -802,10 +838,7 @@ describe('设计决定：关注详情、作品详情、播放器与侧栏', () =
     await opened.page.reload({ waitUntil: 'load' });
     await opened.page.locator('#drawer [data-sidebar-group="时长"]').waitFor({ state: 'attached', timeout: 15_000 });
     await settle(opened.page);
-    return { ...opened, close: async () => {
-      await opened.page.unrouteAll({ behavior: 'ignoreErrors' });
-      await opened.close();
-    } };
+    return opened;
   }
 
   it('侧栏当前项自己不铺底，由挂在抽屉上的那块玻璃标出；悬停时玻璃跟过去，离开这一列回到当前项', { timeout: 60_000 }, async () => {

@@ -9,7 +9,7 @@ import { after, before, describe, it } from 'node:test';
 
 import type { Browser, Page } from 'playwright-core';
 
-import { launch, layout, settle, VIEWPORTS } from './harness.ts';
+import { launch, layout, settle, VIEWPORTS, withPageDiagnostics } from './harness.ts';
 import { CATALOG, ITEM, openItemPage, type ItemVisit } from './item-fixture.ts';
 
 const DESKTOP = VIEWPORTS.find((viewport) => !viewport.mobile)!;
@@ -27,8 +27,9 @@ const STUDIOS = Array.from({ length: 10 }, (_, at) => ({ k: `演示厂牌${at + 
 const TAGS = Array.from({ length: 40 }, (_, at) => ({ k: `演示标签${String(at + 1).padStart(2, '0')}`, n: 90 - at }));
 
 interface Counts {
-  /** 目录网格那一路：竖屏那一排（`orient=竖屏`）与只探有没有内容的 `limit=1` 各走各的，不算在里面。 */
+  /** 目录分页带 offset；竖屏、搜索推荐与库存在性探测各走各的。窄屏首批可以只有一张。 */
   items: URL[];
+  summaries: URL[];
   facets: URL[];
   tops: URL[];
 }
@@ -38,10 +39,10 @@ const pathIs = (page: Page, path: string) => page.waitForFunction(
 const withoutPlayer = (problems: string[]) => problems.filter((line) => !line.includes('VIDEOJS'));
 
 /** 等 Node 这一侧记下的请求数到位：桩在 Node 里计数，页面里的 `waitForFunction` 读不到。 */
-async function until(done: () => boolean, message: string, timeout = 10_000) {
+async function until(done: () => boolean, message: string | (() => string), timeout = 10_000) {
   const end = Date.now() + timeout;
   while (!done()) {
-    if (Date.now() > end) assert.fail(message);
+    if (Date.now() > end) assert.fail(typeof message === 'function' ? message() : message);
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
 }
@@ -50,7 +51,7 @@ async function until(done: () => boolean, message: string, timeout = 10_000) {
 async function openHome(browser: Browser, path = '/', viewport = DESKTOP): Promise<ItemVisit & { counts: Counts }> {
   const opened = await openItemPage(browser, '/', viewport, { ready: '#grid [data-media-card]' });
   const { page } = opened;
-  const counts: Counts = { items: [], facets: [], tops: [] };
+  const counts: Counts = { items: [], summaries: [], facets: [], tops: [] };
   await page.route((url) => url.pathname === '/api/tops', (route) => {
     const url = new URL(route.request().url());
     counts.tops.push(url);
@@ -66,8 +67,9 @@ async function openHome(browser: Browser, path = '/', viewport = DESKTOP): Promi
   /* 加一条标签筛选，列表就只剩一半：读数跟着换，才看得出这一趟真按新口径取了。 */
   await page.route((url) => url.pathname === '/api/items', (route) => {
     const url = new URL(route.request().url());
-    if (!url.searchParams.has('orient') && url.searchParams.get('limit') !== '1') counts.items.push(url);
-    const ids = url.searchParams.get('tag') ? CATALOG.slice(0, 3) : CATALOG;
+    if (url.searchParams.get('summary_only') === '1') counts.summaries.push(url);
+    else if (!url.searchParams.has('orient') && url.searchParams.has('offset')) counts.items.push(url);
+    const ids = url.searchParams.get('tag') || url.searchParams.get('owner') === 'none' ? CATALOG.slice(0, 3) : CATALOG;
     return route.fulfill({ json: {
       items: ids.map((id) => ({ id, name: `sample_${id}.mp4`, title: `演示作品 ${id}`, is_jav: false, medium: 'video',
         location: 'local', has_thumb: true, duration: 3600, studio: 'Peach Studio', performers: [], tags: [] })),
@@ -78,11 +80,7 @@ async function openHome(browser: Browser, path = '/', viewport = DESKTOP): Promi
   await page.locator(READOUT, { hasText: '个符合' }).waitFor({ timeout: 15_000 });
   await page.locator(`${FILTER} [data-tier-performer]`).first().waitFor({ timeout: 15_000 });
   await settle(page);
-  // 关页时 `/api/facets` 那一趟 `route.fetch` 可能还在路上，它落空不算失败。
-  return { ...opened, counts, close: async () => {
-    await page.unrouteAll({ behavior: 'ignoreErrors' });
-    await opened.close();
-  } };
+  return { ...opened, counts };
 }
 
 const tag = (page: Page, key: string) => page.locator(`${FILTER} [data-catalog-tag="${key}"]`);
@@ -92,6 +90,30 @@ describe('首页筛选条', () => {
   let browser: Browser;
   before(async () => { browser = await launch(); });
   after(async () => { await browser?.close(); });
+
+  it('JAV 读数尚未返回时保持两行骨架，内容就绪后再决定合行', { timeout: 60_000 }, async () => {
+    const opened = await openHome(browser, '/?jav=1');
+    const { page } = opened;
+    let release!: () => void;
+    const waiting = new Promise<void>(resolve => { release = resolve });
+    try {
+      await page.route((url) => url.pathname === '/api/facets', async route => {
+        const response = await route.fetch();
+        await route.fulfill({ json: { ...await response.json(), tags: TAGS.slice(0, 1) } });
+      });
+      await page.route((url) => url.pathname === '/api/items', async route => { await waiting; await route.fallback() });
+      await page.setViewportSize({ width: 1920, height: 900 });
+      await page.reload();
+      const frame = page.locator(`${FILTER} [data-catalog-frame]`);
+      await frame.locator('[data-catalog-tag]').first().waitFor();
+      assert.equal(await frame.getAttribute('data-single-row'), null);
+      assert.equal(await frame.evaluate(node => node.getBoundingClientRect().height), 96);
+      release();
+      await page.locator(READOUT, { hasText: '个符合' }).waitFor();
+      await page.locator(`${FILTER} [data-catalog-frame][data-single-row]`).waitFor();
+      assert.deepEqual(opened.problems, []);
+    } finally { release(); await opened.close() }
+  });
 
   it('少量筛选项与右侧操作按容器宽度同行或分行', { timeout: 60_000 }, async () => {
     const opened = await openHome(browser);
@@ -133,11 +155,14 @@ describe('首页筛选条', () => {
               color: style.color, border: style.border, shadow: style.boxShadow, radius: style.borderRadius };
           });
           return { heights: candidates.map(node => ({ label: node.getAttribute('aria-label') || node.textContent,
-            height: node.getBoundingClientRect().height })), actions };
+            height: node.getBoundingClientRect().height })), actions,
+            compact: parseFloat(getComputedStyle(frame).getPropertyValue('--control-h-compact')) };
         });
-        for (const control of controls.heights) assert.equal(control.height, 30, JSON.stringify(control));
+        // 筛选条整条取紧凑档：页签、药丸、分段与两枚动作键同高。
+        assert.equal(controls.compact, 32);
+        for (const control of controls.heights) assert.equal(control.height, controls.compact, JSON.stringify(control));
         assert.deepEqual(controls.actions[0], controls.actions[1]);
-        assert.equal(controls.actions[0].width, 30);
+        assert.equal(controls.actions[0].width, controls.compact);
         assert.equal(controls.actions[0].color, 'rgb(255, 255, 255)');
         assert.match(controls.actions[0].background, /^linear-gradient\(/);
         const gap = await opened.page.evaluate(() => document.querySelector('#grid [data-media-card]')!.getBoundingClientRect().top
@@ -177,7 +202,7 @@ describe('首页筛选条', () => {
         const first = document.querySelector(`${filter} [data-tier-performer]`) as HTMLElement & { __kept?: boolean };
         first.__kept = true;
       }, FILTER);
-      const [items, facets] = [counts.items.length, counts.facets.length];
+      const [items, facets, summaries] = [counts.items.length, counts.facets.length, counts.summaries.length];
       const order = () => page.locator(`${FILTER} [data-catalog-tag]`).evaluateAll((pills) =>
         pills.map((pill) => pill.getAttribute('data-catalog-tag')));
       const members = await order();
@@ -198,6 +223,8 @@ describe('首页筛选条', () => {
       assert.equal(new URL(page.url()).searchParams.get('tag'), key);
       assert.deepEqual(counts.items.slice(items).map((url) => url.searchParams.get('tag')), [key],
         '点一枚标签应当只按新口径取一次列表');
+      assert.deepEqual(counts.summaries.slice(summaries).map((url) => url.searchParams.get('tag')), [key],
+        '独立读数应当按新口径取一次统计');
       assert.deepEqual(counts.facets.slice(facets).map((url) => url.searchParams.get('tag')), [key],
         '侧栏计数应当按新口径取一次聚合');
       /* 口径变了两排头像会按新口径再取一次（`getBarsData`），但同一位的那一格原地换数，不拆了重建。 */
@@ -289,6 +316,7 @@ describe('首页筛选条', () => {
     try {
       const { page, counts } = opened;
       const before = counts.items.length;
+      const homeIds = await page.locator('#grid [data-media-card]').evaluateAll(nodes => nodes.map(node => node.getAttribute('data-id')));
       if (viewport.mobile) await page.locator('#filterBtn').click();
       await page.locator('button[data-nav="jav"]:visible').first().click();
       await page.waitForFunction(() => location.pathname === '/' && new URLSearchParams(location.search).get('jav') === '1');
@@ -315,7 +343,10 @@ describe('首页筛选条', () => {
       if (viewport.mobile) await page.locator('#searchBtn').click();
       await page.locator('#q').fill('演示作品');
       await page.locator('#q').press('Enter');
-      await until(() => counts.items.length > beforeSearch, '作品搜索没有重取 JAV 馆藏');
+      await withPageDiagnostics(page, '作品搜索没有按搜索词重取 JAV 馆藏', () => until(
+        () => counts.items.slice(beforeSearch).some(url => url.searchParams.get('q') === '演示作品'),
+        () => JSON.stringify({ url: page.url(), list: counts.items.slice(beforeSearch).map(url => url.search),
+          summaries: counts.summaries.map(url => url.search) })));
       assert.equal(counts.items.at(-1)?.searchParams.get('jav'), '1');
       assert.equal(counts.items.at(-1)?.searchParams.get('q'), '演示作品');
       assert.equal(new URL(page.url()).searchParams.get('jav'), '1');
@@ -332,13 +363,16 @@ describe('首页筛选条', () => {
       assert.equal(await page.locator(`${FILTER} input[name="jav-layout"][value="big"]`).isChecked(), true);
       const box = await layout(page);
       assert.ok(box.scrollWidth <= box.viewportWidth, 'JAV 页面横向溢出');
+      await settle(page);
+      const beforeHome = counts.items.length;
       if (viewport.mobile) await page.locator('#filterBtn').click();
       await page.locator('button[data-nav=""]:visible').first().click();
       await page.waitForFunction(() => location.pathname === '/' && !new URLSearchParams(location.search).has('jav'));
       await page.locator(`${FILTER} input[name="home-layout"]`).first().waitFor({ state: 'attached' });
       await page.locator(READOUT, { hasText: '个符合' }).waitFor();
       await settle(page);
-      assert.notEqual(counts.items.at(-1)?.searchParams.get('jav'), '1');
+      assert.equal(counts.items.length, beforeHome, '返回首页沿用原来的目录缓存');
+      assert.deepEqual(await page.locator('#grid [data-media-card]').evaluateAll(nodes => nodes.map(node => node.getAttribute('data-id'))), homeIds);
       assert.equal(await page.locator('#javLibraryHeader').isVisible(), false);
       assert.deepEqual(withoutPlayer(opened.problems), []);
     } finally {
@@ -347,23 +381,31 @@ describe('首页筛选条', () => {
   });
   }
 
-  it('未归属跟着地址走：侧栏回首页按全库取，后退回到带它的地址再按它取', { timeout: 60_000 }, async () => {
+  it('未归属随首页位置保留，撤掉筛选后取全库，后退恢复未归属缓存', { timeout: 60_000 }, async () => {
     const opened = await openHome(browser, '/?owner=none');
     try {
       const { page, counts } = opened;
       assert.equal(counts.items.at(-1)?.searchParams.get('owner'), 'none', '地址上的未归属没有进列表请求');
       let before = counts.items.length;
+      const mainCards = page.locator('#grid [data-media-grid] > [data-media-card]');
+      const filteredIds = await mainCards.evaluateAll(nodes => nodes.map(node => node.getAttribute('data-id')));
       await page.locator('[data-nav=""]:visible').first().click();
-      await page.waitForFunction(() => location.pathname === '/' && !location.search);
-      await until(() => counts.items.length > before, '回首页之后没有重取列表');
       await settle(page);
-      assert.equal(counts.items.at(-1)?.searchParams.has('owner'), false, '回首页之后还带着未归属');
+      assert.equal(new URL(page.url()).searchParams.get('owner'), 'none');
+      assert.equal(counts.items.length, before, '点击当前栏目保留筛选');
+      await chips(page).filter({ hasText: '未归属' }).getByRole('button').click();
+      await page.waitForFunction(() => !new URLSearchParams(location.search).has('owner'));
+      await until(() => counts.items.length > before, '撤掉未归属之后没有重取列表');
+      await settle(page);
+      assert.equal(counts.items.at(-1)?.searchParams.has('owner'), false);
+      assert.equal(await mainCards.count(), CATALOG.length);
       before = counts.items.length;
       await page.goBack();
       await page.waitForFunction(() => new URLSearchParams(location.search).get('owner') === 'none');
-      await until(() => counts.items.length > before, '后退之后没有重取列表');
       await settle(page);
-      assert.equal(counts.items.at(-1)?.searchParams.get('owner'), 'none', '后退回来没有按地址上的未归属取');
+      assert.equal(counts.items.length, before, '后退恢复已取得的未归属结果');
+      assert.equal(await chips(page).filter({ hasText: '未归属' }).count(), 1);
+      assert.deepEqual(await mainCards.evaluateAll(nodes => nodes.map(node => node.getAttribute('data-id'))), filteredIds);
       assert.deepEqual(withoutPlayer(opened.problems), []);
     } finally {
       await opened.close();
@@ -478,6 +520,41 @@ describe('首页筛选条', () => {
       }
       const measured = await layout(page);
       assert.deepEqual(measured.offenders, [], `筛选条把页面撑宽了：${measured.offenders.join('、')}`);
+      assert.deepEqual(withoutPlayer(opened.problems), []);
+    } finally {
+      await opened.close();
+    }
+  });
+
+  it('上次两排都没人：再进首页时取回之前不铺两排占位，浮层不随取回移位', { timeout: 60_000 }, async () => {
+    const opened = await openHome(browser);
+    try {
+      const { page } = opened;
+      let delay = 0;
+      // 后注册的先拦：这一组两排都没人，第二次进页拖住三秒，量的就是取回之前那一刻。
+      await page.route((url) => url.pathname === '/api/tops', async (route) => {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        await route.fulfill({ json: { performers: [], studios: [] } });
+      });
+      await page.reload();
+      await page.locator(`${FILTER} [data-catalog-root]:not([data-loading])`).waitFor();
+      await settle(page);
+      delay = 3_000;
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      const frame = page.locator(`${FILTER} [data-catalog-frame]`);
+      await frame.waitFor();
+      const read = () => page.evaluate((filter) => ({
+        rows: document.querySelectorAll(`${filter} [data-catalog-tier]`).length,
+        loading: !!document.querySelector(`${filter} [data-catalog-root][data-loading]`),
+        top: Math.round(document.querySelector(`${filter} [data-catalog-frame]`)!.getBoundingClientRect().top),
+      }), FILTER);
+      const waiting = await read();
+      assert.deepEqual({ rows: waiting.rows, loading: waiting.loading }, { rows: 0, loading: true }, JSON.stringify(waiting));
+      await page.locator(`${FILTER} [data-catalog-root]:not([data-loading])`).waitFor({ timeout: 10_000 });
+      await settle(page);
+      const done = await read();
+      assert.equal(done.rows, 0);
+      assert.ok(Math.abs(done.top - waiting.top) <= 1, `取回后浮层移位：${waiting.top} → ${done.top}`);
       assert.deepEqual(withoutPlayer(opened.problems), []);
     } finally {
       await opened.close();

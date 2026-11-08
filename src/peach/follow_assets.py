@@ -43,6 +43,7 @@ RETRY_SECONDS = 3600
 SOURCE_ICON_URLS: dict[str, str] = {
     "fanbox": "https://www.fanbox.cc/favicon.ico",
     "patreon": "https://www.patreon.com/favicon.ico",
+    "iwara": "https://www.iwara.tv/logo.png",
     "subscribestar": "https://assets.subscribestar.com/assets/public/images/favicons/"
                      "favicon-32x32-b9aa1e7e5bab6cb1b28b5161e16f9d42.png",
     "kemono": "https://kemono.cr/assets/favicon-CPB6l7kH.ico",
@@ -152,6 +153,21 @@ def fetch_image(client: httpx.Client, url: str) -> bytes | None:
     if response.status_code != 200 or not body or len(body) > MAX_BYTES:
         return None
     return body if sniff(body) else None
+
+
+def legible_icon(body: bytes | None) -> bytes | None:
+    """来源图标落盘前的最后一道：透明底纯白或纯黑字形换成外链圆标同款的圆底白字。
+
+    Iwara 只声明一枚透明底白字形，原样发给页面在浅色主题下看不见。其余图标原样保留。
+    """
+    if not body:
+        return body
+    from . import link_marks
+
+    image = link_marks.decode(body)
+    if image is None or not link_marks.bare_single_tone(image):
+        return body
+    return link_marks.glyph_mark(image) or body
 
 
 #: 圆标落盘时的长边。定这个数的不是圆标有多大，是圆标里那张脸能放大到多少：页面按

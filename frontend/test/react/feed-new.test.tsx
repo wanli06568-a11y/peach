@@ -6,7 +6,8 @@ import { act, useState } from 'react';
 import { notifyManager, QueryClientProvider } from '@tanstack/react-query';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { feedNewKey, prefetchFeedNew, type FeedDiscoveries, type FeedNewProps } from '../../src/react/feed-new/feed-new';
+import { appSettingsStore } from '@peach/appearance';
+import { feedNewKey, fetchFeedNew, prefetchFeedNew, type FeedDiscoveries, type FeedNewProps } from '../../src/react/feed-new/feed-new';
 import { FeedNewPage } from '../../src/react/feed-new/feed-new-page';
 import { queryClient } from '../../src/react/query';
 import { click, mountRoot, settle } from './render';
@@ -36,9 +37,9 @@ function serve(...rounds: number[][]) {
 const reads = (fetcher: ReturnType<typeof serve>) =>
   fetcher.mock.calls.map(([url]) => String(url)).filter((url) => url.startsWith('/api/feeds/discoveries'));
 
-it('新作来源共演头像经详情同一查询加载并在忽略后可卸载', async () => {
+it('新作来源共演头像直接按来源图片地址加载并在忽略后可卸载', async () => {
   vi.stubGlobal('IntersectionObserver', undefined);
-  const fetcher = vi.fn(async (_url: string) => ({ ok: true, status: 200, json: async () => ({ ok: true, image: 'data:image/jpeg;base64,cGl4ZWxz' }) }));
+  const fetcher = vi.fn(async (_url: string) => ({ ok: true, status: 200, json: async () => ({ ok: true }) }));
   vi.stubGlobal('fetch', fetcher);
   const host = document.createElement('section');
   document.body.append(host);
@@ -48,9 +49,9 @@ it('新作来源共演头像经详情同一查询加载并在忽略后可卸载'
   const mounted = await mountRoot(<QueryClientProvider client={queryClient}><FeedNewRow host={host} feedNew={{ items: [{ id: 1 }], html }}
     wire={() => {}} act={async () => {}} /></QueryClientProvider>);
   await settle();
-  expect(mounted.host.querySelectorAll('.mav img')).toHaveLength(2);
-  expect(fetcher.mock.calls.map(([url]) => url).sort()).toEqual([
-    '/api/jav/image?code=EXM-001&image=actor%3AA', '/api/jav/image?code=EXM-001&image=actor%3AB']);
+  const avatars = [...mounted.host.querySelectorAll<HTMLImageElement>('.mav img')].map((img) => img.getAttribute('src')).sort();
+  expect(avatars).toEqual(['/jav-image?code=EXM-001&image=actor%3AA', '/jav-image?code=EXM-001&image=actor%3AB']);
+  expect(fetcher).not.toHaveBeenCalled();
   await click(mounted.host.querySelector('[data-feed-action]'));
   await settle();
   expect(mounted.host.querySelector('[data-feed-id]')).toBeNull();
@@ -73,12 +74,38 @@ async function open(given: FeedNewProps) {
 }
 
 describe('取数', () => {
+  it('文字和操作就绪即返回，不在取数阶段预载或解码封面', async () => {
+    serve([1]);
+    const image = vi.fn(function () { throw new Error('不应预载封面') });
+    vi.stubGlobal('Image', image);
+    const data = await fetchFeedNew(null, () => '<article>作品<button>想要</button><img src="/cover-image?code=EXM-001"></article>');
+    expect(data.items).toHaveLength(1);
+    expect(data.html).toContain('想要');
+    expect(image).not.toHaveBeenCalled();
+  });
+
+  it('读取失败保留失败状态，不伪装成没有新作', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ error: '读取未完成' }) })));
+    await expect(fetchFeedNew(null, rowHtml)).rejects.toThrow('读取未完成');
+  });
+
   it('首页那一行不分人：只带条数，与资料页那一行各占一个键', async () => {
     const fetcher = serve([1, 2]);
     await open(props());
     expect(reads(fetcher)).toEqual(['/api/feeds/discoveries?limit=12']);
     expect(feedNewKey(null)).toEqual(['feed-new', 'home']);
     expect(feedNewKey(7)).toEqual(['feed-new', 7]);
+  });
+
+  it('条数跟着设置弹窗的「新作显示数量」走', async () => {
+    const store = appSettingsStore();
+    const before = store.value.feedLimit;
+    store.value.feedLimit = 30;
+    try {
+      const fetcher = serve([1]);
+      await open(props());
+      expect(reads(fetcher)).toEqual(['/api/feeds/discoveries?limit=30']);
+    } finally { store.value.feedLimit = before }
   });
 
   it('每次挂上都是新的一趟，不读上一次留下的缓存', async () => {
@@ -103,6 +130,15 @@ describe('画进宿主', () => {
     expect(root.querySelector('[data-feed-id]')).toBeNull();
     expect(given.helpers.wireFeedRow).toHaveBeenCalledWith(given.host.querySelector('.feednewrow'));
     expect(given.actions.settled).toHaveBeenLastCalledWith(true);
+  });
+
+  it('首页那一行行尾带「查看全部新作」，指向 JAV 页的新作分区', async () => {
+    serve([1]);
+    const rowWithAll = vi.fn((data: FeedDiscoveries | null, allHref = '') => `${rowHtml(data).slice(0, -6)}<a class="feednewall" href="${allHref}">查看全部新作</a></div>`);
+    const given = props({ helpers: { feedRowHtml: rowWithAll, wireFeedRow: vi.fn() } });
+    await open(given);
+    expect(rowWithAll).toHaveBeenLastCalledWith(expect.anything(), '/jav?tab=releases');
+    expect(given.host.querySelector('.feednewrow > a.feednewall')?.getAttribute('href')).toBe('/jav?tab=releases');
   });
 
   it('一条都没有就整块不出，报给壳「没有」', async () => {

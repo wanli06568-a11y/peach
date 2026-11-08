@@ -168,7 +168,7 @@ function shellActions(): ShellActions {
     openItem: vi.fn(), openEntity: vi.fn(), openTag: vi.fn(), openTasteSignal: vi.fn(), navigate: vi.fn(),
     openManage: vi.fn(), managePath: vi.fn(() => ''), openFollow: vi.fn(), receipt: vi.fn(), toast: vi.fn(),
     failure: vi.fn(), revealSource: vi.fn(async () => ''), reopenTutorial: vi.fn(async () => {}),
-    requestConfigurationSection: vi.fn(), routeReview: vi.fn(),
+    routeReview: vi.fn(),
     routeFollowManage: vi.fn(), saveFollowPreference: vi.fn(), srcBadge: () => '', routeIndex: vi.fn(),
     savePeopleLayout: vi.fn(), exitSelectMode: vi.fn(), personAvatar: vi.fn(() => ({ html: '', face: '' })),
     authorAvatar: vi.fn(() => ''), showIndexTags: vi.fn(), openFollowAuthor: vi.fn(), openFollowTag: vi.fn(),
@@ -281,6 +281,9 @@ describe('片单与起播', () => {
     expect(playable(row(2, { cost: 'metered' }), offline)).toBe(false);
     expect(playable(row(3, { duration: 0 }), offline)).toBe(false);
     expect(playable(row(4, { location: 'gone' }), offline)).toBe(false);
+    const rootOffline = (key: string) => key === 'root-offline';
+    expect(playable(row(5, { location: 'local', root_id: 'root-offline' }), rootOffline)).toBe(false);
+    expect(playable(row(6, { location: 'local', root_id: 'root-online' }), rootOffline)).toBe(true);
     serve({ draws: [[row(1, { location: 'gone' }), row(2)]] });
     await open();
     expect(current().item.id).toBe(2);
@@ -363,7 +366,8 @@ describe('片单与起播', () => {
     await act(async () => { opening = api.open(null) });
     await until(() => !!q('[data-immerse-loader]') && !q('[data-immerse-loader]')!.hidden);
     expect(root().hasAttribute('data-idle')).toBe(true);
-    expect(q('[data-immerse-loader]')!.textContent).toContain('加载中…');
+    expect(q('[data-immerse-loader]')!.textContent).toContain('加载中');
+    expect(q('[data-immerse-loader]')!.textContent, '转圈已经在动，字不带省略号').not.toContain('…');
     expect(document.body.hasAttribute('data-immerse-open')).toBe(true);
     await hold.release();
     await act(async () => { await opening });
@@ -492,7 +496,7 @@ describe('作者与标题', () => {
     const author = q<HTMLAnchorElement>('[data-immerse-author]>a')!;
     expect(author.textContent).toBe('甲、乙、丙 等 4 人');
     expect(q('[data-immerse-avatar] .ini')!.textContent).toBe('甲');
-    expect(q('[data-immerse-avatar] img')!.getAttribute('src')).toBe('/entity-image?kind=performer&id=91');
+    expect(q('[data-immerse-avatar] img')!.getAttribute('src')).toBe('/entity-image?kind=performer&id=91&thumb=1');
     await click(author);
     expect(host.closed).toHaveBeenCalledTimes(1);
     expect(host.openEntity).toHaveBeenCalledWith('performer', '甲');
@@ -643,6 +647,32 @@ describe('手势', () => {
     expect(video.currentTime).toBe(40);
     expect(bar.hasAttribute('data-scrubbing')).toBe(false);
   });
+
+  it('进度条上方的画面预览：鼠标悬停显示，横划拖动显示，离开或抬手收起', async () => {
+    serve({ draws: [[row(1, { has_thumb: true })]], details: { 1: { has_thumb: true } } });
+    await open();
+    const bar = q('[data-immerse-bar]')!;
+    bar.getBoundingClientRect = () => ({ left: 0, width: 1000, top: 0, height: 20, right: 1000, bottom: 20, x: 0, y: 0, toJSON() {} });
+    const preview = () => q('[data-immerse-bar] [data-player-seek-preview]')!;
+    expect(preview().hidden).toBe(true);
+    await act(async () => { bar.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, clientX: 300, pointerType: 'mouse' })) });
+    const image = preview().querySelector('img')!;
+    expect(preview().hidden).toBe(true);
+    Object.defineProperties(image, { complete: { configurable: true, value: true }, naturalWidth: { configurable: true, value: 320 } });
+    await act(async () => image.dispatchEvent(new Event('load')));
+    expect(preview().hidden).toBe(false);
+    expect(preview().querySelector('span')!.textContent).toBe('0:30');
+    // React 的 onPointerLeave 由 pointerout 合成。
+    await act(async () => {
+      bar.dispatchEvent(new PointerEvent('pointerout', { bubbles: true, clientX: 300, pointerType: 'mouse', relatedTarget: document.body }));
+    });
+    expect(preview().hidden).toBe(true);
+    await swipe(['touchstart', 500, 400], ['touchmove', 520, 402], ['touchmove', 600, 405]);
+    expect(preview().hidden).toBe(false);
+    expect(preview().querySelector('span')!.textContent).toBe('0:10');
+    await swipe(['touchend', 600, 405]);
+    expect(preview().hidden).toBe(true);
+  });
 });
 
 describe('播放键', () => {
@@ -716,7 +746,7 @@ describe('常驻组件', () => {
     expect(root().hidden, '同步段里外框已经显出来').toBe(false);
     expect(root().hasAttribute('data-idle')).toBe(true);
     expect(q('[data-immerse-loader]')!.hidden).toBe(false);
-    expect(q('[data-immerse-loader]')!.textContent).toContain('加载内容…');
+    expect(q('[data-immerse-loader]')!.textContent).toContain('加载内容');
     expect(document.body.hasAttribute('data-immerse-open')).toBe(true);
     await opening;
     expect(root().hasAttribute('data-idle'), '返回时已经画完，不等下一次渲染').toBe(false);

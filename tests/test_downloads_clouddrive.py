@@ -35,6 +35,9 @@ class FakeCloudDrive:
         self.quota = pb.OfflineQuotaInfo(total=1500, used=3, left=1497)
         self.add_error = ""
         self.files: set[str] = set()
+        self.files_after_refresh: set[str] = set()
+        self.list_error = None
+        self.can_manage = True
 
     def _auth(self, name, request, context):
         header = dict(context.invocation_metadata()).get("authorization", "")
@@ -47,10 +50,31 @@ class FakeCloudDrive:
         self.calls.append(("GetSystemInfo", request, header))
         return pb.CloudDriveSystemInfo(IsLogin=True, UserName="u1", SystemReady=True)
 
+    def GetSystemSettings(self, request, context):
+        self._auth('GetSystemSettings', request, context)
+        return pb.SystemSettings()
+
     def GetApiTokenInfo(self, request, context):
         self._auth("GetApiTokenInfo", request, context)
         return pb.TokenInfo(token=request.value, rootDir="/", permissions=pb.TokenPermissions(
             allow_add_offline_download=True, allow_list_offline_downloads=True))
+
+    def GetAllCloudApis(self, request, context):
+        self._auth('GetAllCloudApis', request, context)
+        return pb.CloudAPIList()
+
+    def GetCloudAPIConfig(self, request, context):
+        self._auth('GetCloudAPIConfig', request, context)
+        return pb.CloudAPIConfig()
+
+    def SetCloudAPIConfig(self, request, context):
+        self._auth('SetCloudAPIConfig', request, context)
+        from google.protobuf.empty_pb2 import Empty
+        return Empty()
+
+    def GetMountPoints(self, request, context):
+        self._auth('GetMountPoints', request, context)
+        return pb.GetMountPointsResult()
 
     def FindFileByPath(self, request, context):
         self._auth("FindFileByPath", request, context)
@@ -60,11 +84,19 @@ class FakeCloudDrive:
                        key=len, default="/115")
             return pb.CloudDriveFile(name=request.path, fullPathName=full, isDirectory=True,
                                      isCloudRoot=full == root, canOfflineDownload=self.folders[full],
+                                     supportOfflineDownloadManagement=self.can_manage,
                                      CloudAPI=pb.CloudAPI(name=self.clouds.get(root, "115open"),
                                                           userName="u1", path=root))
         if full in self.files:
             return pb.CloudDriveFile(name=request.path, fullPathName=full)
         context.abort(grpc.StatusCode.NOT_FOUND, "no such file")
+
+    def GetSubFiles(self, request, context):
+        self._auth('GetSubFiles', request, context)
+        if self.list_error is not None:
+            context.abort(self.list_error, 'listing unavailable')
+        self.files.update(self.files_after_refresh)
+        yield pb.SubFilesReply()
 
     def CreateFolder(self, request, context):
         self._auth("CreateFolder", request, context)
@@ -119,6 +151,9 @@ class _Server(unittest.TestCase):
                 getattr(fake, name), request_deserializer=request.FromString,
                 response_serializer=response.SerializeToString)
             for name, (request, response) in cd._METHODS.items()}
+        handlers['GetSubFiles'] = grpc.unary_stream_rpc_method_handler(
+            fake.GetSubFiles, request_deserializer=pb.FileRequest.FromString,
+            response_serializer=pb.SubFilesReply.SerializeToString)
         server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
         server.add_generic_rpc_handlers(
             (grpc.method_handlers_generic_handler("clouddrive.CloudDriveFileSrv", handlers),))
@@ -132,6 +167,19 @@ class _Server(unittest.TestCase):
 
 
 class SubmitTests(_Server):
+    def test_cloud_without_task_management_submits_and_waits_for_the_file(self):
+        self.fake.can_manage = False
+        self.assertEqual(self.provider.submit(MAGNET, TARGET).state, dl.RUNNING)
+        self.assertNotIn("ListOfflineFilesByPath", self.methods())
+        self.assertNotIn("GetOfflineQuotaInfo", self.methods())
+        task = dl.DownloadTask(1, HASH, "clouddrive:guangya:test", MAGNET.uri, "ABC-123", TARGET, dl.SUBMITTED)
+        self.assertEqual(self.provider.status(task).state, dl.RUNNING)
+        self.fake.files.add(f"{TARGET}/ABC-123")
+        self.assertEqual(self.provider.status(task).state, dl.DONE)
+        with self.assertRaisesRegex(dl.DownloadError, "到网盘中处理"):
+            self.provider.cancel(task)
+        self.assertNotIn("RemoveOfflineFiles", self.methods())
+
     def test_a_submission_checks_the_folder_and_quota_then_adds(self):
         status = self.provider.submit(MAGNET, TARGET)
         self.assertEqual((status.state, status.adopted), (dl.RUNNING, False))
@@ -209,6 +257,19 @@ class TrackingTests(_Server):
         self.fake.files.add(f"{TARGET}/ABC-123")
         self.assertTrue(self.provider.landed(self.task()))
 
+    def test_landed_refreshes_the_official_directory_cache(self):
+        self.fake.files_after_refresh.add(f'{TARGET}/ABC-123')
+        self.assertTrue(self.provider.landed(self.task()))
+        name, request, header = self.fake.calls[0]
+        self.assertEqual((name, request.path, request.forceRefresh), ('GetSubFiles', TARGET, True))
+        self.assertEqual(header, f'Bearer {TOKEN}')
+
+    def test_directory_refresh_network_failure_remains_retryable(self):
+        self.fake.list_error = grpc.StatusCode.UNAVAILABLE
+        with self.assertRaises(dl.DownloadError) as caught:
+            self.provider.landed(self.task())
+        self.assertEqual(caught.exception.failure, 'network')
+
     def test_cancelling_keeps_the_downloaded_files(self):
         self.provider.submit(MAGNET, TARGET)
         self.provider.cancel(self.task())
@@ -265,6 +326,19 @@ class CheckTests(_Server):
     def test_addresses_turn_into_grpc_targets(self):
         self.assertEqual(cd.channel_target("http://127.0.0.1"), ("127.0.0.1:19798", False))
         self.assertEqual(cd.channel_target("https://192.0.2.10:8443"), ("192.0.2.10:8443", True))
+        self.assertEqual(cd.channel_target("http://[::1]:19798"), ("[::1]:19798", False))
+        for address in ("http://localhost:bad-port", "http://localhost:0", "http://localhost:65536"):
+            with self.subTest(address=address), self.assertRaises(dl.DownloadError) as raised:
+                cd.channel_target(address)
+            self.assertEqual(raised.exception.failure, "config")
+
+    def test_discovery_returns_only_validated_service_addresses(self):
+        from unittest.mock import patch
+        with patch.object(cd, "answers", return_value=True) as answers:
+            address = cd.discover(("http://localhost:bad-port", "127.0.0.1:19798"))
+        self.assertEqual(address, "http://127.0.0.1:19798")
+        answers.assert_called_once_with(address)
+        self.assertTrue(all(dl.clean_address(address) == address for address in cd.LOCAL_ADDRESSES))
         self.assertEqual(cd.split_remote("/115/云下载/"), ("/115", "云下载"))
 
 

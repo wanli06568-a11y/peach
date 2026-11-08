@@ -58,17 +58,50 @@ def _require_readable_settings() -> None:
             f"{SETTINGS_ERROR}\n修好这个文件，或者用 `peach init --force` 重新生成。")
 
 
-def _serve(args: argparse.Namespace) -> int:
+def _run_uvicorn(app, **options) -> None:
+    """与单进程的 `uvicorn.run` 相同，只是先在 uvicorn 的事件循环上装好 Peach 的 asyncio 处理器。
+
+    处理器拿着 Server：Windows 上客户端在 accept 完成前断开时，标准库会关掉监听套接字，
+    `error_reporting.asyncio_handler` 靠它按原地址重新监听。
+    """
+    import asyncio
+    import functools
+
     import uvicorn
 
+    from .error_reporting import asyncio_handler
+    config = uvicorn.Config(app, workers=1, **options)
+    server = uvicorn.Server(config)
+
+    async def serve():
+        asyncio.get_running_loop().set_exception_handler(
+            functools.partial(asyncio_handler, uvicorn_server=server))
+        await server.serve()
+
+    try:
+        asyncio.run(serve(), loop_factory=config.get_loop_factory())
+    except KeyboardInterrupt:
+        pass
+    if not server.started:
+        raise SystemExit(uvicorn.config.STARTUP_FAILURE)
+
+
+def _serve(args: argparse.Namespace) -> int:
     _require_readable_settings()
     if args.redirect_origin:
         from .redirect import create_redirect_app
         if args.ssl_certfile or args.ssl_keyfile:
             raise SystemExit("redirect listener must use HTTP")
-        uvicorn.run(create_redirect_app(args.redirect_origin), host=args.host,
-                    port=args.port, workers=1)
+        _run_uvicorn(create_redirect_app(args.redirect_origin), host=args.host, port=args.port)
         return 0
+    if distribution.docker():
+        # Docker 没有托盘，日志的半年保留、按月切段与空进程日志清理在这里做；子进程还没起。
+        import logging
+        from . import log_retention
+        try:
+            log_retention.sweep(settings_file.active().directory("logs"))
+        except Exception:
+            logging.getLogger(__name__).warning("日志整理失败", exc_info=True)
     if bool(args.ssl_certfile) != bool(args.ssl_keyfile):
         raise SystemExit("--ssl-certfile and --ssl-keyfile must be provided together")
     for path in (args.ssl_certfile, args.ssl_keyfile):
@@ -93,12 +126,15 @@ def _serve(args: argparse.Namespace) -> int:
     if not distribution.standalone() and not _is_loopback(args.host) and (publish_mdns or TUNNEL_ENABLED):
         from .mdns import lan_ipv4
         tunnel_lan_address = args.mdns_address or lan_ipv4()
+    token = "" if args.setup else _serve_token(args)
+    secrets_dir = settings_file.active().directory("secrets")
     settings = PeachSettings(
         db_path=args.db,
         host=args.host,
         port=args.port,
-        token="" if args.setup else _serve_token(args),
-        access_path=settings_file.active().directory("secrets") / "access.json",
+        token=token,
+        token_file=auth.token_file(args.token, secrets_dir) if token else None,
+        access_path=secrets_dir / "access.json",
         configured=CONFIGURED and not args.setup,
         docs_enabled=args.docs,
         mdns_enabled=publish_mdns,
@@ -118,8 +154,8 @@ def _serve(args: argparse.Namespace) -> int:
         tunnel_log_root=settings_file.active().directory("logs"),
     )
     sync = _build_sync(args, settings)
-    uvicorn.run(
-        create_app(settings, sync), host=args.host, port=args.port, workers=1,
+    _run_uvicorn(
+        create_app(settings, sync), host=args.host, port=args.port,
         ssl_certfile=str(args.ssl_certfile) if args.ssl_certfile else None,
         ssl_keyfile=str(args.ssl_keyfile) if args.ssl_keyfile else None,
     )
@@ -185,6 +221,11 @@ def _build_sync(args: argparse.Namespace, settings: PeachSettings) -> LedgerSync
 
 def _migrate(args: argparse.Namespace) -> int:
     _require_readable_settings()
+    if args.action == "upgrade":
+        # 托盘起服务前先跑这一步；恢复中断后账本可能暂时不在，不收拾就会迁出一个空账本。
+        from .ledger_backups import recover
+        if (settled := recover(args.db)) is not None:
+            print(f"restore marker: {settled['message']}")
     all_migrations, pending = plan(args.db, MIGRATIONS_DIR)
     print(f"database: {args.db}")
     print(f"migrations: {len(all_migrations)}, pending: {len(pending)}")
@@ -192,6 +233,12 @@ def _migrate(args: argparse.Namespace) -> int:
         print(f"PENDING {migration.version} {migration.name}")
     if args.action == "status" or not pending:
         return 0
+    config = settings_file.active()
+    if args.db.resolve() == (config.directory('database') / 'ledger.db').resolve():
+        from .runtime_prepare import configured_ledger_writer
+        writer, reason = configured_ledger_writer(config)
+        if not writer:
+            raise SystemExit(f'本机不能迁移账本：{reason}；请先在写入端迁移并同步')
     if args.db.resolve() == DEFAULT_DB.resolve() and not args.yes:
         raise SystemExit("refusing to modify the real ledger without --yes")
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -314,10 +361,10 @@ def _parse_mounts(
         key = key.strip()
         if not separator or not key:
             raise SystemExit(f"--mount 要写成 来源ID=路径，收到：{chunk}")
-        if known and key not in known:
+        if key not in known:
             raise SystemExit(
                 f"--mount 的来源 ID 未在 [media.locations] 声明：{key}"
-                f"（已知：{'、'.join(sorted(known))}）"
+                f"（已知：{'、'.join(sorted(known)) or '尚未声明媒体来源'}）"
             )
         mounts.setdefault(key, []).append(value.strip())
     return {key: tuple(item for item in values if item) for key, values in mounts.items()}
@@ -491,6 +538,27 @@ def _scan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _processing_line(state: dict) -> str:
+    """一行进度，口径同页面的 `processingLine`：总量已知写完成数，扫描目录时写已发现的文件数。"""
+    if state.get('total'):
+        return f"{state['stage']}：{state.get('checked', 0)}/{state['total']}"
+    if state.get('current_action') == 'scanning_files' or state.get('stage') == '扫描文件':
+        return f"{state['stage']}：已发现 {state.get('scanned', 0):,} 个文件"
+    return str(state['stage'])
+
+
+def _processing_printer():
+    """资料处理的进度回调：流量、问题等回报也会走这里，和上一行相同就不再打印。"""
+    last = None
+    def report(state):
+        nonlocal last
+        line = _processing_line(state)
+        if line != last:
+            print(line, flush=True)
+            last = line
+    return report
+
+
 def _process_library(args: argparse.Namespace) -> int:
     """命令行跑资料处理，和网页那一轮一样记进任务中心、结算时派发声明的后继。
 
@@ -502,10 +570,15 @@ def _process_library(args: argparse.Namespace) -> int:
     _require_readable_settings()
     config = settings_file.active()
     with cli_run('library-processing', args.db, label='资料处理') as handle:
-        result = process_library(config, args.db, config.directory('generated'),
-                                 config.directory('generated') / 'covers', location=args.location,
-                                 database=LedgerDatabase(args.db),
-                                 report=lambda state: print(f"{state['stage']}：{state['checked']}/{state['total']}", flush=True))
+        from .jobs import JobCancelled
+        try:
+            result = process_library(config, args.db, config.directory('generated'),
+                                     config.directory('generated') / 'covers', location=args.location,
+                                     database=LedgerDatabase(args.db), report=_processing_printer())
+        except JobCancelled:
+            handle.finish('cancelled', error='用户停止任务')
+            print('任务已取消，已保存结果保留。')
+            return 130
         rows = declared_rows(result.get('followups'))
         queued = handle.store.enqueue_followups(handle.run_id, rows)
         if rows:
@@ -643,9 +716,9 @@ def _report_blanks(config: settings_file.PeachConfig) -> None:
         table, _, name = dotted.partition(".")
         if not getattr(getattr(config, table), name):
             blanks.append(f"  {dotted} 留空 → {effect}；要填就重跑并加 {flag}")
-    if not config.mounts and os.name != "nt":
+    if config.locations and not config.mounts and os.name != "nt":
         # Windows 上盘符本身就是挂载点，空表是正常的，提示它只会让人去填没用的值。
-        known = "、".join(sorted(config.locations)) or "local"
+        known = "、".join(sorted(config.locations))
         blanks.append(
             f"  [media.mounts] 为空 → 无法读取媒体来源的目录；"
             f"可用 --mount <媒体来源ID>=<媒体目录> 指定目录（已知来源：{known}）"
@@ -697,6 +770,22 @@ def _doctor(args: argparse.Namespace) -> int:
     return 1 if result["status"] == "failed" else 0
 
 
+
+def _check_sources(args: argparse.Namespace) -> int:
+    import json
+    from .source_preflight import check_sources
+
+    result = check_sources(settings_file.active().directory("secrets"), args.source)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        print("检查来源页面与图片 CDN；连通不代表作品资料或登录会话已验证。")
+        for source in result["sources"]:
+            for target in source["results"]:
+                print(f"{source['label']} / {target['label']} [{target['outcome_label']}] {target.get('message', '')}")
+    return 0 if result["ok"] else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="peach")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -706,6 +795,13 @@ def build_parser() -> argparse.ArgumentParser:
     local_image.add_argument('source', type=Path)
     local_image.add_argument('output', type=Path)
     local_image.set_defaults(handler=lambda args: local_image_main([str(args.source), str(args.output)]))
+
+    from .media_io import main as media_read_main, OPERATIONS
+    media_read = commands.add_parser('media-read', help='限时读取媒体目录与配套文件')
+    media_read.add_argument('operation', choices=OPERATIONS)
+    media_read.add_argument('path')
+    media_read.add_argument('value', nargs='?', default='')
+    media_read.set_defaults(handler=lambda args: media_read_main([args.operation, args.path, args.value]))
 
     init = commands.add_parser(
         "init", help="首次运行：不带参数在终端里问答；带任何参数或 --no-input 走非交互")
@@ -788,6 +884,11 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--db", type=Path, default=DEFAULT_DB)
     status.add_argument("--shared-db", type=Path, default=SHARED_DATABASE_PATH)
     status.set_defaults(handler=_status)
+
+    sources = commands.add_parser("check-sources", help="安装后有界检测外部资料源与图片 CDN，不读取影片")
+    sources.add_argument("--source", action="append", help="只检查指定来源 ID；可重复指定，默认检查全部资料源")
+    sources.add_argument("--json", action="store_true", help="输出不含凭据的 JSON 结果")
+    sources.set_defaults(handler=_check_sources)
 
     doctor = commands.add_parser("doctor", help="逐项诊断本机配置、数据库、工具与挂载，不执行修复")
     doctor.add_argument("--json", action="store_true", help="输出脱敏 JSON 报告")

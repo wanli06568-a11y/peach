@@ -47,6 +47,20 @@ export function requiredEnv(name: string): string {
 
 export async function launch(): Promise<Browser> {
   const args: string[] = [];
+  if (process.platform === 'win32') {
+    // 仅隔离 E2E：Chromium 572515601 的回环随机端口缺陷会返回 WSAENOBUFS 10055。
+    // 重复 --disable-features 会覆盖默认值；保留锁定 Playwright 1.64.1 的全部条目。
+    // browser-launch.test.ts 从真实 Chrome 对照默认参数，依赖升级时检查此表漂移。
+    const disabled = [
+      'AvoidUnnecessaryBeforeUnloadCheckSync', 'DestroyProfileOnBrowserClose', 'DialMediaRouteProvider',
+      'GlobalMediaControls', 'HttpsUpgrades', 'LensOverlay', 'MediaRouter', 'PaintHolding',
+      'ThirdPartyStoragePartitioning', 'BlockOriginHeaderModificationOnRedirect',
+      'AvoidCorsURLLoaderRestartOnRedirect', 'Translate', 'AutoDeElevate', 'OptimizationHints',
+      'NetworkTimeServiceQuerying', 'AimEnabled', 'msForceBrowserSignIn', 'msEdgeUpdateLaunchServicesPreferredVersion',
+      'TcpPortRandomizationWin',
+    ];
+    args.push('--disable-features=' + disabled.join(','));
+  }
   const networkLogs = process.env.PEACH_E2E_NET_LOG_DIR;
   if (networkLogs) {
     mkdirSync(networkLogs, { recursive: true });
@@ -63,36 +77,65 @@ export async function launch(): Promise<Browser> {
   });
 }
 
+/** 失败时保留焦点、输入和弹层现场；成功路径不额外查询页面。 */
+export async function withPageDiagnostics<T>(page: Page, where: string | (() => string), action: () => Promise<T>): Promise<T> {
+  try {
+    return await action();
+  } catch (error) {
+    const state = await page.evaluate(() => ({
+      path: location.pathname + location.search,
+      ready: document.readyState,
+      focus: document.activeElement?.outerHTML.slice(0, 600),
+      query: document.querySelector<HTMLInputElement>('#q')?.value,
+      layers: [...document.querySelectorAll('dialog,[role="dialog"],#searchMenu')].slice(0, 12).map(node => ({
+        tag: node.tagName, id: node.id, hidden: (node as HTMLElement).hidden,
+        expanded: node.getAttribute('aria-expanded'), text: node.textContent?.slice(0, 600),
+      })),
+      busy: [...document.querySelectorAll('[aria-busy="true"],[data-skeleton]')]
+        .filter(node => !node.closest('[data-content-skeleton][aria-hidden="true"]'))
+        .slice(0, 12).map(node => ({ tag: node.tagName, id: node.id, label: node.getAttribute('aria-label') })),
+    })).catch(() => '未取得');
+    const tree = await page.locator('body').ariaSnapshot({ timeout: 2000 }).catch(() => '未取得');
+    throw new Error(`${typeof where === 'function' ? where() : where}：${String(error)}\n页面现场：${JSON.stringify(state)}\n无障碍树：\n${tree.slice(0, 4000)}`,
+      { cause: error });
+  }
+}
+
 /** 等待态以 `aria-busy="true"` 与 `data-skeleton` 为准；超时就是等待态卡住了。
  * 两个标记由页面自己写：island、遗留模板和 React 子树都得发出，这里才等得到。
  *
  * 它只证明「没有东西在等」，证明不了页面画出来了：主体完全没渲染时同样立刻成立。
- * 所以调用方先等到目标页面自己的主体出现，再调它。 */
-export async function settle(page: Page, scope = 'body'): Promise<void> {
+ * 所以调用方先等到目标页面自己的主体出现，再调它。
+ *
+ * `except` 是用例自己压住、永远不会结束的那一处等待（例如故意不回的下一页），按选择器排除。 */
+export async function settle(page: Page, scope = 'body', { except = '' }: { except?: string } = {}): Promise<void> {
   /* 活动页和馆藏页会持续轮询任务状态，本来就不保证进入 `networkidle`。页面导航由
      `visit()` 等到 load，主体由调用方的 `expectBody()` 验证；这里只等 Peach 自己公开的
      等待态结束。 */
   try {
     await page.waitForFunction(
-      (selector) => {
+      ({ selector, except }) => {
         const root = document.querySelector(selector);
-        return !!root && !root.matches('[aria-busy="true"],[data-skeleton]')
-          && !root.querySelector('[aria-busy="true"],[data-skeleton]');
+        const waiting = (node: Element) => node.matches('[aria-busy="true"],[data-skeleton]')
+          && !node.closest('[data-content-skeleton][aria-hidden="true"]') && !(except && node.matches(except));
+        return !!root && !waiting(root) && ![...root.querySelectorAll('[aria-busy="true"],[data-skeleton]')].some(waiting);
       },
-      scope, { timeout: 15_000 });
+      { selector: scope, except }, { timeout: 15_000 });
   } catch (error) {
-    const pending = await page.evaluate((selector) => {
+    const pending = await page.evaluate(({ selector, except }) => {
       const root = document.querySelector(selector);
       if (!root) return { missing_scope: selector };
-      const nodes = [...root.querySelectorAll('[aria-busy="true"],[data-skeleton]')];
-      if (root.matches('[aria-busy="true"],[data-skeleton]')) nodes.unshift(root);
+      const waiting = (node: Element) => node.matches('[aria-busy="true"],[data-skeleton]')
+        && !node.closest('[data-content-skeleton][aria-hidden="true"]') && !(except && node.matches(except));
+      const nodes = [...root.querySelectorAll('[aria-busy="true"],[data-skeleton]')].filter(waiting);
+      if (waiting(root)) nodes.unshift(root);
       return nodes.slice(0, 12).map(node => {
         const box = node.getBoundingClientRect();
         return { tag: node.tagName, id: node.id, skeleton: node.getAttribute('data-skeleton'),
           label: node.getAttribute('aria-label'), scope: node.closest('dialog')?.id || 'page',
           width: box.width, height: box.height };
       });
-    }, scope).catch(() => '未取得');
+    }, { selector: scope, except }).catch(() => '未取得');
     throw new Error(`页面等待态未结束：${JSON.stringify(pending)}\n${(error as Error).message}`);
   }
 }
@@ -151,20 +194,64 @@ export async function visit(browser: Browser, path: string, viewport: Viewport,
       problems.push(`failed ${request.url().slice(origin.length)} ${reason}`);
     }
   });
+  /* 桩回调里的 `route.fetch`、`route.continue` 可能在关上下文时还没返回，之后会以
+   * 「Request context disposed」失败；没人等它，就成了整个文件的 unhandledRejection。
+   * `ignoreErrors` 先撤掉全部桩，让还在路上的那几趟失败时静默返回。 */
+  const close = async () => {
+    if (!page.isClosed()) await page.unrouteAll({ behavior: 'ignoreErrors' });
+    await context.close();
+  };
   // 只打开到 load：等哪块主体、何时 settle 由用例决定，见 `settle` 的说明。
   try {
     await prepare?.(page);
     await page.goto(origin + path, { waitUntil: 'load' });
   } catch (error) {
-    await context.close();
+    await close();
     throw error;
   }
-  return { page, problems, close: () => context.close() };
+  return { page, problems, close };
+}
+
+/** 时间轴预览的桩：`/api/timeline` 回固定间隔的自有接触印相，`/timeline` 回合成的 10×10 拼图，
+ *  每格写「页-格」序号，截图里看得出取的是哪一格。返回每页被请求的次数。 */
+export async function stubTimelineSheets(page: Page, { frames, interval }: { frames: number; interval: number }) {
+  const requested = new Map<number, number>();
+  await page.route((url) => url.pathname === '/api/timeline', (route) => route.fulfill({
+    json: { source: 'peach', frames, interval, sheets: Math.ceil(frames / 100), columns: 10, rows: 10, frame_width: 160 },
+  }));
+  await page.route((url) => url.pathname === '/timeline', (route) => {
+    const sheet = Number(new URL(route.request().url()).searchParams.get('s'));
+    requested.set(sheet, (requested.get(sheet) ?? 0) + 1);
+    const count = Math.min(100, frames - sheet * 100), rows = Math.ceil(count / 10);
+    const cells = Array.from({ length: count }, (_, slot) => {
+      const x = slot % 10 * 160, y = Math.floor(slot / 10) * 90;
+      return `<rect x="${x}" y="${y}" width="160" height="90" fill="hsl(${(sheet * 100 + slot) * 7 % 360} 40% 35%)"/>`
+        + `<text x="${x + 80}" y="${y + 58}" font-size="36" font-family="sans-serif" fill="#fff" text-anchor="middle">${sheet}-${slot}</text>`;
+    }).join('');
+    return route.fulfill({ contentType: 'image/svg+xml',
+      body: `<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="${rows * 90}">${cells}</svg>` });
+  });
+  return requested;
 }
 
 /* 越界名单只报根因：页面一旦被撑宽，移动视口跟着变宽，`fixed` 的顶栏、Toast 会一起
  * 伸出去，按文档顺序截前几个就只剩这些症状。所以跳过 `fixed` 及其后代，并且只留
  * 父元素自己没越界的那一层。 */
+/** 检查实际可滚动的区域是否由统一滑块或横向手势接管。 */
+export async function unmanagedScrollers(page: Page): Promise<string[]> {
+  return page.evaluate(() => [...document.querySelectorAll<HTMLElement>('body *')].flatMap(node => {
+    if (!(node instanceof HTMLElement) || node.closest('.ovtrack,.ui-ov-edges,[data-skeleton],[inert]')) return [];
+    const style = getComputedStyle(node), box = node.getBoundingClientRect();
+    if (!box.width || !box.height || style.visibility === 'hidden' || style.display === 'none') return [];
+    const vertical = /^(auto|scroll)$/.test(style.overflowY) && node.scrollHeight > node.clientHeight + 1;
+    const horizontal = /^(auto|scroll)$/.test(style.overflowX) && node.scrollWidth > node.clientWidth + 1;
+    if (!vertical && !horizontal) return [];
+    if (node.hasAttribute('data-overlay-scrollbar')) return [];
+    if (!vertical && (node.hasAttribute('data-horizontal-scroll') || node.hasAttribute('data-scroll-gesture'))) return [];
+    return [`${node.tagName.toLowerCase()}${node.id ? '#' + node.id : ''}.${String(node.className).slice(0, 120)}`];
+  }));
+}
+
 export async function layout(page: Page): Promise<Layout> {
   return page.evaluate(() => {
     const width = document.documentElement.clientWidth;

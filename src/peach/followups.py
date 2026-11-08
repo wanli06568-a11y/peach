@@ -25,12 +25,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from .repository import in_background
 from .task_runs import TaskRunHandle, TaskRunStore
 
 LOGGER = logging.getLogger(__name__)
 
 #: 写账本的后继共用的通道名。它不是任务种类，是「这条路上一次只许过一个」。
 LEDGER_LANE = "ledger"
+#: 后继让路以后，通道隔多久看一眼路让回来没有。
+DEFER_POLL_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -100,12 +103,16 @@ class FollowupType:
 
     `run(contract, key, handle)` 返回一份摘要字典，异常一律算这一条失败——后继失败
     不回滚也不改判父任务（ADR-0040 第四条），所以这里不往上抛。
+
+    `jumps_queue` 的后继在自己的通道里先于别的种类领取（ADR-0114）：给人刚做完的那件事
+    收尾的后继，人在等它；补资料、补头像这类后台存量不急。
     """
 
     task_key: str
     label: str
     writes_ledger: bool
     run: Callable[[object, str, TaskRunHandle], dict]
+    jumps_queue: bool = False
 
     @property
     def lane(self) -> str:
@@ -133,6 +140,11 @@ def lanes() -> dict[str, tuple[str, ...]]:
     return {lane: tuple(sorted(keys)) for lane, keys in grouped.items()}
 
 
+def _ahead(keys) -> tuple[str, ...]:
+    """这几类里插队先领的那些（`FollowupType.jumps_queue`）。"""
+    return tuple(key for key in keys if key in REGISTRY and REGISTRY[key].jumps_queue)
+
+
 class FollowupRunner:
     """把库里排着的后继跑掉。每条通道一个线程，通道内串行。
 
@@ -145,6 +157,7 @@ class FollowupRunner:
         self.store = store if store is not None else contract.task_runs
         self._lock = threading.Lock()
         self._threads: dict[str, threading.Thread] = {}
+        self._active: dict[threading.Thread, str] = {}
         self._stopping = False
         self._paused_for_update = False
 
@@ -166,12 +179,12 @@ class FollowupRunner:
                 if thread is not None and thread.is_alive():
                     continue
                 thread = threading.Thread(
-                    target=self._work, args=(keys,), daemon=True,
+                    target=in_background(self._work), args=(keys,), daemon=True,
                     name=f"PeachFollowup-{lane}")
                 self._threads[lane] = thread
                 thread.start()
 
-    def stop(self, timeout: float | None = 2.0) -> None:
+    def stop(self, timeout: float | None = 2.0, *, wait_for=()) -> None:
         """不再领新的后继并等在途那一条收工。
 
         在途那一条不打断：它多半正在写账本，中途掐掉留下的是一条停在 `running` 的行，
@@ -180,10 +193,11 @@ class FollowupRunner:
         with self._lock:
             self._stopping = True
             threads = list(self._threads.values())
+            required = {thread for thread, key in self._active.items() if key in wait_for}
             self._threads.clear()
         for thread in threads:
             if thread.is_alive():
-                thread.join(timeout)
+                thread.join(None if thread in required else timeout)
 
     def resume_after_update(self) -> None:
         if self._paused_for_update:
@@ -195,30 +209,61 @@ class FollowupRunner:
 
         测试与命令行用这一条：它们要的是「跑完了再往下走」，而不是一个后台线程。
         """
+        from .update_tasks import GateBusy
         done = 0
         for keys in lanes().values():
             while True:
-                run = self.store.claim_followup(keys)
+                try:
+                    run = self.store.claim_followup(keys, first=_ahead(keys))
+                except GateBusy:
+                    break
                 if run is None:
                     break
-                self._execute(run)
+                deferred = self._execute(run)
                 done += 1
+                if deferred is not None:
+                    # 让路的那条已回到队列，同步排空时没人会把路让回来，留给后台通道。
+                    break
         return done
 
     # -- 执行 --------------------------------------------------------------
 
     def _work(self, keys: tuple[str, ...]) -> None:
+        from .update_tasks import GateBusy
         while not self._stopping:
-            run = self.store.claim_followup(keys)
+            try:
+                run = self.store.claim_followup(keys, first=_ahead(keys))
+            except GateBusy:
+                # 闸门锁被别人拿着不是「队列空了」：退出线程就没人再叫醒这条通道。
+                time.sleep(DEFER_POLL_SECONDS)
+                continue
             if run is None:
                 from .update_tasks import is_pausing
                 db = getattr(getattr(self.store, 'database', None), 'db_path', None)
                 if isinstance(db, Path) and is_pausing(db):
                     self._paused_for_update = True
                 return
-            self._execute(run)
+            thread = threading.current_thread()
+            with self._lock:
+                self._active[thread] = run.task_key
+            try:
+                deferred = self._execute(run)
+            finally:
+                with self._lock:
+                    self._active.pop(thread, None)
+            # 让路的那条已回到队列：路让回来之前再领，领到的还是它。
+            while deferred is not None and not self._stopping and not deferred.ready():
+                time.sleep(DEFER_POLL_SECONDS)
 
-    def _execute(self, run) -> None:
+    def _execute(self, run):
+        try:
+            return self._execute_one(run)
+        finally:
+            self.store.prune(run.task_key, keep_errors=True)
+
+    def _execute_one(self, run):
+        """跑一条后继；它给别的任务让路时返回那个 `JobDeferred`，否则返回 None。"""
+        from .jobs import JobDeferred, JobPaused
         followup_type = REGISTRY.get(run.task_key)
         handle = TaskRunHandle(self.store, run.id)
         if followup_type is None:
@@ -227,7 +272,20 @@ class FollowupRunner:
             handle.finish("failed", error=f"没有登记 {run.task_key} 这种后继")
             return
         try:
-            summary = followup_type.run(self.contract, run.followup_key, handle)
+            from .task_control import bind, checkpoint, Cancelled
+            with bind(self.store, run.id, recoverable=True):
+                summary = followup_type.run(self.contract, run.followup_key, handle)
+                checkpoint()
+        except Cancelled:
+            handle.finish('cancelled', summary={'cancelled_by_user': True})
+            return
+        except JobDeferred as error:
+            self.store.suspend(run.id, label=str(error), paused_for_update=False)
+            return error
+        except JobPaused as error:
+            self.store.suspend(run.id, label=str(error) or '等待安装完成后继续')
+            self._paused_for_update = True
+            return
         except Exception as error:  # 后继失败只是它自己失败，父任务的结论不动。
             LOGGER.warning("followup failed: %s: %s", run.followup_key, error,
                            exc_info=True)
@@ -237,4 +295,9 @@ class FollowupRunner:
         handle.finish("succeeded", summary=summary)
         # 处理器说还没做完：原地接一条，不加深（ADR-0084）。先结算再接，互斥键才空得出来。
         if summary.get("continue"):
-            self.store.continue_followup(run, followup_type.label)
+            from .update_tasks import UpdateBusy
+            try:
+                self.store.continue_followup(run, followup_type.label)
+            except UpdateBusy as error:
+                # 接续没排上只是少接一轮，存量规划下次会再派；异常不能打死通道线程。
+                LOGGER.warning("followup continuation skipped: %s: %s", run.followup_key, error)

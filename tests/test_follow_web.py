@@ -5,11 +5,14 @@
 """
 import json
 import os
+import sqlite3
 import stat
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +27,7 @@ from peach.follow_secrets import CredentialError
 from peach.follow_sources import FollowCandidate, SourceFetch
 from peach.follow_store import FollowStore
 from peach.http import HttpResponse
+from peach.repository import in_background
 from support.backoff import no_real_backoff
 from support.ledger import fresh_ledger
 from peach.web_contract import WebContract, dispatch_api_get, dispatch_api_post
@@ -171,6 +175,35 @@ class FollowContractTests(unittest.TestCase):
         self.assertEqual([row['source'] for row in result['results']], [selected])
         self.assertEqual(factory.call_count, 1)
 
+    def test_sources_skipped_for_a_site_cooldown_are_not_reported_as_failures(self):
+        """站点限流冷却中：同站的来源这一轮不问，也不进失败清单（ADR-0134）。"""
+        from peach.follow_stream import FollowMediaResolver
+        self._seed(ref='first')
+        self._seed(ref='second')
+        self.contract.follow_media_resolver = FollowMediaResolver(transport=None)
+        self.contract.follow_media_resolver.pause('rule34video', 60)
+        with mock.patch.object(web_follow, 'build_connector') as factory:
+            result = self._post('/api/follow/check', {})
+            # 往回一路抓到底也一样：冷却中的那条只跳过一次，不在原地空转翻页。
+            backfill = self._post('/api/follow/check', {'older': True, 'backfill_all': True})
+        self.assertEqual(factory.call_count, 0)
+        self.assertEqual((result['results'], result['deferred']), ([], 2))
+        self.assertEqual((backfill['results'], backfill['deferred']), ([], 2))
+
+    def test_a_scheduled_round_checks_only_the_sources_that_are_due(self):
+        """定时那一跳跳过刚查过、又久未更新的来源；手动检查照旧全查。"""
+        stale = self._seed(ref='stale')
+        recent = self._seed(ref='recent')
+        with self.contract.database.write_transaction() as connection:
+            connection.execute("UPDATE follow_source SET last_checked_at=? WHERE id=?",
+                               (datetime.now(timezone.utc).isoformat(), recent))
+        with mock.patch.object(web_follow, 'build_connector') as factory:
+            factory.return_value.fetch.side_effect = FollowSourceError('offline')
+            scheduled = self._post('/api/follow/check', {'automatic': True})
+            manual = self._post('/api/follow/check', {})
+        self.assertEqual([row['source'] for row in scheduled['results']], [stale])
+        self.assertEqual({row['source'] for row in manual['results']}, {stale, recent})
+
     def test_failed_numeric_source_has_a_readable_author(self):
         source = self._seed(ref='patreon/12387984', label='Pantsushi · patreon')
         with mock.patch.object(web_follow, 'build_connector') as factory:
@@ -257,6 +290,44 @@ class FollowContractTests(unittest.TestCase):
 
     def _post(self, path, body):
         return dispatch_api_post(self.contract, path, body)
+
+    def test_a_background_sync_reaches_the_list_after_the_request_has_closed(self):
+        """后台同步写进新条目后，关注页先回上一份、另起后台重算（ADR-0146）。
+
+        重算跑起来时请求那条连接早已关掉；重算还得从账本现读，不能拿请求那一刻的旧条目
+        去排列表、数筛选项，否则旧结果记在新版本下，计数变了、列表一直缺新条目。
+        """
+        source_id = self._seed()
+        self.assertEqual(self._get()["counts"]["new"], 2)
+
+        @in_background
+        def sync():
+            with self.contract.database.write_transaction() as connection:
+                FollowStore(lambda: connection, sources_root=self.contract.follow_sources_root).record(
+                    source_id, SourceFetch(
+                        provider="rule34video", ref="lazyprocrastinator",
+                        request_url="https://rule34video.test/lazyprocrastinator", semantics="work",
+                        candidates=(FollowCandidate(provider="rule34video", external_id="4600001",
+                                                    title="Brand New Upload",
+                                                    url="https://rule34video.com/video/4600001/x/",
+                                                    extra={"tags": ["fresh"],
+                                                           "tag_types": {"fresh": "general"}}),),
+                        raw_body=b"<html>later</html>"),
+                    moment=MOMENT)
+
+        writer = threading.Thread(target=sync)
+        writer.start()
+        writer.join(5)
+        with self.assertNoLogs("peach.web_state", level="ERROR"):
+            self._get()
+            deadline = time.monotonic() + 10
+            while self.contract.stale_refreshing and time.monotonic() < deadline:
+                time.sleep(0.01)
+        self.assertEqual(self.contract.stale_refreshing, set())
+        after = self._get()
+        self.assertEqual(after["counts"]["new"], 3)
+        self.assertIn("Brand New Upload", [group["primary"]["title"] for group in after["groups"]])
+        self.assertIn("fresh", dict(after["facets"]["tags"]))
 
     def test_saved_catalog_media_uses_the_follow_cover_and_content_tags(self):
         self._seed(candidates=(FollowCandidate(
@@ -536,6 +607,46 @@ class FollowContractTests(unittest.TestCase):
         payload = self._get(item=str(item_id), limit="1")
         self.assertEqual(payload["groups"][0]["primary"]["id"], item_id)
         self.assertEqual(len(payload["groups"][0]["variants"]), 1)
+        # 详情只读这一组和署名要的来源、别名；整库筛选项不随单条下发。
+        self.assertNotIn("facets", payload)
+        self.assertEqual(payload["sources"][0]["label"], "LazyProcrastinator")
+        self.assertEqual(self._get(item=str(item_id + 999))["groups"], [])
+
+    def test_feed_groups_once_per_ledger_version_and_ignores_playback_heartbeats(self):
+        """整库分组按账本版本缓存：翻页、直达详情与播放心跳都不再分组，条目状态变了才重分。"""
+        self._seed(candidates=(
+            FollowCandidate(provider="rule34video", external_id="1", title="First Work",
+                            url="https://rule34video.com/video/1/x/", published_at="2026-08-18T00:00:00Z"),
+            FollowCandidate(provider="rule34video", external_id="2", title="Second Work",
+                            url="https://rule34video.com/video/2/x/", published_at="2026-08-17T00:00:00Z"),
+        ))
+        grouped = []
+        original = FollowStore.group
+
+        def counted(*args, **kwargs):
+            grouped.append(1)
+            return original(*args, **kwargs)
+
+        with mock.patch.object(FollowStore, "group", side_effect=counted):
+            first = self._get(limit="1")
+            item = first["groups"][0]["primary"]["id"]
+            self.assertIn("facets", first)
+            second = self._get(limit="1", offset="1")
+            # 翻页只接组，筛选项沿用首页那份。
+            self.assertNotIn("facets", second)
+            self.assertNotEqual(second["groups"][0]["primary"]["id"], item)
+            self.assertEqual(self._get(item=str(item))["groups"][0]["primary"]["id"], item)
+            settled = len(grouped)
+            self._get(limit="1")
+            self._get(item=str(item))
+            self._post("/api/follow/activity", {"item": item, "position": 5, "duration": 20, "delta": 5})
+            self._get(limit="1")
+            self._get(item=str(item))
+            self.assertEqual(len(grouped), settled)
+            self._post("/api/follow/status", {"item": item, "to": "ignored"})
+            relisted = self._get(limit="1")
+        self.assertGreater(len(grouped), settled)
+        self.assertEqual(relisted["counts"]["ignored"], 1)
 
     def test_feed_never_exposes_the_raw_media_url(self):
         # 界面只需要知道有没有媒体；直链是来源层的事，不进公共 JSON。
@@ -1442,6 +1553,18 @@ class FollowContractTests(unittest.TestCase):
         self.assertEqual(row["k"], "LazyProcrastinator")
         self.assertEqual(sorted(row["providers"]), ["rule34video", "rule34xxx"])
 
+    def test_the_online_roster_carries_each_authors_latest_post_and_follows_new_items(self):
+        """搜索推荐写「最新更新于」读的就是这一格；名册按账本缓存，新条目进来就得重数。"""
+        self._seed(ref="a", label="Author A", candidates=(
+            self._clip("a1", published_at="2026-03-01T00:00:00Z"),
+            self._clip("a2", published_at="2026-05-02T08:00:00Z")))
+        row = self._get("/api/follow/authors")["items"][0]
+        self.assertEqual((row["n"], row["latest"]), (2, "2026-05-02T08:00:00Z"))
+        self._seed(ref="a", label="Author A", candidates=(
+            self._clip("a3", published_at="2026-06-03T00:00:00Z"),))
+        row = self._get("/api/follow/authors")["items"][0]
+        self.assertEqual((row["n"], row["latest"]), (3, "2026-06-03T00:00:00Z"))
+
     def test_the_online_roster_supports_search_and_paging(self):
         """形状与 /api/index 一致：艺人页的分页、过滤和「载入更多」换个地址就能用。"""
         self._seed(ref="a", label="Author A", candidates=(self._clip("a1"),))
@@ -1567,6 +1690,46 @@ class FollowContractTests(unittest.TestCase):
             [["stellar blade", "Stellar Blade", 1, 1,
               {"axis": "y", "pct": 17,
                "box": {"cx": 0.5, "cy": 0.2, "faceW": 29, "imgW": 144, "imgH": 256}}]])
+
+    def test_a_work_cover_framed_after_the_first_page_shows_up_on_the_next(self):
+        """题材图与取景记录落在 `works/` 子目录里，往里新增文件不改上一级目录的时间；
+        筛选项缓存认的是这一层，取完图下一次请求就带上取景。"""
+        self._seed(provider="rule34xxx", ref="typed", candidates=(
+            self._typed("1", {"stellar blade": "copyright"},
+                        preview="https://api-cdn.rule34.xxx/thumbnails/9/s.jpg"),
+        ))
+        cached = follow_assets.cache_path(
+            self.contract.candidate_root / follow_assets.ROOT_NAME, "works", "stellar blade")
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        # 两级目录都定在一分钟前，下面那次写入必然换一个时间。
+        settled = time.time_ns() - 60 * 1_000_000_000
+        for directory in (cached.parent, cached.parent.parent):
+            os.utime(directory, ns=(settled, settled))
+        self.assertIsNone(self._get()["facets"]["works"][0][4])
+        avatar_face.write_sidecar(cached, {
+            "ratio": 0.563, "px": [144, 256],
+            "face": {"cx": 0.5, "cy": 0.2, "w": 0.2, "h": 0.18, "score": 0.9},
+            "focus": {"axis": "y", "pct": 17}})
+        self.assertEqual(self._get()["facets"]["works"][0][4]["pct"], 17)
+
+    def test_sources_read_before_a_concurrent_write_are_not_kept_under_the_new_version(self):
+        """来源、别名在请求开头读出，缓存的计算另从账本现读一份。两次读之间来源被停用的话，
+        旧来源算出的条目不能记在新版本下一直命中：停用之后的下一次请求就不再列出它的条目。"""
+        self._seed()
+        real = FollowStore.sources
+        writes = []
+
+        def sources_then_disable(store):
+            rows = real(store)
+            if not writes:
+                with closing(sqlite3.connect(self.db)) as connection, connection:
+                    writes.append(connection.execute("UPDATE follow_source SET enabled=0").rowcount)
+            return rows
+
+        with mock.patch.object(FollowStore, "sources", sources_then_disable):
+            self._get()
+            self.assertEqual(writes, [1])
+            self.assertEqual(self._get()["groups"], [])
 
     def test_one_series_is_one_pill_however_the_source_spells_each_installment(self):
         """一个系列在那一排上只占一枚。
@@ -2135,6 +2298,43 @@ class FollowContractTests(unittest.TestCase):
         self.assertIn("证据未取得", outcome["evidence_error"])
         self.assertEqual(self._get()["sources"][0]["last_status"], "ok")
 
+    def test_one_source_evidence_conflict_does_not_abort_the_other_sources(self):
+        self._seed()
+        self._seed(provider="rule34xxx", ref="lazyprocrastinator", candidates=())
+        persist = FollowStore._persist_evidence
+
+        def evidence(store, fetch, moment):
+            if fetch.provider == "rule34video":
+                raise FollowSourceError("immutable follow snapshot collision")
+            return persist(store, fetch, moment)
+
+        def factory(provider, **kwargs):
+            connector = mock.Mock()
+            connector.fetch.return_value = SourceFetch(
+                provider=provider, ref="lazyprocrastinator",
+                request_url=f"https://{provider}.test/", semantics="work", raw_body=b"page",
+                candidates=(FollowCandidate(provider=provider, external_id="999", title="作品"),))
+            return connector
+
+        with mock.patch.object(web_follow, "build_connector", factory), \
+                mock.patch.object(FollowStore, "_persist_evidence", evidence), \
+                mock.patch("peach.error_reporting.event") as report:
+            result = self._post("/api/follow/check", {})
+        failure = next(call for call in report.call_args_list if call.args[0] == "follow-check")
+        self.assertEqual(failure.kwargs["provider"], "rule34video")
+        self.assertEqual(failure.kwargs["phase"], "record")
+        self.assertEqual(failure.kwargs["status"], "error")
+        self.assertEqual(result["checked"], 2)
+        outcomes = {row["provider"]: row for row in result["results"]}
+        self.assertFalse(outcomes["rule34video"]["ok"])
+        self.assertEqual(outcomes["rule34video"]["status"], "error")
+        self.assertIn("immutable follow snapshot collision", outcomes["rule34video"]["error"])
+        self.assertTrue(outcomes["rule34xxx"]["ok"])
+        self.assertEqual(outcomes["rule34xxx"]["added"], 1)
+        sources = {row["provider"]: row for row in self._get()["sources"]}
+        self.assertEqual(sources["rule34video"]["last_status"], "error")
+        self.assertEqual(sources["rule34xxx"]["last_status"], "ok")
+
     def test_source_errors_are_recorded_for_later_inspection(self):
         self._seed()
         with mock.patch.object(web_follow, "build_connector") as factory:
@@ -2164,6 +2364,19 @@ class FollowContractTests(unittest.TestCase):
         self.assertEqual(by_provider["simpcity"]["needs"], ["cookie"])
         self.assertIn("游客", by_provider["simpcity"]["why"])
         self.assertTrue(by_provider["rule34xxx"]["path"].endswith("rule34xxx.json"))
+
+    def test_skeleton_registry_matches_the_credentials_endpoint(self):
+        # 配置页的来源凭据骨架在数据回来之前就按这份登记画行；登记与接口的静态部分必须一致。
+        registry = json.loads((ROOT / "frontend" / "src" / "react" / "follow-manage" / "credential-providers.json").read_text(encoding="utf-8"))
+        expected = []
+        for row in self._get("/api/follow/credentials")["providers"]:
+            entry = {"provider": row["provider"], "label": row["provider_label"], "requirement": row["requirement"]}
+            if row["needs"]:
+                entry.update(fields=row["needs"], why=row["why"], where=row["where"], howto=row["howto"])
+            elif row["requirement"] == "blocked":
+                entry.update(why=row["why"])
+            expected.append(entry)
+        self.assertEqual(registry, expected)
 
     def test_a_configured_credential_reports_nothing_missing(self):
         secrets = self.root / "secrets" / "follow"
@@ -2773,6 +2986,44 @@ class FollowSourceAddTests(FollowContractTests):
             "action": "remove", "alias": "FFXIVInitialA"})
         self.assertTrue(removed["ok"])
         self.assertEqual(len({row["author_key"] for row in self._get()["sources"]}), 2)
+
+    def test_renaming_an_alias_group_updates_its_linked_creator_and_keeps_names(self):
+        current, chosen = "Suzutaru 3D (鈴太郎3D)", "鈴太郎3D"
+        source = self._source("fanbox", "suzutaro3d", current)
+        self._post("/api/follow/author-alias", {"action": "add", "canonical": current, "alias": chosen})
+        with self.contract.database.write_transaction() as connection:
+            entity_id = connection.execute(
+                "INSERT INTO entity(kind,canonical_name,normalized_name,created_at,updated_at) VALUES('creator',?,?,?,?)",
+                (current, current.casefold(), MOMENT.isoformat(), MOMENT.isoformat()),
+            ).lastrowid
+            connection.execute("UPDATE follow_source SET entity_id=? WHERE id=?", (entity_id, source))
+            connection.execute("INSERT INTO asset(location,path,name,medium,creator,first_seen) VALUES('local',?,'example.mp4','video',?,?)",
+                               ("R:\\Media\\example.mp4", current, MOMENT.isoformat()))
+        result = self._post("/api/follow/author-alias", {"action": "rename",
+            "canonical_key": follow_store.normalized_author_name(current), "canonical": chosen})
+        self.assertEqual(result["author_aliases"][0]["canonical_name"], chosen)
+        payload = self._get()
+        self.assertEqual(payload["sources"][0]["entity_name"], chosen)
+        with self.contract.database.read_connection() as connection:
+            self.assertEqual(connection.execute("SELECT creator FROM asset").fetchone()[0], chosen)
+            self.assertEqual(connection.execute("SELECT alias FROM entity_alias WHERE entity_id=? AND alias=?",
+                                               (entity_id, current)).fetchone()[0], current)
+
+    def test_alias_group_name_conflict_rolls_back_the_whole_write(self):
+        self._source("fanbox", "a", "作者 A")
+        self._post("/api/follow/author-alias", {"action": "add", "canonical": "作者 A", "alias": "alias A"})
+        before = self._get()["author_aliases"]
+        with self.contract.database.write_transaction() as connection:
+            entity_id = connection.execute("INSERT INTO entity(kind,canonical_name,normalized_name,created_at,updated_at) VALUES('creator','作者 A','作者 a',?,?)",
+                                           (MOMENT.isoformat(), MOMENT.isoformat())).lastrowid
+            connection.execute("UPDATE follow_source SET entity_id=?", (entity_id,))
+            connection.execute("INSERT INTO entity(kind,canonical_name,normalized_name,created_at,updated_at) VALUES('creator','作者 B','作者 b',?,?)",
+                               (MOMENT.isoformat(), MOMENT.isoformat()))
+        with self.assertRaises(ValueError):
+            self._post("/api/follow/author-alias", {"action": "rename",
+                "canonical_key": follow_store.normalized_author_name("作者 A"), "canonical": "作者 B"})
+        self.assertEqual(self._get()["author_aliases"], before)
+        self.assertEqual(self._get()["sources"][0]["entity_name"], "作者 A")
 
     def test_an_official_profile_learns_its_handle_as_an_alias(self):
         self._source("rule34video", "ffxivinitiala", "FFXIVInitialA")

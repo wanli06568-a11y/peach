@@ -12,9 +12,12 @@ import { fmtSize } from '@peach/legacy/core';
 import { Button } from '@/components/base/buttons/button';
 
 import { errorMessage } from '../../api';
+import { RESOURCE_SYNC_TEXT } from '../../cleanup-tool-skeletons';
 import { useBackgroundJob } from '../background-job';
 import { Fieldset, FieldsetTitle } from '../components/fieldset';
 import { Note } from '../components/note';
+import { ConnectionStatus } from '../components/connection-status';
+import { StatusLabel } from '../components/status-label';
 import { TaskProgress } from '../components/task-progress';
 import { spriteGlyph } from '../components/sprite-glyph';
 import { PlainStat, plainStatClass } from '../components/stat-card';
@@ -49,11 +52,11 @@ function ScanResult({ scan, partial = false }: { scan: ResourceScanState; partia
           <article key={source.location} className={plainStatClass()}>
             <PlainStat label={SOURCE_LABELS[source.location] || '媒体来源'}
               mark={<SourceMark mark={MEDIA_SOURCE_ICONS[source.location] ?? 'database'} />}
-              aside={<span className={source.online ? 'text-notification-success-foreground' : 'text-text-error-primary'}>
-                {source.online ? '可访问' : '离线，已跳过'}
-              </span>}
+              aside={<ConnectionStatus online={source.online}>{source.online ? '可访问' : '离线'}</ConnectionStatus>}
               figure={source.online ? `${count(source.missing)} 项` : '—'}
-              meta={sourceMeta(source)} wrapMeta />
+              meta={source.online ? sourceMeta(source) : `${sourceMeta(source)} · 本次已跳过`} wrapMeta />
+            {source.online && source.unreadable > 0
+              ? <span className="self-start"><StatusLabel tone="warning">{count(source.unreadable)} 个目录未读取</StatusLabel></span> : null}
           </article>
         ))}
       </div>
@@ -105,6 +108,7 @@ export function ResourceSyncCard(
   const state = scan.job;
   const scanning = scan.running || scan.start.isPending;
   const cleaning = apply.running || apply.start.isPending;
+  const actionsReady = !!scan.job && !!apply.job;
   const scanned = state?.status === 'complete' || state?.status === 'failed';
   const label = scanning ? '扫描中' : scanned ? '重新扫描' : '检查文件';
 
@@ -133,7 +137,7 @@ export function ResourceSyncCard(
   } else if (done) {
     result = receipt(done);
   } else if (apply.running) {
-    progress = <TaskProgress embedded label={apply.job?.message || '正在复核并清理失效条目…'} />;
+    progress = <TaskProgress embedded label={apply.job?.message || '正在复核并清理失效条目'} />;
   } else if (scan.start.isError) {
     result = <Note tone="error" title="扫描失败">{errorMessage(scan.start.error)}</Note>;
   } else if (scan.query.isError && state) {
@@ -158,16 +162,15 @@ export function ResourceSyncCard(
     result = (
       <>
         <ScanResult scan={state} />
-        {changes ? <Note tone="neutral" title="清理内容">{applyPlanText(state)}</Note> : null}
-        <div className="flex flex-wrap items-center justify-end gap-2">
-          {changes
-            ? <Button variant="danger" {...busyProps(cleaning)} onClick={() => runApply(state)}>
+        {changes
+          ? <Note tone="neutral" title="清理内容" action={
+              <Button variant="danger" disabled={!actionsReady} {...busyProps(cleaning)} onClick={() => { if (actionsReady) runApply(state) }}>
                 {cleaning ? '正在复核并清理…' : APPLY_LABEL}
               </Button>
-            : <p className="mr-auto text-body-regular text-notification-success-foreground">
-                已检查可访问的来源，没有待清理的记录、空文件夹或缓存。
-              </p>}
-        </div>
+            }>{applyPlanText(state)}</Note>
+          : <p className="mr-auto text-body-regular text-notification-success-foreground">
+              已检查可访问的来源，没有待清理的记录、空文件夹或缓存。
+            </p>}
       </>
     );
   }
@@ -178,12 +181,15 @@ export function ResourceSyncCard(
   return (
     <section id="resource-sync" aria-labelledby="resource-sync-title" className="flex scroll-mt-20 flex-col gap-4">
       <Fieldset layout="split" labelledBy="resource-sync-title" footer={
-        <Button data-resource-scan leadingIcon={scanned && !scanning ? AGAIN : COMPARE} {...busyProps(scanning)}
-          onClick={() => { if (!scanning) scan.start.mutate() }}>{label}</Button>
+        <Button data-resource-scan leadingIcon={scanned && !scanning ? AGAIN : COMPARE} disabled={!actionsReady} {...busyProps(scanning)}
+          onClick={() => { if (actionsReady && !scanning) scan.start.mutate() }}>{label}</Button>
       }>
         <FieldsetTitle id="resource-sync-title" gap="small">资源同步</FieldsetTitle>
+        {scan.query.isPending || apply.query.isPending ? <div role="status" aria-label="正在读取资源同步状态" data-skeleton="" className="skeleton-sheen h-6 rounded-md" /> : null}
+        {!scan.job && scan.query.isError ? <Note tone="error">检查状态未取得</Note> : null}
+        {!apply.job && apply.query.isError ? <Note tone="error">清理状态未取得</Note> : null}
         <p className="max-w-190 text-body-2-regular leading-5 text-text-secondary">
-          按馆藏记录逐条查找本地磁盘与网盘上的文件，列出文件已不存在的记录、空文件夹，以及不再被引用的缓存。
+          {RESOURCE_SYNC_TEXT}
         </p>
         <div aria-live="polite" className="mt-4 empty:hidden">{progress}</div>
       </Fieldset>

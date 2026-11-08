@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import re
 from datetime import date
+from functools import lru_cache
 from urllib.parse import urlsplit
 
 from .catalog_rules import (
-    same_release_code, code_query_variants, normalise_code_key, tokyo_hot_code)
+    same_release_code, code_query_variants, code_serial_pattern, normalise_code_key, tokyo_hot_code)
 from .genre_taxonomy import map_genres, unmapped_genre_warning
 from .http import body_text
 from .javdb import LOGIN as JAVDB_LOGIN_PAGE
@@ -190,6 +191,13 @@ def identifies_code(code: str, payload: dict) -> bool:
     两条判据取并集：`same_release_code` 严格但不认厂牌数字前缀（`MAAN-545` 与
     `300MAAN-545`），正则宽松但认得，去掉任何一条都有 16 条合法候选被误拒。
     """
+    return _identifies_code(str(code or ""), *(str(payload.get(field) or "") for field in IDENTITY_FIELDS))
+
+
+#: 复核队列整页核对时，同一番号与同一组来源编号要比好几万次；判据只看这几样原文，按原文缓存。
+@lru_cache(maxsize=65536)
+def _identifies_code(code: str, provider_id: str, content_id: str, source_url: str) -> bool:
+    payload = {"id": provider_id, "content_id": content_id, "source_url": source_url}
     if any(same_release_code(code, writing) for writing in _release_writings(payload)):
         return True
     if re.match(r"^\d{3}[A-Z]", str(code or "").upper()):
@@ -206,10 +214,11 @@ def identifies_code(code: str, payload: dict) -> bool:
     if not blob.strip("|"):
         return False
     value = str(code or "").upper()
-    matched = re.fullmatch(r"(?:\d{3,6})?([A-Z]{2,8})-?(\d{2,5})", value)
+    matched = re.fullmatch(r"(?:\d{3,6})?([A-Z]{2,8})-?(\d{2,5})([A-Z]{0,2})", value)
     if matched:
-        letters, digits = matched.group(1).lower(), matched.group(2).lstrip("0") or "0"
-        return any(re.search(rf"(?<![a-z]){letters}[-_]?0*{digits}(?!\d)",
+        letters, digits = matched.group(1).lower(), code_serial_pattern(matched.group(1), matched.group(2))
+        suffix = matched.group(3).lower()
+        return any(re.search(rf"(?<![a-z]){letters}[-_]?{digits}{suffix}(?![a-z0-9])",
                              str(payload.get(field) or "").lower()) is not None
                    for field in IDENTITY_FIELDS)
     return _compact(value) in blob
@@ -431,6 +440,30 @@ def _url_list_evidence(raw: object, label: str) -> dict | None:
     }
 
 
+def contains_replacement_character(value: object) -> bool:
+    """来源解码已丢失的字符不能作为文字证据，保留原始快照供重新取证。"""
+    if isinstance(value, str):
+        return '\ufffd' in value
+    if isinstance(value, dict):
+        return any(contains_replacement_character(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(contains_replacement_character(item) for item in value)
+    return False
+
+
+def candidate_text_is_valid(candidate: dict) -> bool:
+    """候选正文与未映射标签均须可解码；来源路径和诊断文字不参与判定。"""
+    return not any(contains_replacement_character(candidate.get(key))
+                   for key in ('value', 'display_value', 'unmapped_genres'))
+
+
+def source_text_is_valid(payload: dict) -> bool:
+    """来源文字必须完整；原始旁证、路径和诊断文字不决定缓存有效性。"""
+    return not any(contains_replacement_character(payload.get(key)) for key in (
+        'title', 'original_title', 'actresses', 'actors', 'performers', 'maker', 'studio',
+        'label', 'series', 'genres', 'tags', 'director'))
+
+
 def extract_catalog_evidence(payload: dict) -> dict[str, dict]:
     """Preserve source-only catalog fields without mapping them to ledger truth.
 
@@ -443,7 +476,7 @@ def extract_catalog_evidence(payload: dict) -> dict[str, dict]:
     out: dict[str, dict] = {}
     text_fields = {
         "title": original_wording(payload, "title"),
-        "original_title": payload.get("original_title"),
+        "original_title": original_wording(payload, "original_title"),
         "director": japanese.get("director") or payload.get("director"),
         "label": japanese.get("label") or payload.get("label"),
     }
@@ -466,7 +499,7 @@ def extract_catalog_evidence(payload: dict) -> dict[str, dict]:
     screenshots = _url_list_evidence(payload.get("screenshot_urls"), "张截图")
     if screenshots is not None:
         out["screenshot_urls"] = screenshots
-    return out
+    return {field: value for field, value in out.items() if candidate_text_is_valid(value)}
 
 
 def extract_peach_fields(payload: dict, genre_decisions=None) -> dict[str, dict]:
@@ -519,4 +552,4 @@ def extract_peach_fields(payload: dict, genre_decisions=None) -> dict[str, dict]
             "unmapped_genres": unmapped,
             "warnings": [unmapped_genre_warning(unmapped)] if unmapped else [],
         }
-    return out
+    return {field: value for field, value in out.items() if candidate_text_is_valid(value)}

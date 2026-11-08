@@ -23,7 +23,7 @@ const HELP: Partial<Record<AccessState['mode'], string>> = {
   password: '已设置密码。新设备需要登录，登录时勾选「保持登录」可保持 30 天。',
 };
 
-export function AccessSettings({ initial, receipt }: AccessSettingsProps) {
+export function AccessSettings({ initial, receipt, devices, after }: AccessSettingsProps) {
   const [state, setState] = useState(initial);
   const [current, setCurrent] = useState('');
   const [password, setPassword] = useState('');
@@ -61,8 +61,8 @@ export function AccessSettings({ initial, receipt }: AccessSettingsProps) {
 
   const help = HELP[state.mode];
   const editable = state.mode !== 'locked';
-  return (
-    <Section title="访问密码" onSubmit={submit}>
+  return (<>
+    <Section guide="access" title="访问密码" onSubmit={submit}>
       <div ref={body}>
         <Stack>
           {help ? <Help>{help}</Help> : null}
@@ -77,11 +77,11 @@ export function AccessSettings({ initial, receipt }: AccessSettingsProps) {
                 value={current} onChange={setCurrent} isRequired validationBehavior="aria"
                 isInvalid={Boolean(fields.current_password)} hint={fields.current_password} />
             : null}
-          {editable
+          {editable && !disable
             ? <PasswordPair label={state.mode === 'password' ? '新访问密码' : '设置访问密码'}
                 password={password} confirmation={confirmation} onPassword={setPassword} onConfirmation={setConfirmation}
-                disabled={disable} passwordError={fields.password} confirmationError={fields.confirmation}
-                passwordHint={disable ? '关闭访问密码时无需填写。' : '至少 8 个字符。保存后其他设备需要重新登录。'} />
+                passwordError={fields.password} confirmationError={fields.confirmation}
+                passwordHint="至少 8 个字符。保存后其他设备需要重新登录。" />
             : null}
           {disable ? <Note tone="warning" title="访问范围">保存后，能连接到 Peach 的设备将直接访问馆藏。</Note> : null}
           {action.error ? <ErrorText>{action.error}</ErrorText> : null}
@@ -91,5 +91,7 @@ export function AccessSettings({ initial, receipt }: AccessSettingsProps) {
         ? <Footer><Button type="submit" {...busyProps(action.busy === 'save')}>保存配置</Button></Footer>
         : null}
     </Section>
-  );
+    {devices && (state.mode === 'password' || state.mode === 'legacy') ? devices(state) : null}
+    {after ? after(state) : null}
+  </>);
 }

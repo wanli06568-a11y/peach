@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import io
 import json
 import os
 import shutil
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -111,6 +113,28 @@ class IndexTests(unittest.TestCase):
             self.assertEqual(gfriends.load_index(Path(folder)), {})
             self.assertIsNone(gfriends.index_age(Path(folder)))
 
+    def test_repeated_reads_reuse_parsing_and_atomic_replacement_refreshes_the_index(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            path = root / gfriends.INDEX_NAME
+            first = json.dumps({'Content': {'0-Source': {'Alice.jpg': 'Alice.jpg'}}}).encode()
+            second = json.dumps({'Content': {'0-Source': {'Clara.jpg': 'Clara.jpg'}}}).encode()
+            self.assertEqual(len(first), len(second))
+            path.write_bytes(first)
+            with mock.patch.object(gfriends, 'parse_filetree', wraps=gfriends.parse_filetree) as parse:
+                for _ in range(5):
+                    self.assertEqual(gfriends.load_index(root), {'alice': [('0-Source', 'Alice.jpg')]})
+                self.assertEqual(parse.call_count, 1)
+                previous = path.stat()
+                replacement = root / 'replacement.json'
+                replacement.write_bytes(second)
+                os.utime(replacement, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+                replacement.replace(path)
+                self.assertEqual(gfriends.load_index(root), {'clara': [('0-Source', 'Clara.jpg')]})
+                self.assertEqual(parse.call_count, 2)
+                path.unlink()
+                self.assertEqual(gfriends.load_index(root), {})
+
     def test_every_name_on_the_chain_brings_its_own_pictures(self):
         """并起来，不是停在第一个命中的名字上。
         """
@@ -133,6 +157,114 @@ class IndexTests(unittest.TestCase):
     def test_a_chain_that_hits_nothing_is_falsy(self):
         index = gfriends.parse_filetree(json.dumps(FILETREE).encode("utf-8"))
         self.assertFalse(gfriends.candidates(index, ["谁都不是"]))
+
+
+OLD_FILETREE = {"Content": {"7-S1": {"旧人.jpg": "旧人.jpg?t=0"}}}
+
+
+class IndexRefreshTests(unittest.TestCase):
+    """图库索引缺失或过期时由服务在后台补；取不到时旧缓存原样留着，也不反复出网。"""
+
+    def setUp(self):
+        self.cache = Path(tempfile.mkdtemp()).resolve() / avatar_picker.GFRIENDS_CACHE
+        self.addCleanup(shutil.rmtree, self.cache.parent, True)
+        self.calls: list[str] = []
+        self.reply = lambda: HttpResponse(200, {}, json.dumps(FILETREE).encode("utf-8"),
+                                          gfriends.INDEX_URL)
+
+    def transport(self):
+        def send(request, timeout=None, max_bytes=None):
+            self.calls.append(request.url)
+            return self.reply()
+        return send
+
+    def refresher(self):
+        return avatar_picker.IndexRefresher(self.cache, self.transport)
+
+    def seed_old(self, age: float) -> bytes:
+        body = json.dumps(OLD_FILETREE).encode("utf-8")
+        self.cache.mkdir(parents=True, exist_ok=True)
+        path = self.cache / gfriends.INDEX_NAME
+        path.write_bytes(body)
+        stamp = path.stat().st_mtime - age
+        os.utime(path, (stamp, stamp))
+        return body
+
+    def run_queued(self, refresher) -> bool:
+        queued = refresher.request()
+        if queued:
+            refresher._thread.join(10)
+        return queued
+
+    def test_a_missing_index_is_fetched_in_the_background(self):
+        self.assertTrue(self.run_queued(self.refresher()))
+        self.assertEqual(self.calls, [gfriends.INDEX_URL])
+        self.assertIn("葵つかさ", gfriends.load_index(self.cache))
+        self.assertFalse(gfriends.index_stale(self.cache))
+
+    def test_an_automatic_consumer_prepares_the_index_once(self):
+        refresher = self.refresher()
+        self.assertTrue(refresher.ensure())
+        self.assertIn("葵つかさ", gfriends.load_index(self.cache))
+        self.assertTrue(refresher.ensure())
+        self.assertEqual(self.calls, [gfriends.INDEX_URL])
+
+    def test_an_automatic_consumer_honours_the_failure_retry_window(self):
+        self.reply = lambda: HttpResponse(503, {}, b"", gfriends.INDEX_URL)
+        refresher = self.refresher()
+        with self.assertLogs(avatar_picker.LOGGER, "WARNING"):
+            self.assertFalse(refresher.ensure())
+        self.assertFalse(refresher.ensure())
+        self.assertEqual(self.calls, [gfriends.INDEX_URL])
+
+    def test_a_stale_index_is_replaced(self):
+        self.seed_old(gfriends.INDEX_MAX_AGE_SECONDS + 3600)
+        self.assertTrue(self.run_queued(self.refresher()))
+        index = gfriends.load_index(self.cache)
+        self.assertIn("葵つかさ", index)
+        self.assertNotIn("旧人", index)
+
+    def test_a_fresh_index_is_left_alone(self):
+        self.seed_old(60)
+        self.assertFalse(self.run_queued(self.refresher()))
+        self.assertEqual(self.calls, [])
+
+    def test_a_failed_fetch_keeps_the_old_index_and_waits_before_retrying(self):
+        """离线时每开一次头像框都出网一回，只会一次次白等超时。"""
+        old = self.seed_old(gfriends.INDEX_MAX_AGE_SECONDS + 3600)
+        mtime = (self.cache / gfriends.INDEX_NAME).stat().st_mtime
+        failures = [
+            lambda: HttpResponse(503, {}, b"", gfriends.INDEX_URL),
+            lambda: HttpResponse(200, {}, b"<html>", gfriends.INDEX_URL),
+            lambda: (_ for _ in ()).throw(OSError("连接被重置")),
+        ]
+        for reply in failures:
+            with self.subTest(reply=reply):
+                self.reply = reply
+                refresher = self.refresher()
+                with self.assertLogs(avatar_picker.LOGGER, "WARNING"):
+                    self.assertTrue(self.run_queued(refresher))
+                path = self.cache / gfriends.INDEX_NAME
+                self.assertEqual(path.read_bytes(), old)
+                self.assertEqual(path.stat().st_mtime, mtime)
+                self.assertTrue(gfriends.index_stale(self.cache))
+                self.assertIn("旧人", gfriends.load_index(self.cache))
+                calls = len(self.calls)
+                self.assertFalse(self.run_queued(refresher))
+                self.assertEqual(len(self.calls), calls)
+        later = time.monotonic() + avatar_picker.INDEX_RETRY_SECONDS + 1
+        self.reply = lambda: HttpResponse(200, {}, json.dumps(FILETREE).encode("utf-8"),
+                                          gfriends.INDEX_URL)
+        with mock.patch.object(avatar_picker.time, "monotonic", return_value=later):
+            self.assertTrue(self.run_queued(refresher))
+        self.assertIn("葵つかさ", gfriends.load_index(self.cache))
+
+    def test_a_missing_index_that_cannot_be_fetched_stays_missing(self):
+        self.reply = lambda: HttpResponse(404, {}, b"", gfriends.INDEX_URL)
+        with self.assertLogs(avatar_picker.LOGGER, "WARNING"):
+            self.assertFalse(self.refresher().refresh())
+        self.assertFalse((self.cache / gfriends.INDEX_NAME).exists())
+        self.assertEqual(gfriends.load_index(self.cache), {})
 
 
 class SourceBoundaryTests(unittest.TestCase):
@@ -189,13 +321,13 @@ class PickerFixture(unittest.TestCase):
         self.addCleanup(mock.patch.stopall)
 
     def remember(self, body: bytes, provider: str = "social-web",
-                 external_id: str = "old", url: str = "") -> str:
+                 external_id: str = "old", url: str = "", cache_name: str = "") -> str:
         """把一张图放进候选缓存并留下证据，等同「这个人取过这张」。
 
         `url` 给显式值是为了造「同一张图既在图库里、也在取过的图里」那一幕：跨来源
         认同一张图靠的是缓存记录里的地址，不是证据文件自己说了算。
         """
-        cache = AvatarCandidateCache(self.providers / provider)
+        cache = AvatarCandidateCache(self.providers / (cache_name or provider))
         inspected = inspect_avatar(body)
         url = url or f"https://{provider}.example/{external_id}.jpg"
         cache.store(url, body, inspected)
@@ -212,7 +344,140 @@ class PickerFixture(unittest.TestCase):
                                      self.avatars, "performer", 7792)
 
 
+class CachedSocialAvatarTests(PickerFixture):
+    def test_only_the_same_entity_and_x_account_can_reuse_a_social_avatar(self):
+        body = picture(colour="blue")
+        url = "https://pbs.twimg.com/profile_images/1/avatar.jpg"
+        self.remember(body, external_id="x:Example", url=url, cache_name="social")
+        params = {"service": "profile", "id": "twitter:example"}
+        cached = avatar_online.cached_profile_avatar(self.providers, 7792, params)
+        self.assertEqual(cached[0], body)
+        self.assertEqual(cached[1]["upstream_url"], url)
+        self.assertTrue(cached[1]["cached_at"])
+        self.assertIsNone(avatar_online.cached_profile_avatar(self.providers, 7793, params))
+        self.assertIsNone(avatar_online.cached_profile_avatar(
+            self.providers, 7792, {"service": "profile", "id": "twitter:Other"}))
+
+    def test_a_litlink_image_cannot_fill_an_x_avatar(self):
+        self.remember(picture(), external_id="x:Example",
+                      url="https://prd.storage.lit.link/images/creator/example/avatar.jpeg", cache_name="social")
+        self.assertIsNone(avatar_online.cached_profile_avatar(
+            self.providers, 7792, {"service": "profile", "id": "twitter:Example"}))
+
+    def test_a_changed_url_snapshot_does_not_relabel_a_different_image(self):
+        url = "https://pbs.twimg.com/profile_images/1/avatar.jpg"
+        self.remember(picture(colour="blue"), external_id="x:Example", url=url, cache_name="social")
+        replacement = picture(colour="green")
+        AvatarCandidateCache(self.providers / "social").store(url, replacement, inspect_avatar(replacement))
+        self.assertIsNone(avatar_online.cached_profile_avatar(
+            self.providers, 7792, {"service": "profile", "id": "twitter:Example"}))
+
+    def test_selecting_a_cached_x_image_keeps_the_original_capture_date(self):
+        body = picture(colour="blue")
+        url = "https://pbs.twimg.com/profile_images/1/avatar.jpg"
+        digest = self.remember(body, external_id="x:Example", url=url, cache_name="social")
+        evidence = self.providers / "social/evidence" / f"performer-7792-{digest}.json"
+        original = json.loads(evidence.read_text(encoding="utf-8"))
+        original["cached_at"] = "2026-09-05T18:14:39+00:00"
+        evidence.write_text(json.dumps(original), encoding="utf-8")
+        avatar_picker.keep(self.providers, 7792, body, original)
+        selected = self.providers / "social-web/evidence" / f"performer-7792-{digest}.json"
+        self.assertNotEqual(json.loads(selected.read_text(encoding="utf-8"))["cached_at"], original["cached_at"])
+        cached = avatar_online.cached_profile_avatar(
+            self.providers, 7792, {"service": "profile", "id": "twitter:Example"})
+        self.assertEqual(cached[0], body)
+        self.assertEqual(cached[1]["cached_at"], original["cached_at"])
+
+    def test_a_user_selection_alone_is_not_capture_evidence(self):
+        self.remember(picture(), external_id="x:Example",
+                      url="https://pbs.twimg.com/profile_images/1/avatar.jpg")
+        self.assertIsNone(avatar_online.cached_profile_avatar(
+            self.providers, 7792, {"service": "profile", "id": "twitter:Example"}))
+
+
+class HistorySourceTests(PickerFixture):
+    def history(self):
+        return avatar_picker._history(self.providers, 7792, "")
+
+    def test_matching_history_and_social_evidence_show_the_account_once(self):
+        body = picture(60, 80, "blue")
+        digest = self.remember(body, provider="history")
+        self.remember(body, external_id="x:Example",
+                      url="https://pbs.twimg.com/profile_images/1/avatar.jpg", cache_name="social")
+        choices = self.history()
+        self.assertEqual([(choice.ref, choice.label) for choice in choices], [(f"sha256:{digest}", "X @Example")])
+
+    def test_litlink_evidence_names_the_profile_instead_of_the_storage_host(self):
+        self.remember(picture(), external_id="https://lit.link/example",
+                      url="https://prd.storage.lit.link/images/creator/example/avatar.jpeg")
+        self.assertEqual(self.history()[0].label, "lit.link @example")
+
+    def test_a_legacy_crop_uses_a_unique_original_hash_from_the_same_entity(self):
+        body = picture(60, 80, "blue")
+        digest = self.remember(body, external_id="x:Example",
+                               url="https://pbs.twimg.com/profile_images/1/avatar.jpg", cache_name="social")
+        cut, crop_origin = avatar_picker.crop(body, {"x0": 5, "y0": 10, "x1": 55, "y1": 70})
+        avatar_picker.keep(self.providers, 7792, cut,
+                           {"provider": "history", "external_id": digest[:12], **crop_origin})
+        choice = next(choice for choice in self.history() if choice.ref == f"sha256:{inspect_avatar(cut).sha256}")
+        self.assertEqual(choice.label, "X @Example · 已裁剪")
+        self.assertEqual(choice.detail, "https://pbs.twimg.com/profile_images/1/avatar.jpg")
+
+    def test_ambiguous_original_hashes_leave_the_crop_source_unrecorded(self):
+        body = picture(60, 80, "blue")
+        digest = self.remember(body, external_id="x:Example",
+                               url="https://pbs.twimg.com/profile_images/1/avatar.jpg", cache_name="social")
+        evidence = self.providers / "social/evidence" / f"performer-7792-{digest}.json"
+        other = json.loads(evidence.read_text(encoding="utf-8"))
+        other["sha256"] = digest[:12] + "0" * 52
+        (evidence.parent / f"performer-7792-{other['sha256']}.json").write_text(json.dumps(other), encoding="utf-8")
+        cut, crop_origin = avatar_picker.crop(body, {"x0": 5, "y0": 10, "x1": 55, "y1": 70})
+        avatar_picker.keep(self.providers, 7792, cut,
+                           {"provider": "history", "external_id": digest[:12], **crop_origin})
+        choice = next(choice for choice in self.history() if choice.ref == f"sha256:{inspect_avatar(cut).sha256}")
+        self.assertEqual(choice.label, "来源未记录 · 已裁剪")
+        self.assertEqual(choice.detail, "")
+
+    def test_another_entity_cannot_supply_a_history_source(self):
+        body = picture(60, 80, "blue")
+        digest = self.remember(body, external_id="x:Example",
+                               url="https://pbs.twimg.com/profile_images/1/avatar.jpg", cache_name="social")
+        evidence = self.providers / "social/evidence" / f"performer-7792-{digest}.json"
+        other = json.loads(evidence.read_text(encoding="utf-8"))
+        other["entity_id"] = 7793
+        evidence.write_text(json.dumps(other), encoding="utf-8")
+        self.remember(body, provider="history", external_id=digest[:12])
+        self.assertEqual(self.history()[0].label, "来源未记录")
+
+    def test_cropping_a_history_choice_retains_the_original_site_and_account(self):
+        body = picture(60, 80, "blue")
+        digest = self.remember(body, external_id="https://lit.link/example",
+                               url="https://prd.storage.lit.link/images/creator/example/avatar.jpeg")
+        resolved, origin = avatar_picker.resolve(f"sha256:{digest}", self.connection, self.providers, 7792, None)
+        cut, crop_origin = avatar_picker.crop(resolved, {"x0": 5, "y0": 10, "x1": 55, "y1": 70})
+        kept = avatar_picker.keep(self.providers, 7792, cut, {**origin, **crop_origin})
+        evidence = self.providers / "social-web/evidence" / f"performer-7792-{kept.sha256}.json"
+        record = json.loads(evidence.read_text(encoding="utf-8"))
+        self.assertEqual(record["external_id"], "https://lit.link/example")
+        self.assertEqual(record["upstream_url"], origin["upstream_url"])
+        choice = next(choice for choice in self.history() if choice.ref == f"sha256:{kept.sha256}")
+        self.assertEqual(choice.label, "lit.link @example · 已裁剪")
+
+
 class ChoiceTests(PickerFixture):
+    def test_cached_social_and_history_share_one_choice(self):
+        body = picture(colour="blue")
+        digest = self.remember(body, external_id="x:Example")
+        (self.avatars / "performer-7792.img").write_bytes(body)
+        listed = avatar_picker.choices(
+            self.connection, self.providers, self.avatars, "performer", 7792,
+            online=[avatar_picker.Choice(ref=f"sha256:{digest}", source="social",
+                                         label="X @Example", detail="已缓存的社交头像")])
+        matches = [one for one in listed["choices"] if one["ref"] == f"sha256:{digest}"]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["label"], "X @Example")
+        self.assertTrue(matches[0]["current"])
+
     def test_the_alias_is_what_finds_her_in_the_library(self):
         """规范名是简体，图库里只有日文写法；不查别名一张也列不出来。"""
         out = self.listed()
@@ -268,19 +533,33 @@ class ChoiceTests(PickerFixture):
                    if one["source"] == "history"]
         self.assertEqual([one["ref"] for one in history], [f"sha256:{digest}"])
 
-    def test_every_label_reads_as_where_the_picture_came_from(self):
-        """格子底下写来源，不写取图时用的那串代号。
+    def test_lit_share_posters_are_hidden_without_removing_cached_images(self):
+        poster_url = "https://prd.storage.lit.link/images/creators/example/ogp/ogp_image.jpg"
+        poster = self.remember(picture(colour="blue"), external_id="lit.link", url=poster_url)
+        icon = self.remember(picture(colour="green"), external_id="lit.link",
+                             url="https://prd.storage.lit.link/images/creators/example/icons/avatar.png")
+        history = [one["ref"] for one in self.listed()["choices"] if one["source"] == "history"]
+        self.assertEqual(history, [f"sha256:{icon}"])
+        self.assertTrue(avatar_picker._object_bytes(self.providers, poster))
 
-        `x:aoi_tsukasa8`、`jae:actress.html#joyu117` 回答的是「批处理怎么再找到它」，
-        对着屏幕选图的人读不出意思。图库那一侧同理：目录名首字母是图库自己的优先级
-        记号（`quality_key` 读的就是它），`S1`、`Minnano` 才说得出这张图出自谁家。
-        """
-        self.remember(picture(colour="blue"), external_id="x:aoi_tsukasa8")
+    def test_a_manually_selected_lit_share_image_remains_available(self):
+        url = "https://prd.storage.lit.link/images/creators/example/ogp/ogp_image.jpg"
+        body = picture(colour="blue")
+        self.remember(body, provider="social-web", external_id="lit.link", url=url)
+        digest = self.remember(body, provider="url", url=url)
+        history = [one for one in self.listed()["choices"] if one["source"] == "history"]
+        self.assertEqual([one["ref"] for one in history], [f"sha256:{digest}"])
+        self.assertEqual(history[0]["label"], "图片地址 · prd.storage.lit.link")
+
+    def test_every_label_reads_as_where_the_picture_came_from(self):
+        """社媒标签显示站点与账号，图库标签显示实际分类。"""
+        self.remember(picture(colour="blue"), external_id="x:aoi_tsukasa8",
+                      url="https://pbs.twimg.com/profile_images/1/avatar.jpg")
         out = self.listed()["choices"]
         self.assertEqual([one["label"] for one in out if one["source"] == "gfriends"],
                          ["Hand-Storage", "S1", "Minnano"])
         self.assertEqual([one["label"] for one in out if one["source"] == "history"],
-                         ["社交主页"])
+                         ["X @aoi_tsukasa8"])
 
     def test_a_picture_with_one_colour_never_reaches_the_grid(self):
         """整张一个颜色的不是人像，是来源取不到图时给的一块底色。
@@ -318,8 +597,8 @@ class ChoiceTests(PickerFixture):
         listed = next(one for one in out if one["ref"] == LIBRARY_REF)
         self.assertEqual((listed["width"], listed["height"]), (40, 60))
 
-    def test_a_stale_index_is_reported_rather_than_refreshed(self):
-        """页面不为一次点击同步拉 6 MB；过期就说出来，补索引是批处理的事。"""
+    def test_a_stale_index_is_reported_and_still_read(self):
+        """页面不为一次点击同步拉 6 MB；过期就说出来，补索引交给后台（`IndexRefresher`）。"""
         self.assertFalse(self.listed()["index_stale"])
         old = gfriends.INDEX_MAX_AGE_SECONDS + 3600
         with mock.patch.object(gfriends, "index_age", return_value=old):
@@ -902,6 +1181,26 @@ class AvatarPickerRouteTests(unittest.TestCase):
         self.assertEqual(out["matched_names"], ["葵つかさ"])
         self.assertIn(LIBRARY_REF, [one["ref"] for one in out["choices"]])
 
+    def test_opening_the_picker_on_a_stale_index_queues_a_refresh(self):
+        """这一次照旧按旧缓存列，刷新只排进后台，不挡住这次回应。"""
+        from peach.routes_media import _index_refresher
+        refresher = _index_refresher(self.app)
+        self.assertIs(_index_refresher(self.app), refresher)
+        self.assertEqual(refresher.cache_dir, self.providers / avatar_picker.GFRIENDS_CACHE)
+        # 出网走采集统一出口，Peach 代理设置在那里生效。
+        from peach.scraping_access import SourceTransport
+        transport = refresher._transport()
+        self.addCleanup(transport.close)
+        self.assertIsInstance(transport, SourceTransport)
+        queued = mock.patch.object(refresher, "request").start()
+        old = gfriends.INDEX_MAX_AGE_SECONDS + 3600
+        with mock.patch.object(gfriends, "index_age", return_value=old):
+            out = self.client.get(
+                "/api/avatar-choices?kind=performer&id=7792&t=secret").json()
+        self.assertTrue(out["index_stale"])
+        self.assertIn(LIBRARY_REF, [one["ref"] for one in out["choices"]])
+        queued.assert_called_once_with()
+
     def _online_creator(self):
         from peach.follow_sources import FollowCandidate, SourceFetch
         from peach.follow_store import FollowStore
@@ -932,6 +1231,74 @@ class AvatarPickerRouteTests(unittest.TestCase):
         self.assertTrue(any(choice['source'] == 'social' for choice in listing['choices']))
         self.assertNotIn('https://example.com', json.dumps(listing))
 
+    def test_performer_choices_include_bound_social_avatars_without_fetching(self):
+        with self.app.state.database.write_transaction() as connection:
+            connection.execute(
+                "INSERT INTO entity_link(entity_id,link_kind,label,url,created_at,updated_at)"
+                " VALUES(7792,'social','lit.link','https://lit.link/example','t','t')")
+        with mock.patch("peach.follow_avatar.profile_avatar_tiers") as fetch:
+            listing = self.client.get('/api/avatar-choices?kind=performer&id=7792&t=secret').json()
+        social = next(choice for choice in listing["choices"] if choice["source"] == "social")
+        self.assertTrue(social["ref"].startswith("follow-link:"))
+        self.assertEqual(social["label"], "lit.link")
+        fetch.assert_not_called()
+
+    def test_bound_litlink_preview_uses_the_shared_avatar_service_and_cache(self):
+        with self.app.state.database.write_transaction() as connection:
+            connection.execute(
+                "INSERT INTO entity_link(entity_id,link_kind,label,url,created_at,updated_at)"
+                " VALUES(7792,'social','lit.link','https://lit.link/example','t','t')")
+        listing = self.client.get('/api/avatar-choices?kind=performer&id=7792&t=secret').json()
+        ref = next(choice["ref"] for choice in listing["choices"] if choice["source"] == "social")
+        from fastapi.responses import FileResponse
+        path = self.folder / "social-avatar.jpg"
+        path.write_bytes(self.picture)
+        with mock.patch("peach.routes_media.follow_avatar", return_value=FileResponse(path)) as fetch:
+            params = {"kind": "performer", "id": 7792, "ref": ref, "t": "secret"}
+            self.assertEqual(self.client.get('/avatar-choice', params=params).status_code, 200)
+            self.assertEqual(self.client.get('/avatar-choice', params=params).status_code, 200)
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(fetch.call_args.kwargs["service"], "profile")
+        self.assertEqual(fetch.call_args.kwargs["id"], "litlink:example")
+
+    def test_cached_x_avatar_preserves_its_source_and_date_without_fetching(self):
+        from peach.routes_media import _picker_online
+        with self.app.state.database.write_transaction() as connection:
+            cursor = connection.execute(
+                "INSERT INTO entity_link(entity_id,link_kind,label,url,created_at,updated_at)"
+                " VALUES(7792,'social','X','https://x.com/Example','t','t')")
+            ref = f"follow-link:{cursor.lastrowid}"
+        record = {"provider": "social-web", "source_kind": "official_profile", "external_id": "x:Example",
+                  "sha256": hashlib.sha256(self.picture).hexdigest(),
+                  "upstream_url": "https://pbs.twimg.com/profile_images/1/avatar.jpg",
+                  "cached_at": "2026-09-05T18:14:39+00:00"}
+        with mock.patch("peach.avatar_online.cached_profile_avatar", return_value=(self.picture, record)), \
+                mock.patch("peach.routes_media.follow_avatar") as fetch, \
+                self.app.state.database.read_connection() as connection:
+            for _ in range(2):
+                body, origin = _picker_online(mock.Mock(app=self.app), connection, 7792)(ref)
+                self.assertEqual(body, self.picture)
+                self.assertEqual(origin["upstream_url"], record["upstream_url"])
+                self.assertEqual(origin["cached_at"], record["cached_at"])
+            listing = self.client.get('/api/avatar-choices?kind=performer&id=7792&t=secret').json()
+        social = next(choice for choice in listing["choices"] if choice["source"] == "social")
+        self.assertEqual(social["detail"], "已缓存的社交头像 · 2026-09-05")
+        fetch.assert_not_called()
+
+    def test_online_avatar_preserves_a_source_error(self):
+        from fastapi.responses import JSONResponse
+        from peach.routes_media import _picker_online
+        with self.app.state.database.write_transaction() as connection:
+            cursor = connection.execute(
+                "INSERT INTO entity_link(entity_id,link_kind,label,url,created_at,updated_at)"
+                " VALUES(7792,'social','X','https://x.com/Example','t','t')")
+            ref = f"follow-link:{cursor.lastrowid}"
+        with mock.patch("peach.routes_media.follow_avatar", return_value=JSONResponse(
+                {"error": "X 资料页没有本人头像"}, status_code=404)), \
+                self.app.state.database.read_connection() as connection, \
+                self.assertRaisesRegex(avatar_picker.PickerError, "X 资料页没有本人头像"):
+            _picker_online(mock.Mock(app=self.app), connection, 7792)(ref)
+
     def test_online_domain_uses_the_injected_visible_media_and_cover(self):
         item_id = self._online_creator()
         project = mock.Mock(return_value=avatar_online.MediaChoices(
@@ -950,6 +1317,16 @@ class AvatarPickerRouteTests(unittest.TestCase):
         self.assertTrue(all(call.args[0].id == item_id for call in project.call_args_list))
         avatar.assert_not_called()
         media.assert_not_called()
+
+    def test_missing_online_images_and_oversized_images_have_different_errors(self):
+        item_id = self._online_creator()
+        project = mock.Mock(return_value=avatar_online.MediaChoices(cover="https://example.com/image.jpg", images=()))
+        for payload, message in ((None, "未取得"), (b"12345", "大小上限")):
+            with self.subTest(payload=payload), mock.patch("peach.avatar_online.MAX_IMAGE_BYTES", 4), \
+                    self.app.state.database.read_connection() as connection, \
+                    self.assertRaisesRegex(avatar_picker.PickerError, message):
+                avatar_online.resolve(f"follow:{item_id}:cover", connection, 8892, project=project,
+                                      image=mock.Mock(return_value=payload), avatar=mock.Mock(), media=mock.Mock())
 
     def test_online_domain_rechecks_visibility_before_fetching_a_listed_candidate(self):
         item_id = self._online_creator()
@@ -1034,14 +1411,61 @@ class AvatarPickerRouteTests(unittest.TestCase):
             content=body, headers={"content-type": "image/jpeg"})
         self.assertEqual(framed.status_code, 200)
         self.assertEqual((framed.json()["width"], framed.json()["height"]), (300, 400))
-        # 只量不存：本机文件确认时浏览器再发一次原字节。
-        self.assertFalse((self.providers / "upload").exists())
+        # 转换预览留在候选缓存；用户确认前不安装头像。
+        self.assertTrue(framed.json()["ref"].startswith("sha256:"))
+        preview = self.client.get("/avatar-choice", params={
+            "kind": "performer", "id": 7792, "ref": framed.json()["ref"], "t": "secret"})
+        self.assertEqual(preview.status_code, 200)
+        self.assertEqual(preview.content, body)
+        self.assertFalse((self.avatars / "performer-7792.img").exists())
         picked = self.client.post(
             "/api/avatar-pick?id=7792&kind=performer&name=me.jpg&crop=0,0,300,300&t=secret",
             content=body, headers={"content-type": "image/jpeg"})
         self.assertEqual(picked.status_code, 200)
         installed = avatar_picker.accept_image((self.avatars / "performer-7792.img").read_bytes())
         self.assertEqual((installed.width, installed.height), (300, 300))
+
+    def test_a_tiff_upload_uses_one_converted_image_for_preview_crop_and_save(self):
+        stream = io.BytesIO()
+        Image.open(io.BytesIO(picture(120, 160))).save(stream, "TIFF")
+        body = stream.getvalue()
+        framed = self.client.post(
+            "/api/avatar-frame?id=7792&kind=performer&name=portrait.tif&t=secret",
+            content=body, headers={"content-type": "application/octet-stream"})
+        self.assertEqual(framed.status_code, 200)
+        ref = framed.json()["ref"]
+        preview = self.client.get("/avatar-choice", params={"id": 7792, "ref": ref, "t": "secret"})
+        self.assertEqual(preview.status_code, 200)
+        self.assertEqual(preview.headers["content-type"], "image/jpeg")
+        self.assertEqual(inspect_avatar(preview.content).width, framed.json()["width"])
+        saved = self.client.post(
+            "/api/avatar-pick?id=7792&kind=performer&name=portrait.tif&crop=0,0,120,120&t=secret",
+            content=body, headers={"content-type": "image/tiff"})
+        self.assertEqual(saved.status_code, 200)
+        installed = inspect_avatar((self.avatars / "performer-7792.img").read_bytes())
+        self.assertEqual((installed.width, installed.height), (120, 120))
+
+    def test_an_address_with_webp_content_has_a_jpeg_preview_and_can_be_installed(self):
+        buffer = io.BytesIO()
+        Image.open(io.BytesIO(picture(80, 120))).save(buffer, "WEBP")
+        self.app.state.http_transport = transport_of(buffer.getvalue())
+        address = "https://example.com/photo.jpg"
+        with mock.patch.object(peach_http, "host_addresses", return_value=("93.184.216.34",)):
+            framed = self.client.post("/api/avatar-frame?t=secret", json={"id": 7792, "url": address})
+        self.assertEqual(framed.status_code, 200)
+        preview = self.client.get("/avatar-choice", params={"id": 7792, "ref": framed.json()["ref"], "t": "secret"})
+        self.assertEqual(preview.headers["content-type"], "image/jpeg")
+        saved = self.client.post("/api/avatar-pick?t=secret", json={"id": 7792, "ref": framed.json()["ref"]})
+        self.assertEqual(saved.status_code, 200)
+
+    def test_invalid_uploads_have_a_client_error_and_do_not_install_an_avatar(self):
+        for suffix, body in ((".jpg", picture()[:-32]), (".html", b"<html>image required</html>")):
+            for endpoint in ("avatar-frame", "avatar-pick"):
+                with self.subTest(endpoint=endpoint, suffix=suffix):
+                    response = self.client.post(f"/api/{endpoint}?id=7792&name=portrait{suffix}&t=secret", content=body)
+                    self.assertEqual(response.status_code, 400)
+                    self.assertTrue(response.json()["error"])
+        self.assertFalse((self.avatars / "performer-7792.img").exists())
 
     def test_a_typed_address_is_checked_before_peach_goes_and_fetches_it(self):
         refused = self.client.post("/api/avatar-frame?t=secret",
@@ -1108,9 +1532,9 @@ class AvatarPickerRouteTests(unittest.TestCase):
         current = [one for one in listed["choices"] if one["current"]]
         self.assertEqual([one["ref"] for one in current],
                          [f"sha256:{inspect_avatar(installed).sha256}"])
-        self.assertEqual(current[0]["label"], "图库")
+        self.assertEqual(current[0]["label"], "图库 · S1 · 已裁剪")
 
-    def test_a_piece_cut_from_a_taken_picture_reads_as_one_she_took(self):
+    def test_a_piece_cut_from_library_history_keeps_the_library_source(self):
         self.client.post("/api/avatar-pick?t=secret", json={
             "kind": "performer", "id": 7792, "ref": LIBRARY_REF})
         taken = f"sha256:{inspect_avatar(self.picture).sha256}"
@@ -1120,7 +1544,7 @@ class AvatarPickerRouteTests(unittest.TestCase):
         self.assertEqual(picked.status_code, 200)
         listed = self.client.get("/api/avatar-choices?kind=performer&id=7792&t=secret").json()
         current = [one for one in listed["choices"] if one["current"]]
-        self.assertEqual([one["label"] for one in current], ["取过的图"])
+        self.assertEqual([one["label"] for one in current], ["图库 · S1 · 已裁剪"])
 
     def test_a_typed_code_brings_back_a_cover_that_then_frames_and_installs(self):
         from peach import routes_media
@@ -1207,6 +1631,26 @@ class CoverCropRouteTests(unittest.TestCase):
         # 边车删掉就没人再算一遍，算出来的那一档取景会跟着消失。
         self.assertNotEqual(self.sidecar()["box"]["method"], MANUAL)
         self.assertNotIn("source", self.sidecar())
+
+    def test_reading_and_writing_the_cover_happens_off_the_event_loop(self):
+        """异步端点里同步读图会停住整个服务的送流：读封面、写边车都在线程里。"""
+        import asyncio
+        from peach import images
+        measure = images.measure_image_size
+        seen = []
+
+        def off_loop(data):
+            try:
+                asyncio.get_running_loop()
+                seen.append("loop")
+            except RuntimeError:
+                seen.append("thread")
+            return measure(data)
+        with mock.patch.object(images, "measure_image_size", side_effect=off_loop):
+            response = self.client.post("/api/cover-crop?t=secret", json={
+                "code": "ABW-232", "box": {"x0": 300, "y0": 20, "x1": 700, "y1": 520}})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(seen, ["thread"])
 
     def test_the_endpoint_needs_the_token(self):
         response = self.client.post("/api/cover-crop", json={"code": "ABW-232"})
